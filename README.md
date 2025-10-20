@@ -13,7 +13,7 @@ The server maintains:
 - A **real display buffer** (the VGA framebuffer)
 - A **per-client off-screen buffer**
 - Basic **input handling** (keyboard + mouse)
-- **IPC** using UNIX domain sockets (for commands) and FIFOs (for input events)
+- **IPC** using UNIX domain sockets for commands and input events
 
 The client communicates with the server via a shared library exposing these APIs:
 
