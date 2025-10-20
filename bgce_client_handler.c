@@ -1,3 +1,5 @@
+#define _XOPEN_SOURCE 700
+
 #include "bgce.h"
 #include "bgce_shared.h"
 
@@ -8,6 +10,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 
 /* Handle a single connected client */

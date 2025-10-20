@@ -1,42 +1,24 @@
-# BGCE Makefile
-# Build: make [all|server|client|clean]
+CC = gcc
+CFLAGS = -Wall -O2 -std=c99 -fPIC -g
+LDFLAGS = -lrt
 
-CC      := gcc
-CFLAGS  := -std=c11 -O2 -Wall -Wextra
-LDFLAGS := -lrt
+SERVER_OBJS = bgce_server.o bgce_shared.o
+LIB_OBJS = libbgce.o bgce_shared.o
 
-SERVER  := bgce-server
-CLIENT  := bgce-client
-LIB     := libbgce.a
+all: bgce-server libbgce.so bgce-test-client
 
-SRC_SERVER := bgce-server.c
-SRC_CLIENT := bgce-client.c
-SRC_LIB    := libbgce.c
+bgce-server: $(SERVER_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) $(LDFLAGS)
 
-OBJ_SERVER := $(SRC_SERVER:.c=.o)
-OBJ_CLIENT := $(SRC_CLIENT:.c=.o)
-OBJ_LIB    := $(SRC_LIB:.c=.o)
+libbgce.so: $(LIB_OBJS)
+	$(CC) -shared -o $@ $(LIB_OBJS) $(LDFLAGS)
 
-.PHONY: all clean server client lib
-
-all: $(SERVER) $(CLIENT)
-
-server: $(SERVER)
-client: $(CLIENT)
-lib: $(LIB)
-
-$(SERVER): $(OBJ_SERVER)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-$(CLIENT): $(OBJ_CLIENT) $(LIB)
-	$(CC) $(CFLAGS) -o $@ $< -L. -lbgce $(LDFLAGS)
-
-$(LIB): $(OBJ_LIB)
-	ar rcs $@ $^
+bgce-test-client: bgce_test_client.c bgce.h
+	$(CC) $(CFLAGS) -o $@ bgce_test_client.c -L. -lbgce $(LDFLAGS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(SERVER) $(CLIENT) $(LIB) *.o
+	rm -f *.o bgce-server libbgce.so bgce-test-client
 

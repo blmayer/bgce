@@ -1,131 +1,127 @@
-// libbgce.c
-#define _GNU_SOURCE
-#include "libbgce.h"
+#include "bgce.h"
+#include "bgce_shared.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <stdio.h>
 #include <sys/mman.h>
 #include <fcntl.h>
-#include <string.h>
-#include <stdint.h>
+#include <unistd.h>
 
-#define SOCK_PATH "/tmp/bgce.sock"
-#define SHM_NAME_MAX 256
+static int bgce_fd = -1;
+static int shm_fd = -1;
+static void *shared_buf = NULL;
 
-enum {
-    MSG_INFO = 1,
-    MSG_DRAW = 2,
-    MSG_EVENT = 3,
-    MSG_RESIZE = 4,
-    MSG_EXIT = 5
-};
+/* Connect to the BGCE server */
+static int bgce_connect(void)
+{
+	if (bgce_fd >= 0) return bgce_fd;
 
-static int sockfd = -1;
-static struct bgce_info ginfo;
-static char g_shm_name[SHM_NAME_MAX];
-static uint32_t *g_buf = NULL;
-static size_t g_buf_size = 0;
+	bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (bgce_fd < 0) {
+		perror("socket");
+		return -1;
+	}
 
-static int send_message(int fd, uint32_t type, const void *payload, uint32_t len) {
-    uint32_t hdr[2] = {type, len};
-    if (write(fd, hdr, sizeof(hdr)) != sizeof(hdr)) return -1;
-    if (len > 0 && write(fd, payload, len) != (ssize_t)len) return -1;
-    return 0;
+	struct sockaddr_un addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, BGCE_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+	if (connect(bgce_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		perror("connect");
+		close(bgce_fd);
+		bgce_fd = -1;
+		return -1;
+	}
+	return bgce_fd;
 }
 
-static int recv_message_once(int fd, uint32_t *type, void **payload, uint32_t *len) {
-    uint32_t hdr[2];
-    ssize_t r = read(fd, hdr, sizeof(hdr));
-    if (r <= 0) return (int)r;
-    if (r != sizeof(hdr)) return -1;
-    *type = hdr[0];
-    *len = hdr[1];
-    if (*len > 0) {
-        void *buf = malloc(*len);
-        if (!buf) return -1;
-        ssize_t got = 0;
-        while (got < *len) {
-            ssize_t s = read(fd, (char*)buf + got, *len - got);
-            if (s <= 0) { free(buf); return -1; }
-            got += s;
-        }
-        *payload = buf;
-    } else {
-        *payload = NULL;
-    }
-    return 1;
+/* Public API: Get server info */
+int getServerInfo(ServerInfo *info)
+{
+	if (bgce_connect() < 0) return -1;
+
+	BGCEMessage msg = {0};
+	msg.type = MSG_GET_SERVER_INFO;
+	msg.length = 0;
+
+	if (bgce_send_msg(bgce_fd, &msg) <= 0)
+		return -1;
+
+	if (bgce_recv_data(bgce_fd, info, sizeof(ServerInfo)) <= 0)
+		return -1;
+
+	return 0;
 }
 
+/* Public API: Get shared buffer */
+void *getBuffer(int width, int height)
+{
+	if (bgce_connect() < 0) return NULL;
 
-int bgce_connect(const char *sockpath) {
-    (void)sockpath;
-    if (sockfd != -1) return 0;
-    sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sockfd < 0) { perror("socket"); return -1; }
-    struct sockaddr_un addr;
-    memset(&addr,0,sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path)-1);
-    if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("connect"); close(sockfd); sockfd = -1; return -1; }
+	ClientBufferRequest req = { .width = width, .height = height };
 
-    // wait for MSG_INFO
-    uint32_t type; void *payload; uint32_t len;
-    if (recv_message_once(sockfd, &type, &payload, &len) <= 0) { perror("recv info"); close(sockfd); sockfd=-1; return -1; }
-    if (type != MSG_INFO) { fprintf(stderr,"expected MSG_INFO\n"); free(payload); return -1; }
-    if (len != sizeof(struct { uint32_t width,height,depth; char shm_name[SHM_NAME_MAX]; })) {
-        // we'll parse assuming server_info size is known
-    }
-    // parse
-    uint32_t *p = (uint32_t*)payload;
-    ginfo.width = p[0];
-    ginfo.height = p[1];
-    ginfo.depth = p[2];
-    // shm name starts at offset 12
-    char *shm = (char*)payload + 12;
-    strncpy(g_shm_name, shm, SHM_NAME_MAX-1);
-    free(payload);
+	BGCEMessage msg = {0};
+	msg.type = MSG_GET_BUFFER;
+	msg.length = sizeof(req);
+	memcpy(msg.data, &req, sizeof(req));
 
-    // open shared memory and mmap
-    int shmfd = shm_open(g_shm_name, O_RDWR, 0);
-    if (shmfd < 0) { perror("shm_open client"); return -1; }
-    g_buf_size = ginfo.width * ginfo.height * sizeof(uint32_t);
-    g_buf = mmap(NULL, g_buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0);
-    if (g_buf == MAP_FAILED) { perror("mmap client"); close(shmfd); g_buf = NULL; return -1; }
-    close(shmfd);
-    return 0;
+	if (bgce_send_msg(bgce_fd, &msg) <= 0)
+		return NULL;
+
+	ClientBufferReply reply;
+	if (bgce_recv_data(bgce_fd, &reply, sizeof(reply)) <= 0)
+		return NULL;
+
+	size_t size = reply.width * reply.height * 3;
+	shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
+	if (shm_fd < 0) {
+		perror("shm_open (client)");
+		return NULL;
+	}
+
+	shared_buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+	if (shared_buf == MAP_FAILED) {
+		perror("mmap (client)");
+		close(shm_fd);
+		return NULL;
+	}
+
+	return shared_buf;
 }
 
-void bgce_disconnect(void) {
-    if (g_buf) {
-        munmap(g_buf, g_buf_size);
-        g_buf = NULL;
-    }
-    if (sockfd != -1) {
-        // send exit
-        send_message(sockfd, MSG_EXIT, NULL, 0);
-        close(sockfd); sockfd = -1;
-    }
+/* Public API: Draw current buffer */
+int draw(void)
+{
+	if (bgce_connect() < 0) return -1;
+
+	BGCEMessage msg = {0};
+	msg.type = MSG_DRAW;
+	msg.length = 0;
+
+	if (bgce_send_msg(bgce_fd, &msg) <= 0)
+		return -1;
+
+	return 0;
 }
 
-struct bgce_info bgce_get_info(void) {
-    return ginfo;
+/* Public API: Disconnect */
+void bgce_close(void)
+{
+	if (shared_buf) {
+		munmap(shared_buf, 0);
+		shared_buf = NULL;
+	}
+	if (shm_fd >= 0) {
+		close(shm_fd);
+		shm_fd = -1;
+	}
+	if (bgce_fd >= 0) {
+		close(bgce_fd);
+		bgce_fd = -1;
+	}
 }
 
-uint32_t * bgce_get_buffer(uint32_t *out_width, uint32_t *out_height) {
-    if (out_width) *out_width = ginfo.width;
-    if (out_height) *out_height = ginfo.height;
-    return g_buf;
-}
-
-int bgce_draw(int32_t x, int32_t y, int32_t z) {
-    if (sockfd < 0) return -1;
-    uint32_t payload[5];
-    payload[0] = (uint32_t)x;
-    payload[1] = (uint32_t)y;
-    payload[2] = (uint32_t)z;
-    payload[3] = ginfo.width;
-    payload[4] = ginfo.height;
-    return send_message(sockfd, MSG_DRAW, payload, sizeof(payload));
-}
