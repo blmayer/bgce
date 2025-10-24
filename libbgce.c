@@ -10,16 +10,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-static int bgce_fd = -1;
-static int shm_fd = -1;
-static void *shared_buf = NULL;
-
 /* Connect to the BGCE server */
-static int bgce_connect(void)
+int bgce_connect(void)
 {
-	if (bgce_fd >= 0) return bgce_fd;
-
-	bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	int bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (bgce_fd < 0) {
 		perror("socket");
 		return -1;
@@ -40,27 +34,27 @@ static int bgce_connect(void)
 }
 
 /* Public API: Get server info */
-int getServerInfo(ServerInfo *info)
+int getServerInfo(int conn, ServerInfo *info)
 {
-	if (bgce_connect() < 0) return -1;
+	if (conn < 0) return -1;
 
 	BGCEMessage msg = {0};
 	msg.type = MSG_GET_SERVER_INFO;
 	msg.length = 0;
 
-	if (bgce_send_msg(bgce_fd, &msg) <= 0)
+	if (bgce_send_msg(conn, &msg) <= 0)
 		return -1;
 
-	if (bgce_recv_data(bgce_fd, info, sizeof(ServerInfo)) <= 0)
+	if (bgce_recv_data(conn, info, sizeof(ServerInfo)) <= 0)
 		return -1;
 
 	return 0;
 }
 
 /* Public API: Get shared buffer */
-void *getBuffer(int width, int height)
+void *bgce_get_buffer(int conn, int width, int height)
 {
-	if (bgce_connect() < 0) return NULL;
+	if (conn < 0) return NULL;
 
 	ClientBufferRequest req = { .width = width, .height = height };
 
@@ -69,59 +63,50 @@ void *getBuffer(int width, int height)
 	msg.length = sizeof(req);
 	memcpy(msg.data, &req, sizeof(req));
 
-	if (bgce_send_msg(bgce_fd, &msg) <= 0)
+	if (bgce_send_msg(conn, &msg) <= 0)
 		return NULL;
 
 	ClientBufferReply reply;
-	if (bgce_recv_data(bgce_fd, &reply, sizeof(reply)) <= 0)
+	if (bgce_recv_data(conn, &reply, sizeof(reply)) <= 0)
 		return NULL;
 
 	size_t size = reply.width * reply.height * 3;
-	shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
+	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
 	if (shm_fd < 0) {
 		perror("shm_open (client)");
 		return NULL;
 	}
 
-	shared_buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-	if (shared_buf == MAP_FAILED) {
+	void *buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+	if (buf == MAP_FAILED) {
 		perror("mmap (client)");
 		close(shm_fd);
 		return NULL;
 	}
 
-	return shared_buf;
+	return buf;
 }
 
 /* Public API: Draw current buffer */
-int draw(void)
+int draw(int conn)
 {
-	if (bgce_connect() < 0) return -1;
+	if (conn < 0) return -1;
 
 	BGCEMessage msg = {0};
 	msg.type = MSG_DRAW;
 	msg.length = 0;
 
-	if (bgce_send_msg(bgce_fd, &msg) <= 0)
+	if (bgce_send_msg(conn, &msg) <= 0)
 		return -1;
 
 	return 0;
 }
 
 /* Public API: Disconnect */
-void bgce_close(void)
+void bgce_close(conn)
 {
-	if (shared_buf) {
-		munmap(shared_buf, 0);
-		shared_buf = NULL;
-	}
-	if (shm_fd >= 0) {
-		close(shm_fd);
-		shm_fd = -1;
-	}
 	if (bgce_fd >= 0) {
-		close(bgce_fd);
-		bgce_fd = -1;
+		close(conn);
 	}
 }
 
