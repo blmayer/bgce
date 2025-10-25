@@ -2,20 +2,15 @@
 #define BGCE_SHARED_H
 
 #define _XOPEN_SOURCE 700
+
+#include "bgce.h"
+
 #include <sys/types.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <stddef.h>
 
-/* ----------------------------
- * Message Structure
- * ---------------------------- */
-
-struct BGCEMessage {
-    uint32_t type;
-    uint32_t length;
-    char data[0];
-};
+#define SOCKET_PATH "/tmp/bgce.sock"
 
 /* ----------------------------
  * Shared Utilities
@@ -44,12 +39,6 @@ ssize_t bgce_send_msg(int fd, const struct BGCEMessage *msg);
  * Returns total bytes read, or -1 on error.
  */
 ssize_t bgce_recv_msg(int fd, struct BGCEMessage *msg);
-
-/**
- * Blit a client's buffer into the main framebuffer.
- * (Server-side only.)
- */
-void bgce_blit_to_framebuffer(struct ServerState *server, struct Client *client);
 
 #endif /* BGCE_SHARED_H */
 

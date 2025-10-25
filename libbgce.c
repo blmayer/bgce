@@ -1,5 +1,5 @@
 #include "bgce.h"
-#include "bgce_shared.h"
+#include "shared.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +22,7 @@ int bgce_connect(void)
 	struct sockaddr_un addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, BGCE_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+	strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
 	if (connect(bgce_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		perror("connect");
@@ -34,39 +34,38 @@ int bgce_connect(void)
 }
 
 /* Public API: Get server info */
-int getServerInfo(int conn, ServerInfo *info)
+int bgce_get_server_info(int conn, struct ServerInfo *info)
 {
 	if (conn < 0) return -1;
 
-	BGCEMessage msg = {0};
+	struct BGCEMessage msg = {0};
 	msg.type = MSG_GET_SERVER_INFO;
 	msg.length = 0;
 
 	if (bgce_send_msg(conn, &msg) <= 0)
 		return -1;
 
-	if (bgce_recv_data(conn, info, sizeof(ServerInfo)) <= 0)
+	if (bgce_recv_data(conn, info, sizeof(struct ServerInfo)) <= 0)
 		return -1;
 
 	return 0;
 }
 
 /* Public API: Get shared buffer */
-void *bgce_get_buffer(int conn, int width, int height)
+void *bgce_get_buffer(int conn, struct ClientBufferRequest req)
 {
 	if (conn < 0) return NULL;
 
-	ClientBufferRequest req = { .width = width, .height = height };
-
-	BGCEMessage msg = {0};
+	struct BGCEMessage msg;
 	msg.type = MSG_GET_BUFFER;
 	msg.length = sizeof(req);
 	memcpy(msg.data, &req, sizeof(req));
 
-	if (bgce_send_msg(conn, &msg) <= 0)
+	int code = bgce_send_msg(conn, &msg);
+	if (code <= 0)
 		return NULL;
 
-	ClientBufferReply reply;
+	struct ClientBufferReply reply;
 	if (bgce_recv_data(conn, &reply, sizeof(reply)) <= 0)
 		return NULL;
 
@@ -88,11 +87,11 @@ void *bgce_get_buffer(int conn, int width, int height)
 }
 
 /* Public API: Draw current buffer */
-int draw(int conn)
+int bgce_draw(int conn)
 {
 	if (conn < 0) return -1;
 
-	BGCEMessage msg = {0};
+	struct BGCEMessage msg = {0};
 	msg.type = MSG_DRAW;
 	msg.length = 0;
 
@@ -103,9 +102,9 @@ int draw(int conn)
 }
 
 /* Public API: Disconnect */
-void bgce_close(conn)
+void bgce_close(int conn)
 {
-	if (bgce_fd >= 0) {
+	if (conn >= 0) {
 		close(conn);
 	}
 }

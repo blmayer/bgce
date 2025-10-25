@@ -1,7 +1,7 @@
 #define _XOPEN_SOURCE 700
 
-#include "bgce_shared.h"
-#include "bgce_client_handler.h"
+#include "server.h"
+#include "shared.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,17 +15,43 @@
 extern struct ServerState server;
 extern int focused_client_fd;
 
+/*
+ * Writes the active client’s buffer to /tmp/bgce_frame.ppm
+ * Each client overwrites sequentially.
+ */
+void bgce_blit_to_framebuffer(struct ServerState *server, struct Client *client)
+{
+    if (!client->buffer)
+        return;
+
+    char *buf = client->buffer;
+    size_t buf_size = (size_t)client->width * client->height * 3;
+
+    FILE *fp = fopen("/tmp/bgce_frame.ppm", "wb");
+    if (!fp) {
+        perror("fopen");
+        return;
+    }
+
+    fprintf(fp, "P6\n%d %d\n255\n", client->width, client->height);
+    fwrite(buf, 1, buf_size, fp);
+    fclose(fp);
+
+    printf("[BGCE] Frame written from client fd=%d (%ux%u)\n",
+           client->fd, client->width, client->height);
+}
+
 void *client_thread_main(void *arg) {
     int client_fd = *(int *)arg;
     free(arg);
 
-    Client client = {0};
+    struct Client client = {0};
     client.fd = client_fd;
 
     printf("[BGCE] Thread started for client fd=%d\n", client_fd);
 
     while (1) {
-        BGCEMessage msg;
+        struct BGCEMessage msg;
         ssize_t rc = bgce_recv_msg(client_fd, &msg);
         if (rc <= 0) {
             printf("[BGCE] Client disconnected (fd=%d)\n", client_fd);
@@ -34,7 +60,7 @@ void *client_thread_main(void *arg) {
 
         switch (msg.type) {
         case MSG_GET_SERVER_INFO: {
-            ServerInfo info = {
+            struct ServerInfo info = {
                 .width = server.width,
                 .height = server.height,
                 .color_depth = server.color_depth
@@ -44,12 +70,12 @@ void *client_thread_main(void *arg) {
         }
 
         case MSG_GET_BUFFER: {
-            if (msg.length < sizeof(ClientBufferRequest)) {
+            if (msg.length < sizeof(struct ClientBufferRequest)) {
                 fprintf(stderr, "[BGCE] Invalid buffer request size\n");
                 break;
             }
 
-            ClientBufferRequest req;
+            struct ClientBufferRequest req;
             memcpy(&req, msg.data, sizeof(req));
 
             snprintf(client.shm_name, sizeof(client.shm_name),
@@ -73,7 +99,7 @@ void *client_thread_main(void *arg) {
             client.height = req.height;
             close(shm_fd);
 
-            ClientBufferReply reply = {0};
+            struct ClientBufferReply reply = {0};
             strncpy(reply.shm_name, client.shm_name, sizeof(reply.shm_name));
             reply.width = req.width;
             reply.height = req.height;
@@ -92,13 +118,6 @@ void *client_thread_main(void *arg) {
             } else {
                 printf("[BGCE] Ignoring draw from unfocused client %d\n", client_fd);
             }
-            break;
-        }
-
-        case MSG_SET_FOCUS: {
-            /* Any client can request focus, in this simple model */
-            focused_client_fd = client_fd;
-            printf("[BGCE] Focus set to client %d\n", client_fd);
             break;
         }
 

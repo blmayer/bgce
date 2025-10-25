@@ -6,8 +6,6 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#define SOCKET_PATH "/tmp/bgce_server.sock"
-
 /* ----------------------------
  * Client Representation
  * ---------------------------- */

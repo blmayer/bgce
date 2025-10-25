@@ -33,7 +33,7 @@ enum {
 struct BGCEMessage {
     uint32_t type;
     uint32_t length;
-    char data[0]; /* Flexible array member */
+    char data[128];
 };
 
 struct ServerInfo {
@@ -61,7 +61,7 @@ struct ClientBufferReply {
  * Connect to a BGCE server socket.
  * Returns a file descriptor, or -1 on error.
  */
-int bgce_connect(const char *socket_path);
+int bgce_connect(void);
 
 /**
  * Request server info (width, height, color depth).
@@ -74,8 +74,7 @@ int bgce_get_server_info(int fd, struct ServerInfo *out_info);
  * Fills in the reply structure with shm name and dimensions.
  * Returns 0 on success, -1 on failure.
  */
-void *bgce_get_buffer(const struct ClientBufferRequest *req,
-                        struct ClientBufferReply *reply);
+void *bgce_get_buffer(int conn, const struct ClientBufferRequest req);
 
 /**
  * Send a draw command to the server, telling it to blit the
@@ -87,7 +86,7 @@ int bgce_draw(int fd);
 /**
  * Gracefully close connection and unmap any buffer.
  */
-void bgce_close(int fd, void *mapped_buffer, size_t size);
+void bgce_close(int fd);
 
 #endif /* BGCE_H */
 

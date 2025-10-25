@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 700
-#include "bgce_shared.h"
-#include "bgce_server.h"
+
+#include "bgce.h"
+#include "shared.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,35 +78,5 @@ ssize_t bgce_recv_msg(int fd, struct BGCEMessage *msg)
         n += d;
     }
     return n;
-}
-
-/* ============================================================
- *  FRAMEBUFFER UTILITY
- * ============================================================ */
-
-/*
- * Writes the active client’s buffer to /tmp/bgce_frame.ppm
- * Each client overwrites sequentially.
- */
-void bgce_blit_to_framebuffer(struct ServerState *server, struct Client *client)
-{
-    if (!client->buffer)
-        return;
-
-    char *buf = client->buffer;
-    size_t buf_size = (size_t)client->width * client->height * 3;
-
-    FILE *fp = fopen("/tmp/bgce_frame.ppm", "wb");
-    if (!fp) {
-        perror("fopen");
-        return;
-    }
-
-    fprintf(fp, "P6\n%d %d\n255\n", client->width, client->height);
-    fwrite(buf, 1, buf_size, fp);
-    fclose(fp);
-
-    printf("[BGCE] Frame written from client fd=%d (%ux%u)\n",
-           client->fd, client->width, client->height);
 }
 

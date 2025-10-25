@@ -1,7 +1,8 @@
 #define _XOPEN_SOURCE 700
 
-#include "bgce_shared.h"
-#include "bgce_client_handler.h"
+#include "bgce.h"
+#include "shared.h"
+#include "server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +13,10 @@
 #include <pthread.h>
 #include <signal.h>
 
-struct ServerState server;   /* Global server state */
+extern void *client_thread_main(void *arg);
+
+struct ServerState server = {
+}; /* Global server state */
 int focused_client_fd = -1;  /* Currently focused client */
 
 /* Cleanup on Ctrl+C */
@@ -27,7 +31,7 @@ static void handle_sigint(int sig)
 int main(void)
 {
     signal(SIGINT, handle_sigint);
-    memset(&server, 0, sizeof(server));
+    memset(&server, 0, sizeof(struct ServerState));
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -54,6 +58,10 @@ int main(void)
     }
 
     server.server_fd = fd;
+	server.width = 800;
+	server.height = 600;
+	server.color_depth = 32;
+
     printf("[BGCE] Server listening on %s\n", SOCKET_PATH);
 
     while (1) {
