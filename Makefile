@@ -2,13 +2,13 @@ CC = gcc
 CFLAGS = -Wall -O2 -std=c99 -fPIC -g
 LDFLAGS = -lrt
 
-SERVER_OBJS = server.o shared.o server_handler.o
-LIB_OBJS = libbgce.o shared.o
+SERVER_OBJS = server.o server_handler.o libbgce.so input.o
+LIB_OBJS = libbgce.o
 
 all: bgce libbgce.so test-client
 
 bgce: $(SERVER_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) -L. -lbgce $(LDFLAGS)
 
 libbgce.so: $(LIB_OBJS)
 	$(CC) -shared -o $@ $(LIB_OBJS) $(LDFLAGS)

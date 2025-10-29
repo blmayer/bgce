@@ -15,15 +15,17 @@
  * and send draw commands.
  * ------------------------------------------------------------------ */
 
+#define SOCKET_PATH "/tmp/bgce.sock"
+
 /* ----------------------------
  * Protocol Message Types
  * ---------------------------- */
 enum {
-    MSG_GET_SERVER_INFO = 1,
-    MSG_GET_BUFFER,
-    MSG_DRAW,
-    MSG_INPUT_EVENT,
-    MSG_FOCUS_CHANGE
+	MSG_GET_SERVER_INFO = 1,
+	MSG_GET_BUFFER,
+	MSG_DRAW,
+	MSG_INPUT_EVENT,
+	MSG_FOCUS_CHANGE
 };
 
 /* ----------------------------
@@ -31,31 +33,48 @@ enum {
  * ---------------------------- */
 
 struct BGCEMessage {
-    uint32_t type;
-    uint32_t length;
-    char data[128];
+	uint32_t type;
+	char data[128];
 };
 
 struct ServerInfo {
-    uint32_t width;
-    uint32_t height;
-    uint32_t color_depth;
+	uint32_t width;
+	uint32_t height;
+	uint32_t color_depth;
 };
 
 struct ClientBufferRequest {
-    uint32_t width;
-    uint32_t height;
+	uint32_t width;
+	uint32_t height;
 };
 
 struct ClientBufferReply {
-    char shm_name[64];
-    uint32_t width;
-    uint32_t height;
+	char shm_name[64];
+	uint32_t width;
+	uint32_t height;
+};
+
+enum BGCEInputType {
+	INPUT_KEYBOARD,
+	INPUT_MOUSE_MOVE,
+	INPUT_MOUSE_BUTTON,
+};
+
+struct BGCEInputEvent {
+	enum BGCEInputType type;
+	uint32_t code; /* key code or button code */
+	int32_t value; /* press=1, release=0, or delta */
+	int32_t x;     /* optional: for mouse move */
+	int32_t y;     /* optional: for mouse move */
 };
 
 /* ----------------------------
  * API Functions
  * ---------------------------- */
+
+ssize_t bgce_send_msg(int conn, struct BGCEMessage *msg);
+
+ssize_t bgce_recv_msg(int conn, struct BGCEMessage *msg);
 
 /**
  * Connect to a BGCE server socket.
@@ -67,14 +86,14 @@ int bgce_connect(void);
  * Request server info (width, height, color depth).
  * Returns 0 on success, -1 on failure.
  */
-int bgce_get_server_info(int fd, struct ServerInfo *out_info);
+int bgce_get_server_info(int fd, struct ServerInfo* out_info);
 
 /**
  * Request a shared memory buffer from the server.
  * Fills in the reply structure with shm name and dimensions.
  * Returns 0 on success, -1 on failure.
  */
-void *bgce_get_buffer(int conn, const struct ClientBufferRequest req);
+void* bgce_get_buffer(int conn, const struct ClientBufferRequest req);
 
 /**
  * Send a draw command to the server, telling it to blit the
@@ -89,4 +108,3 @@ int bgce_draw(int fd);
 void bgce_close(int fd);
 
 #endif /* BGCE_H */
-

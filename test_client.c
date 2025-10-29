@@ -1,7 +1,9 @@
 #include "bgce.h"
-#include <stdio.h>
-#include <stdlib.h>
+
+#include <linux/input.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 int main(void) {
@@ -18,13 +20,13 @@ int main(void) {
 	}
 
 	printf("[BGCE] Server info: %dx%d, %d-bit color\n",
-		info.width, info.height, info.color_depth);
+	       info.width, info.height, info.color_depth);
 
 	int w = info.width;
 	int h = info.height;
 
-	struct ClientBufferRequest req = { .width = w, .height = h };
-	uint8_t *buf = bgce_get_buffer(conn, req);
+	struct ClientBufferRequest req = {.width = w, .height = h};
+	uint8_t* buf = bgce_get_buffer(conn, req);
 	if (!buf) {
 		fprintf(stderr, "[BGCE] Failed to get buffer\n");
 		return 3;
@@ -34,9 +36,9 @@ int main(void) {
 	for (int y = 0; y < h; y++) {
 		for (int x = 0; x < w; x++) {
 			int idx = (y * w + x) * 3;
-			buf[idx + 0] = (x * 255) / w;   /* Red */
-			buf[idx + 1] = (y * 255) / h;   /* Green */
-			buf[idx + 2] = 64;              /* Blue constant */
+			buf[idx + 0] = (x * 255) / w; /* Red */
+			buf[idx + 1] = (y * 255) / h; /* Green */
+			buf[idx + 2] = 64;            /* Blue constant */
 		}
 	}
 
@@ -46,8 +48,33 @@ int main(void) {
 	}
 
 	printf("[BGCE] Frame drawn. Check /tmp/bgce_frame.ppm\n");
+
+	while (1) {
+		struct BGCEMessage msg;
+		ssize_t rc = bgce_recv_msg(conn, &msg);
+		if (rc <= 0) {
+			printf("[BGCE Client] Disconnected from server\n");
+			break;
+		}
+
+		switch (msg.type) {
+		case MSG_INPUT_EVENT: {
+			struct input_event ev;
+			memcpy(&ev, msg.data, sizeof(ev));
+
+			/* Example: Print keyboard/mouse input */
+			printf("[BGCE Client] Input event: type=%hu code=%hu value=%d\n",
+			       ev.type, ev.code, ev.value);
+			break;
+		}
+
+		default:
+			printf("[BGCE Client] Unknown message type %d\n", msg.type);
+			break;
+		}
+	}
+
 	bgce_close(conn);
 
 	return 0;
 }
-

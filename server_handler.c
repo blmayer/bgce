@@ -1,139 +1,133 @@
 #define _XOPEN_SOURCE 700
 
+#include "bgce.h"
 #include "server.h"
-#include "shared.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/mman.h>
-#include <fcntl.h>
 #include <time.h>
+#include <unistd.h>
 
 /* Externs from bgce_server.c */
 extern struct ServerState server;
-extern int focused_client_fd;
 
 /*
  * Writes the active client’s buffer to /tmp/bgce_frame.ppm
  * Each client overwrites sequentially.
  */
-void bgce_blit_to_framebuffer(struct ServerState *server, struct Client *client)
-{
-    if (!client->buffer)
-        return;
+void bgce_blit_to_framebuffer(struct ServerState* server, struct Client* client) {
+	if (!client->buffer)
+		return;
 
-    char *buf = client->buffer;
-    size_t buf_size = (size_t)client->width * client->height * 3;
+	char* buf = client->buffer;
+	size_t buf_size = (size_t)client->width * client->height * 3;
 
-    FILE *fp = fopen("/tmp/bgce_frame.ppm", "wb");
-    if (!fp) {
-        perror("fopen");
-        return;
-    }
+	FILE* fp = fopen("/tmp/bgce_frame.ppm", "wb");
+	if (!fp) {
+		perror("fopen");
+		return;
+	}
 
-    fprintf(fp, "P6\n%d %d\n255\n", client->width, client->height);
-    fwrite(buf, 1, buf_size, fp);
-    fclose(fp);
+	fprintf(fp, "P6\n%d %d\n255\n", client->width, client->height);
+	fwrite(buf, 1, buf_size, fp);
+	fclose(fp);
 
-    printf("[BGCE] Frame written from client fd=%d (%ux%u)\n",
-           client->fd, client->width, client->height);
+	printf("[BGCE] Frame written from client fd=%d (%ux%u)\n",
+	       client->fd, client->width, client->height);
 }
 
-void *client_thread_main(void *arg) {
-    int client_fd = *(int *)arg;
-    free(arg);
+void* client_thread_main(void* arg) {
+	int client_fd = *(int*)arg;
+	free(arg);
 
-    struct Client client = {0};
-    client.fd = client_fd;
+	struct Client client = {0};
+	client.fd = client_fd;
+	server.focused_client = &client; /* last connected client gets focus */
 
-    printf("[BGCE] Thread started for client fd=%d\n", client_fd);
+	printf("[BGCE] Thread started for client fd=%d\n", client_fd);
 
-    while (1) {
-        struct BGCEMessage msg;
-        ssize_t rc = bgce_recv_msg(client_fd, &msg);
-        if (rc <= 0) {
-            printf("[BGCE] Client disconnected (fd=%d)\n", client_fd);
-            break;
-        }
+	while (1) {
+		struct BGCEMessage msg;
+		ssize_t rc = bgce_recv_msg(client_fd, &msg);
+		if (rc <= 0) {
+			printf("[BGCE] Client disconnected (fd=%d)\n", client_fd);
+			break;
+		}
 
-        switch (msg.type) {
-        case MSG_GET_SERVER_INFO: {
-            struct ServerInfo info = {
-                .width = server.width,
-                .height = server.height,
-                .color_depth = server.color_depth
-            };
-            bgce_send_data(client_fd, &info, sizeof(info));
-            break;
-        }
+		switch (msg.type) {
+		case MSG_GET_SERVER_INFO: {
+			struct ServerInfo info = {
+			        .width = server.width,
+			        .height = server.height,
+			        .color_depth = server.color_depth};
+			memcpy(msg.data, &info, sizeof(info));
+			bgce_send_msg(client_fd, &msg);
+			break;
+		}
 
-        case MSG_GET_BUFFER: {
-            if (msg.length < sizeof(struct ClientBufferRequest)) {
-                fprintf(stderr, "[BGCE] Invalid buffer request size\n");
-                break;
-            }
+		case MSG_GET_BUFFER: {
+			struct ClientBufferRequest req;
+			memcpy(&req, msg.data, sizeof(req));
 
-            struct ClientBufferRequest req;
-            memcpy(&req, msg.data, sizeof(req));
+			snprintf(client.shm_name, sizeof(client.shm_name),
+			         "/bgce_buf_%d_%ld", getpid(), time(NULL));
 
-            snprintf(client.shm_name, sizeof(client.shm_name),
-                     "/bgce_buf_%d_%ld", getpid(), time(NULL));
+			int shm_fd = shm_open(client.shm_name, O_CREAT | O_RDWR, 0600);
+			if (shm_fd < 0) {
+				perror("shm_open");
+				break;
+			}
 
-            int shm_fd = shm_open(client.shm_name, O_CREAT | O_RDWR, 0600);
-            if (shm_fd < 0) {
-                perror("shm_open");
-                break;
-            }
+			size_t buf_size = req.width * req.height * 3;
+			if (ftruncate(shm_fd, buf_size) < 0) {
+				perror("ftruncate");
+				close(shm_fd);
+				break;
+			}
 
-            size_t buf_size = req.width * req.height * 3;
-            if (ftruncate(shm_fd, buf_size) < 0) {
-                perror("ftruncate");
-                close(shm_fd);
-                break;
-            }
+			client.buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+			client.width = req.width;
+			client.height = req.height;
+			close(shm_fd);
 
-            client.buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-            client.width = req.width;
-            client.height = req.height;
-            close(shm_fd);
+			struct ClientBufferReply reply = {0};
+			strncpy(reply.shm_name, client.shm_name, sizeof(reply.shm_name));
+			reply.width = req.width;
+			reply.height = req.height;
+			memcpy(msg.data, &reply, sizeof(reply));
+			bgce_send_msg(client_fd, &msg);
+			break;
+		}
 
-            struct ClientBufferReply reply = {0};
-            strncpy(reply.shm_name, client.shm_name, sizeof(reply.shm_name));
-            reply.width = req.width;
-            reply.height = req.height;
-            bgce_send_data(client_fd, &reply, sizeof(reply));
-            break;
-        }
+		case MSG_DRAW: {
+			if (client_fd == server.focused_client->fd) {
+				if (!client.buffer) {
+					fprintf(stderr, "[BGCE] Client has no buffer!\n");
+					break;
+				}
+				printf("[BGCE] Drawing from focused client %d\n", client_fd);
+				bgce_blit_to_framebuffer(&server, &client);
+			} else {
+				printf("[BGCE] Ignoring draw from unfocused client %d\n", client_fd);
+			}
+			break;
+		}
 
-        case MSG_DRAW: {
-            if (client_fd == focused_client_fd) {
-                if (!client.buffer) {
-                    fprintf(stderr, "[BGCE] Client has no buffer!\n");
-                    break;
-                }
-                printf("[BGCE] Drawing from focused client %d\n", client_fd);
-                bgce_blit_to_framebuffer(&server, &client);
-            } else {
-                printf("[BGCE] Ignoring draw from unfocused client %d\n", client_fd);
-            }
-            break;
-        }
+		default:
+			fprintf(stderr, "[BGCE] Unknown message type %d\n", msg.type);
+			break;
+		}
+	}
 
-        default:
-            fprintf(stderr, "[BGCE] Unknown message type %d\n", msg.type);
-            break;
-        }
-    }
+	if (client.buffer) {
+		munmap(client.buffer, client.width * client.height * 3);
+		shm_unlink(client.shm_name);
+	}
+	close(client_fd);
 
-    if (client.buffer) {
-        munmap(client.buffer, client.width * client.height * 3);
-        shm_unlink(client.shm_name);
-    }
-    close(client_fd);
-
-    printf("[BGCE] Thread exiting for client fd=%d\n", client_fd);
-    return NULL;
+	printf("[BGCE] Thread exiting for client fd=%d\n", client_fd);
+	return NULL;
 }
-

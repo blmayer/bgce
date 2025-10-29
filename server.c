@@ -1,98 +1,109 @@
 #define _XOPEN_SOURCE 700
 
 #include "bgce.h"
-#include "shared.h"
 #include "server.h"
 
+#include <pthread.h>
+#include <signal.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <pthread.h>
-#include <signal.h>
+#include <unistd.h>
 
-extern void *client_thread_main(void *arg);
+extern void* client_thread_main(void* arg);
 
-struct ServerState server = {
-}; /* Global server state */
-int focused_client_fd = -1;  /* Currently focused client */
+extern int bgce_input_init(void);
+extern void* bgce_input_thread(void* arg);
+
+struct ServerState server = {}; /* Global server state */
 
 /* Cleanup on Ctrl+C */
-static void handle_sigint(int sig)
-{
-    (void)sig;
-    unlink(SOCKET_PATH);
-    printf("\n[BGCE] Server terminated.\n");
-    exit(0);
+static void handle_sigint(int sig) {
+	(void)sig;
+	unlink(SOCKET_PATH);
+	printf("\n[BGCE] Server terminated.\n");
+	exit(0);
 }
 
-int main(void)
-{
-    signal(SIGINT, handle_sigint);
-    memset(&server, 0, sizeof(struct ServerState));
+int main(void) {
+	signal(SIGINT, handle_sigint);
+	memset(&server, 0, sizeof(struct ServerState));
 
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        return 1;
-    }
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) {
+		perror("socket");
+		return 1;
+	}
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
-    unlink(SOCKET_PATH);
+	struct sockaddr_un addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+	unlink(SOCKET_PATH);
 
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(fd);
-        return 1;
-    }
+	if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+		perror("bind");
+		close(fd);
+		return 1;
+	}
 
-    if (listen(fd, 8) < 0) {
-        perror("listen");
-        close(fd);
-        return 1;
-    }
+	if (listen(fd, 8) < 0) {
+		perror("listen");
+		close(fd);
+		return 1;
+	}
 
-    server.server_fd = fd;
+	server.server_fd = fd;
 	server.width = 800;
 	server.height = 600;
 	server.color_depth = 32;
 
-    printf("[BGCE] Server listening on %s\n", SOCKET_PATH);
+	if (bgce_input_init() != 0) {
+		perror("[BGCE] Failed to start input thread");
+		return 4;
+	}
+	pthread_t input_thread;
 
-    while (1) {
-        int client_fd = accept(fd, NULL, NULL);
-        if (client_fd < 0) {
-            perror("accept");
-            continue;
-        }
+	int rc = pthread_create(&input_thread, NULL, bgce_input_thread, NULL);
+	if (rc != 0) {
+		errno = rc;
+		perror("[BGCE] Failed to start input thread");
+		return 5;
+	}
+	pthread_detach(input_thread);
 
-        printf("[BGCE] Client connected (fd=%d)\n", client_fd);
+	printf("[BGCE] Server listening on %s\n", SOCKET_PATH);
 
-        pthread_t tid;
-        int *arg = malloc(sizeof(int));
-        if (!arg) {
-            perror("malloc");
-            close(client_fd);
-            continue;
-        }
+	while (1) {
+		int client_fd = accept(fd, NULL, NULL);
+		if (client_fd < 0) {
+			perror("accept");
+			continue;
+		}
 
-        *arg = client_fd;
-        if (pthread_create(&tid, NULL, client_thread_main, arg) != 0) {
-            perror("pthread_create");
-            free(arg);
-            close(client_fd);
-            continue;
-        }
+		printf("[BGCE] Client connected (fd=%d)\n", client_fd);
 
-        pthread_detach(tid);
-        focused_client_fd = client_fd; /* last connected client gets focus */
-    }
+		pthread_t tid;
+		int* arg = malloc(sizeof(int));
+		if (!arg) {
+			perror("malloc");
+			close(client_fd);
+			continue;
+		}
 
-    return 0;
+		*arg = client_fd;
+		if (pthread_create(&tid, NULL, client_thread_main, arg) != 0) {
+			perror("pthread_create input thread");
+			free(arg);
+			close(client_fd);
+			continue;
+		}
+
+		pthread_detach(tid);
+	}
+
+	return 0;
 }
-
