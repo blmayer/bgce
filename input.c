@@ -17,16 +17,14 @@
 #define INPUT_DIR "/dev/input"
 
 static struct {
-	int fds[MAX_INPUT_DEVICES];
 	size_t count;
+	struct pollfd fds[MAX_INPUT_DEVICES];
 } input_state;
 
 extern struct ServerState server;
 
-static struct pollfd* fds = NULL;
-static int num_fds = 0;
-
 int bgce_input_init(void) {
+	input_state.count = 0;
 	DIR* dir = opendir(INPUT_DIR);
 	if (!dir) {
 		perror("[BGCE] Failed to open /dev/input");
@@ -34,14 +32,14 @@ int bgce_input_init(void) {
 	}
 
 	struct dirent* ent;
-	while ((ent = readdir(dir)) != NULL) {
+	while ((ent = readdir(dir)) != NULL && input_state.count < 8) {
 		if (strncmp(ent->d_name, "event", 5) != 0)
 			continue;
 
 		char path[256 + 12];
 		snprintf(path, sizeof(path), "%s/%s", INPUT_DIR, ent->d_name);
 
-		int fd = open(path, O_RDONLY | O_NONBLOCK);
+		int fd = open(path, O_RDONLY);
 		if (fd < 0)
 			continue; // skip inaccessible devices
 
@@ -64,17 +62,9 @@ int bgce_input_init(void) {
 		if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0)
 			strcpy(name, "Unknown");
 
-		fds = realloc(fds, sizeof(struct pollfd) * (num_fds + 1));
-		if (!fds) {
-			perror("[BGCE] realloc");
-			close(fd);
-			closedir(dir);
-			return -1;
-		}
-
-		fds[num_fds].fd = fd;
-		fds[num_fds].events = POLLIN;
-		num_fds++;
+		input_state.fds[input_state.count].fd = fd;
+		input_state.fds[input_state.count].events = POLLIN;
+		input_state.count++;
 
 		printf("[BGCE] Input device accepted: %s (%s)%s%s\n",
 		       path, name,
@@ -84,7 +74,7 @@ int bgce_input_init(void) {
 
 	closedir(dir);
 
-	if (num_fds == 0) {
+	if (input_state.count == 0) {
 		fprintf(stderr, "[BGCE] No suitable input devices found\n");
 		return -1;
 	}
@@ -95,17 +85,19 @@ int bgce_input_init(void) {
 void* bgce_input_thread(void* arg) {
 	(void)arg;
 
-	struct pollfd fds[MAX_INPUT_DEVICES];
-	for (size_t i = 0; i < input_state.count; i++) {
-		fds[i].fd = input_state.fds[i];
-		fds[i].events = POLLIN;
-	}
-
 	printf("[BGCE] Input thread started\n");
 
 	while (1) {
-		if (poll(fds, input_state.count, -1) <= 0)
-			continue;
+		int ret = poll(input_state.fds, input_state.count, -1);
+		if (ret < 0) {
+			if (errno == EINTR) {
+				printf("EINTR\n");
+				continue;
+			}
+			perror("[BGCE] poll");
+			break;
+		}
+		printf("[BGCE] poll() returned %d\n", ret);
 
 		if (!server.focused_client) {
 			printf("[BGCE] No focused client for input event!\n");
@@ -113,19 +105,15 @@ void* bgce_input_thread(void* arg) {
 		}
 
 		for (size_t i = 0; i < input_state.count; i++) {
-			if (!(fds[i].revents & POLLIN))
+			if (input_state.fds[i].revents) {
+				printf("[BGCE] fd[%zu]=%d revents=0x%0x\n", i, input_state.fds[i].fd, input_state.fds[i].revents);
 				continue;
-
-			struct input_event ev;
-			int rc = read(fds[i].fd, &ev, sizeof(ev));
-			if (rc == sizeof(ev)) {
-				printf("[BGCE] event: type=%d code=%d value=%d\n", ev.type, ev.code, ev.value);
-			} else if (rc < 0 && errno != EAGAIN) {
-				perror("[BGCE] read");
 			}
 
-			while (rc == sizeof(ev)) {
-				printf("[BGCE] Event: type=%d code=%d value=%d\n", ev.type, ev.code, ev.value);
+			struct input_event ev;
+			ssize_t n;
+
+			while ((n = read(input_state.fds[i].fd, &ev, sizeof(ev))) == sizeof(ev)) {
 				struct BGCEInputEvent e = {0};
 
 				if (ev.type == EV_KEY) {
@@ -151,6 +139,9 @@ void* bgce_input_thread(void* arg) {
 
 				bgce_send_msg(server.focused_client->fd, &msg);
 			}
+
+			if (n < 0 && errno != EAGAIN)
+				perror("[BGCE] read");
 		}
 	}
 	return NULL;
