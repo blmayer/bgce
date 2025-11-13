@@ -14,31 +14,6 @@
 /* Externs from bgce_server.c */
 extern struct ServerState server;
 
-/*
- * Writes the active client’s buffer to /tmp/bgce_frame.ppm
- * Each client overwrites sequentially.
- */
-void bgce_blit_to_framebuffer(struct ServerState* server, struct Client* client) {
-	if (!client->buffer)
-		return;
-
-	char* buf = client->buffer;
-	size_t buf_size = (size_t)client->width * client->height * 3;
-
-	FILE* fp = fopen("/tmp/bgce_frame.ppm", "wb");
-	if (!fp) {
-		perror("fopen");
-		return;
-	}
-
-	fprintf(fp, "P6\n%d %d\n255\n", client->width, client->height);
-	fwrite(buf, 1, buf_size, fp);
-	fclose(fp);
-
-	printf("[BGCE] Frame written from client fd=%d (%ux%u)\n",
-	       client->fd, client->width, client->height);
-}
-
 void* client_thread_main(void* arg) {
 	int client_fd = *(int*)arg;
 	free(arg);
@@ -60,8 +35,8 @@ void* client_thread_main(void* arg) {
 		switch (msg.type) {
 		case MSG_GET_SERVER_INFO: {
 			struct ServerInfo info = {
-			        .width = server.width,
-			        .height = server.height,
+			        .width = server.display.mode.hdisplay,
+			        .height = server.display.mode.vdisplay,
 			        .color_depth = server.color_depth};
 			memcpy(msg.data, &info, sizeof(info));
 			bgce_send_msg(client_fd, &msg);
@@ -109,7 +84,7 @@ void* client_thread_main(void* arg) {
 					break;
 				}
 				printf("[BGCE] Drawing from focused client %d\n", client_fd);
-				bgce_blit_to_framebuffer(&server, &client);
+				draw(&server);
 			} else {
 				printf("[BGCE] Ignoring draw from unfocused client %d\n", client_fd);
 			}

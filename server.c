@@ -1,11 +1,11 @@
 #define _XOPEN_SOURCE 700
 
-#include "bgce.h"
 #include "server.h"
+#include "bgce.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,9 +57,12 @@ int main(void) {
 	}
 
 	server.server_fd = fd;
-	server.width = 800;
-	server.height = 600;
 	server.color_depth = 32;
+
+	if (init_display(&server) != 0) {
+		fprintf(stderr, "display init failed\n");
+		return 1;
+	}
 
 	if (bgce_input_init() != 0) {
 		perror("[BGCE] Failed to start input thread");
@@ -104,6 +107,9 @@ int main(void) {
 
 		pthread_detach(tid);
 	}
+
+	void bgce_display_shutdown();
+	free(server.display.framebuffer);
 
 	return 0;
 }

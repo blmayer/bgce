@@ -35,10 +35,10 @@ int main(void) {
 	printf("[BGCE] Drawing gradient...\n");
 	for (int y = 0; y < h; y++) {
 		for (int x = 0; x < w; x++) {
-			int idx = (y * w + x) * 3;
-			buf[idx + 0] = (x * 255) / w; /* Red */
-			buf[idx + 1] = (y * 255) / h; /* Green */
-			buf[idx + 2] = 64;            /* Blue constant */
+			uint8_t* p = buf + (y * w + x) * 3;
+			p[0] = (x * 255) / w;  // R
+			p[1] = (y * 255) / h; // G
+			p[2] = 128;                       // B
 		}
 	}
 
