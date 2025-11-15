@@ -16,6 +16,7 @@
  * ------------------------------------------------------------------ */
 
 #define SOCKET_PATH "/tmp/bgce.sock"
+#define BGCE_BYTES_PER_PIXEL 4
 
 /* ----------------------------
  * Protocol Message Types

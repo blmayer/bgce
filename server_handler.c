@@ -78,13 +78,18 @@ void* client_thread_main(void* arg) {
 		}
 
 		case MSG_DRAW: {
+			printf("[BGCE] Drawing from client %d (%dx%d)\n",
+			       client.fd, client.width, client.height);
+
 			if (client_fd == server.focused_client->fd) {
 				if (!client.buffer) {
 					fprintf(stderr, "[BGCE] Client has no buffer!\n");
 					break;
 				}
 				printf("[BGCE] Drawing from focused client %d\n", client_fd);
-				draw(&server);
+				printf("[BGCE] First pixel: %08x\n", ((uint32_t*)client.buffer)[0]);
+
+				draw(&server, client);
 			} else {
 				printf("[BGCE] Ignoring draw from unfocused client %d\n", client_fd);
 			}

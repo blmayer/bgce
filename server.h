@@ -19,6 +19,8 @@ struct Client {
 	void* buffer;
 	uint32_t width;
 	uint32_t height;
+	uint32_t x;
+	uint32_t y;
 	struct Client* next;
 };
 
@@ -35,6 +37,9 @@ struct DisplayState {
 	uint32_t pitch;                /* Bytes per scanline */
 	uint64_t size;                 /* Total buffer size (bytes) */
 	uint8_t* framebuffer;          /* Mapped framebuffer pointer */
+	drmModeRes* resources;
+	drmModeConnector* connector;
+	drmModeEncoder* encoder;
 	struct drm_mode_modeinfo mode; /* Active display mode */
 };
 
@@ -43,13 +48,6 @@ struct ServerState {
 	int color_depth;
 
 	struct DisplayState display;
-
-	int drm_fd;
-	drmModeRes* resources;
-	drmModeConnector* connector;
-	drmModeEncoder* encoder;
-	uint32_t crtc_id;
-	uint32_t fb_id;
 
 	struct Client* clients;
 	int client_count;
@@ -69,7 +67,7 @@ int bgce_server_init(struct ServerState* srv, const char* socket_path);
 
 int init_display(struct ServerState* srv);
 
-void draw(struct ServerState* srv);
+void draw(struct ServerState* srv, struct Client cli);
 
 void bgce_display_shutdown(void);
 

@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <linux/kd.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,12 +20,18 @@
 static struct {
 	size_t count;
 	struct pollfd fds[MAX_INPUT_DEVICES];
+	int ctrl_down;
+	int alt_down;
 } input_state;
 
+extern void cleanup_and_exit(void);
 extern struct ServerState server;
 
-int bgce_input_init(void) {
+int init_input(void) {
 	input_state.count = 0;
+	input_state.ctrl_down = 0;
+	input_state.alt_down = 0;
+
 	DIR* dir = opendir(INPUT_DIR);
 	if (!dir) {
 		perror("[BGCE] Failed to open /dev/input");
@@ -82,7 +89,35 @@ int bgce_input_init(void) {
 	return 0;
 }
 
-void* bgce_input_thread(void* arg) {
+static void handle_input_event(struct input_event* ev) {
+	if (ev->type == EV_KEY && ev->value == 1) { // Key press
+		if (ev->code == KEY_ESC) {
+			printf("[BGCE] ESC pressed, exiting.\n");
+			cleanup_and_exit();
+		}
+
+		// Ctrl+Alt+Q combo
+
+		if (ev->code == KEY_LEFTCTRL || ev->code == KEY_RIGHTCTRL)
+			input_state.ctrl_down = 1;
+		if (ev->code == KEY_LEFTALT || ev->code == KEY_RIGHTALT)
+			input_state.alt_down = 1;
+
+		if (input_state.ctrl_down && input_state.alt_down && ev->code == KEY_Q) {
+			printf("[BGCE] Ctrl+Alt+Q pressed, exiting.\n");
+			cleanup_and_exit();
+		}
+	}
+
+	if (ev->type == EV_KEY && ev->value == 0) {
+		if (ev->code == KEY_LEFTCTRL || ev->code == KEY_RIGHTCTRL)
+			input_state.ctrl_down = 0;
+		if (ev->code == KEY_LEFTALT || ev->code == KEY_RIGHTALT)
+			input_state.alt_down = 0;
+	}
+}
+
+void* input_loop(void* arg) {
 	(void)arg;
 
 	printf("[BGCE] Input thread started\n");

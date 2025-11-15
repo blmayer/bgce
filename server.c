@@ -1,5 +1,3 @@
-#define _XOPEN_SOURCE 700
-
 #include "server.h"
 #include "bgce.h"
 
@@ -15,8 +13,8 @@
 
 extern void* client_thread_main(void* arg);
 
-extern int bgce_input_init(void);
-extern void* bgce_input_thread(void* arg);
+extern int init_input(void);
+extern void* input_loop(void* arg);
 
 struct ServerState server = {}; /* Global server state */
 
@@ -64,13 +62,13 @@ int main(void) {
 		return 1;
 	}
 
-	if (bgce_input_init() != 0) {
+	if (init_input() != 0) {
 		perror("[BGCE] Failed to start input thread");
 		return 4;
 	}
 	pthread_t input_thread;
 
-	int rc = pthread_create(&input_thread, NULL, bgce_input_thread, NULL);
+	int rc = pthread_create(&input_thread, NULL, input_loop, NULL);
 	if (rc != 0) {
 		errno = rc;
 		perror("[BGCE] Failed to start input thread");

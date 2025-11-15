@@ -49,30 +49,30 @@ int main(void) {
 
 	printf("[BGCE] Frame drawn. Check /tmp/bgce_frame.ppm\n");
 
-	while (1) {
-		struct BGCEMessage msg;
-		ssize_t rc = bgce_recv_msg(conn, &msg);
-		if (rc <= 0) {
-			printf("[BGCE Client] Disconnected from server\n");
-			break;
-		}
+	//while (1) {
+	//	struct BGCEMessage msg;
+	//	ssize_t rc = bgce_recv_msg(conn, &msg);
+	//	if (rc <= 0) {
+	//		printf("[BGCE Client] Disconnected from server\n");
+	//		break;
+	//	}
 
-		switch (msg.type) {
-		case MSG_INPUT_EVENT: {
-			struct input_event ev;
-			memcpy(&ev, msg.data, sizeof(ev));
+	//	switch (msg.type) {
+	//	case MSG_INPUT_EVENT: {
+	//		struct input_event ev;
+	//		memcpy(&ev, msg.data, sizeof(ev));
 
-			/* Example: Print keyboard/mouse input */
-			printf("[BGCE Client] Input event: type=%hu code=%hu value=%d\n",
-			       ev.type, ev.code, ev.value);
-			break;
-		}
+	//		/* Example: Print keyboard/mouse input */
+	//		printf("[BGCE Client] Input event: type=%hu code=%hu value=%d\n",
+	//		       ev.type, ev.code, ev.value);
+	//		break;
+	//	}
 
-		default:
-			printf("[BGCE Client] Unknown message type %d\n", msg.type);
-			break;
-		}
-	}
+	//	default:
+	//		printf("[BGCE Client] Unknown message type %d\n", msg.type);
+	//		break;
+	//	}
+	//}
 
 	bgce_close(conn);
 
