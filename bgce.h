@@ -17,6 +17,7 @@
 
 #define SOCKET_PATH "/tmp/bgce.sock"
 #define BGCE_BYTES_PER_PIXEL 4
+#define MAX_INPUT_DEVICES 4
 
 /* ----------------------------
  * Protocol Message Types
@@ -26,7 +27,8 @@ enum {
 	MSG_GET_BUFFER,
 	MSG_DRAW,
 	MSG_INPUT_EVENT,
-	MSG_FOCUS_CHANGE
+	MSG_FOCUS_CHANGE,
+	MSG_SUBSCRIBE_INPUT
 };
 
 /* ----------------------------
@@ -35,13 +37,21 @@ enum {
 
 struct BGCEMessage {
 	uint32_t type;
-	char data[128];
+	char data[512];
+};
+
+struct BGCEInputDevice {
+	uint16_t id;        // internal index of server
+	uint16_t type_mask; // bitmask: KEY, REL, ABS, etc
+	char name[64];
 };
 
 struct ServerInfo {
 	uint32_t width;
 	uint32_t height;
 	uint32_t color_depth;
+	uint16_t input_device_count;
+	struct BGCEInputDevice devices[MAX_INPUT_DEVICES];
 };
 
 struct ClientBufferRequest {
@@ -73,9 +83,9 @@ struct BGCEInputEvent {
  * API Functions
  * ---------------------------- */
 
-ssize_t bgce_send_msg(int conn, struct BGCEMessage *msg);
+ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg);
 
-ssize_t bgce_recv_msg(int conn, struct BGCEMessage *msg);
+ssize_t bgce_recv_msg(int conn, struct BGCEMessage* msg);
 
 /**
  * Connect to a BGCE server socket.

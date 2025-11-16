@@ -196,22 +196,6 @@ void draw(struct ServerState* srv, struct Client cli) {
 
 	/* ------------- Present via DRM ------------- */
 
-	drmModeCrtc* crtc = drmModeGetCrtc(srv->display.drm_fd, srv->display.crtc_id);
-	if (crtc) {
-		int ret = drmModeSetCrtc(
-		        srv->display.drm_fd,
-		        srv->display.crtc_id,
-		        srv->display.fb_id,
-		        0, 0,
-		        &srv->display.connector_id, 1,
-		        &crtc->mode);
-		drmModeFreeCrtc(crtc);
-
-		if (ret < 0) {
-			fprintf(stderr, "[BGCE] drmModeSetCrtc failed in draw(): %s\n",
-			        strerror(errno));
-		}
-	}
 }
 
 /* Shutdown and cleanup */

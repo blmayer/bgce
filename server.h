@@ -2,11 +2,13 @@
 #define BGCE_SERVER_H
 
 #define _XOPEN_SOURCE 700
+#include "bgce.h"
+
 #include <drm/drm_mode.h>
-#include <xf86drmMode.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <xf86drmMode.h>
 
 /* ----------------------------
  * Client Representation
@@ -22,21 +24,28 @@ struct Client {
 	uint32_t x;
 	uint32_t y;
 	struct Client* next;
+	int inputs[MAX_INPUT_DEVICES];
 };
 
 /* ----------------------------
  * Server State
  * ---------------------------- */
 
+struct InputState {
+	int fds[MAX_INPUT_DEVICES];
+	struct BGCEInputDevice devs[MAX_INPUT_DEVICES];
+	size_t count;
+};
+
 struct DisplayState {
-	int drm_fd;                    /* DRM device file descriptor */
-	uint32_t crtc_id;              /* CRTC ID in use */
-	uint32_t connector_id;         /* Connector ID in use */
-	uint32_t fb_id;                /* Framebuffer ID */
-	uint32_t handle;               /* GEM buffer handle */
-	uint32_t pitch;                /* Bytes per scanline */
-	uint64_t size;                 /* Total buffer size (bytes) */
-	uint8_t* framebuffer;          /* Mapped framebuffer pointer */
+	int drm_fd;            /* DRM device file descriptor */
+	uint32_t crtc_id;      /* CRTC ID in use */
+	uint32_t connector_id; /* Connector ID in use */
+	uint32_t fb_id;        /* Framebuffer ID */
+	uint32_t handle;       /* GEM buffer handle */
+	uint32_t pitch;        /* Bytes per scanline */
+	uint64_t size;         /* Total buffer size (bytes) */
+	uint8_t* framebuffer;  /* Mapped framebuffer pointer */
 	drmModeRes* resources;
 	drmModeConnector* connector;
 	drmModeEncoder* encoder;
@@ -48,6 +57,7 @@ struct ServerState {
 	int color_depth;
 
 	struct DisplayState display;
+	struct InputState input;
 
 	struct Client* clients;
 	int client_count;

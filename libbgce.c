@@ -93,7 +93,7 @@ void* bgce_get_buffer(int conn, struct ClientBufferRequest req) {
 	struct ClientBufferReply reply;
 	memcpy(&reply, msg.data, sizeof(reply));
 
-	size_t size = reply.width * reply.height * 3;
+	size_t size = reply.width * reply.height * 4;
 	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
 	if (shm_fd < 0) {
 		perror("shm_open (client)");

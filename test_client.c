@@ -22,6 +22,14 @@ int main(void) {
 	printf("[BGCE] Server info: %dx%d, %d-bit color\n",
 	       info.width, info.height, info.color_depth);
 
+	printf("Available devices:\n");
+	for (int i = 0; i < info.input_device_count; i++) {
+		printf("  [%d] %s (mask=%x)\n",
+		       info.devices[i].id,
+		       info.devices[i].name,
+		       info.devices[i].type_mask);
+	}
+
 	int w = info.width;
 	int h = info.height;
 
@@ -31,14 +39,18 @@ int main(void) {
 		fprintf(stderr, "[BGCE] Failed to get buffer\n");
 		return 3;
 	}
+	printf("Client got buffer at: %p\n", buf);
 
 	printf("[BGCE] Drawing gradient...\n");
 	for (int y = 0; y < h; y++) {
 		for (int x = 0; x < w; x++) {
-			uint8_t* p = buf + (y * w + x) * 3;
-			p[0] = (x * 255) / w;  // R
-			p[1] = (y * 255) / h; // G
-			p[2] = 128;                       // B
+			uint32_t* p = (uint32_t*)buf + (y * w + x);
+
+			uint8_t r = (x * 255) / w;
+			uint8_t g = (y * 255) / h;
+			uint8_t b = 128;
+
+			*p = 0xFF000000 | (r << 16) | (g << 8) | b; // ARGB
 		}
 	}
 
@@ -49,7 +61,7 @@ int main(void) {
 
 	printf("[BGCE] Frame drawn. Check /tmp/bgce_frame.ppm\n");
 
-	//while (1) {
+	// while (1) {
 	//	struct BGCEMessage msg;
 	//	ssize_t rc = bgce_recv_msg(conn, &msg);
 	//	if (rc <= 0) {

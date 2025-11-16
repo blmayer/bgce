@@ -13,7 +13,6 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#define MAX_INPUT_DEVICES 8
 #define test_bit(bit, array) ((array)[(bit) / 8] & (1 << ((bit) % 8)))
 #define INPUT_DIR "/dev/input"
 
@@ -71,6 +70,10 @@ int init_input(void) {
 
 		input_state.fds[input_state.count].fd = fd;
 		input_state.fds[input_state.count].events = POLLIN;
+
+		server.input.devs[input_state.count].id = input_state.count;
+		strcpy(server.input.devs[input_state.count].name, name);
+
 		input_state.count++;
 
 		printf("[BGCE] Input device accepted: %s (%s)%s%s\n",
@@ -85,6 +88,7 @@ int init_input(void) {
 		fprintf(stderr, "[BGCE] No suitable input devices found\n");
 		return -1;
 	}
+	server.input.count = input_state.count;
 
 	return 0;
 }
@@ -132,10 +136,8 @@ void* input_loop(void* arg) {
 			perror("[BGCE] poll");
 			break;
 		}
-		printf("[BGCE] poll() returned %d\n", ret);
 
 		if (!server.focused_client) {
-			printf("[BGCE] No focused client for input event!\n");
 			continue;
 		}
 
@@ -167,12 +169,16 @@ void* input_loop(void* arg) {
 					continue;
 				}
 
-				/* Send to focused client */
-				struct BGCEMessage msg;
-				msg.type = MSG_INPUT_EVENT;
-				memcpy(msg.data, &ev, sizeof(ev));
+				for (int sub = 0; sub < MAX_INPUT_DEVICES; sub++) {
+					if (server.focused_client->inputs[sub] == i) {
+						/* Send to focused client */
+						struct BGCEMessage msg;
+						msg.type = MSG_INPUT_EVENT;
+						memcpy(msg.data, &ev, sizeof(ev));
 
-				bgce_send_msg(server.focused_client->fd, &msg);
+						bgce_send_msg(server.focused_client->fd, &msg);
+					}
+				}
 			}
 
 			if (n < 0 && errno != EAGAIN)

@@ -37,7 +37,13 @@ void* client_thread_main(void* arg) {
 			struct ServerInfo info = {
 			        .width = server.display.mode.hdisplay,
 			        .height = server.display.mode.vdisplay,
-			        .color_depth = server.color_depth};
+			        .color_depth = server.color_depth,
+			        .input_device_count = server.input.count,
+			};
+			for (int d = 0; d < server.input.count; d++) {
+				info.devices[d] = server.input.devs[d];
+			}
+
 			memcpy(msg.data, &info, sizeof(info));
 			bgce_send_msg(client_fd, &msg);
 			break;
@@ -46,6 +52,10 @@ void* client_thread_main(void* arg) {
 		case MSG_GET_BUFFER: {
 			struct ClientBufferRequest req;
 			memcpy(&req, msg.data, sizeof(req));
+			printf(
+			        "[BGCE] Client requested buffer of size %dx%d\n",
+			        req.width,
+			        req.height);
 
 			snprintf(client.shm_name, sizeof(client.shm_name),
 			         "/bgce_buf_%d_%ld", getpid(), time(NULL));
@@ -56,7 +66,7 @@ void* client_thread_main(void* arg) {
 				break;
 			}
 
-			size_t buf_size = req.width * req.height * 3;
+			size_t buf_size = req.width * req.height * 4;
 			if (ftruncate(shm_fd, buf_size) < 0) {
 				perror("ftruncate");
 				close(shm_fd);
@@ -67,6 +77,11 @@ void* client_thread_main(void* arg) {
 			client.width = req.width;
 			client.height = req.height;
 			close(shm_fd);
+			printf("Server buffer: %p size=%zu (%dx%d) name=%s\n",
+			       client.buffer,
+			       client.width * client.height * 4UL,
+			       client.width, client.height,
+			       client.shm_name);
 
 			struct ClientBufferReply reply = {0};
 			strncpy(reply.shm_name, client.shm_name, sizeof(reply.shm_name));
