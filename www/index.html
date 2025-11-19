@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BGCE</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<link rel=alternate type="application/rss+xml" title=log href=feed.xml />
+<style>pre{width:52ch;margin:2ch auto}a{color:#ff00ff}</style>
+<pre>
+	┌────────────────────────┐
+	│                        │
+	│ BGCE.                  │
+	│     |\                 │
+	│                        │
+	└────────────────────────┘
+
+<i><b>BGCE: Brian's Graphical Computer Environment</b></i>
+
+BGCE is a minimal graphical environment for Linux
+written in C. It acts as a bare-bones window system
+similar to Xorg or Wayland, but much simpler and
+designed to run <b>without root privileges</b>.
+
+
+<b>Overview</b>
+
+The system is split into two components:
+
+- <b>Server:</b> Manages video buffer, input events, and
+  window stacking.
+- <b>Client:</b> Applications that render to their own
+  buffers and request drawing through the server.
+
+
+<b>Build Instructions</b>
+
+	git clone https://terminal.pink/bgce
+	cd bgce
+	make
+	./bgce   # Start server
+	./client  # Start test client
+
+
+<b>Goals</b>
+
+- Minimal, understandable graphics stack in C
+- No external dependencies like OpenGL, X11 etc
+- Educational reference for framebuffer-based
+  compositing and IPC
+
+
+<b>License</b>
+
+MIT License
+</pre>
