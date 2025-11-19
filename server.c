@@ -11,11 +11,6 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-extern void* client_thread_main(void* arg);
-
-extern int init_input(void);
-extern void* input_loop(void* arg);
-
 struct ServerState server = {}; /* Global server state */
 
 /* Cleanup on Ctrl+C */
@@ -29,6 +24,9 @@ static void handle_sigint(int sig) {
 int main(void) {
 	signal(SIGINT, handle_sigint);
 	memset(&server, 0, sizeof(struct ServerState));
+	server.drm_fd = -1;
+	server.framebuffer = NULL;
+	server.crtc_id = 0;
 
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -55,12 +53,13 @@ int main(void) {
 	}
 
 	server.server_fd = fd;
-	server.color_depth = 32;
 
-	if (init_display(&server) != 0) {
+	if (init_display() != 0) {
 		fprintf(stderr, "display init failed\n");
+		release_display(); 
 		return 1;
 	}
+	printf("[BGCE] Display initialised\n");
 
 	if (init_input() != 0) {
 		perror("[BGCE] Failed to start input thread");
@@ -96,7 +95,7 @@ int main(void) {
 		}
 
 		*arg = client_fd;
-		if (pthread_create(&tid, NULL, client_thread_main, arg) != 0) {
+		if (pthread_create(&tid, NULL, client_thread, arg) != 0) {
 			perror("pthread_create input thread");
 			free(arg);
 			close(client_fd);
@@ -106,8 +105,8 @@ int main(void) {
 		pthread_detach(tid);
 	}
 
-	void bgce_display_shutdown();
-	free(server.display.framebuffer);
+	release_display();
+	free(server.framebuffer);
 
 	return 0;
 }

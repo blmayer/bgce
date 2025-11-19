@@ -37,26 +37,15 @@ struct InputState {
 	size_t count;
 };
 
-struct DisplayState {
-	int drm_fd;            /* DRM device file descriptor */
-	uint32_t crtc_id;      /* CRTC ID in use */
-	uint32_t connector_id; /* Connector ID in use */
-	uint32_t fb_id;        /* Framebuffer ID */
-	uint32_t handle;       /* GEM buffer handle */
-	uint32_t pitch;        /* Bytes per scanline */
-	uint64_t size;         /* Total buffer size (bytes) */
-	uint8_t* framebuffer;  /* Mapped framebuffer pointer */
-	drmModeRes* resources;
-	drmModeConnector* connector;
-	drmModeEncoder* encoder;
-	struct drm_mode_modeinfo mode; /* Active display mode */
-};
-
 struct ServerState {
 	int server_fd;
-	int color_depth;
+	int drm_fd;
+	uint32_t crtc_id;
+	uint32_t display_w;
+	uint32_t display_h;
+	uint32_t display_bpp;
+	void* framebuffer;
 
-	struct DisplayState display;
 	struct InputState input;
 
 	struct Client* clients;
@@ -66,34 +55,51 @@ struct ServerState {
 };
 
 /* ----------------------------
+ * Cursor
+ * ---------------------------- */
+
+#define CURSOR_WIDTH 8
+#define CURSOR_HEIGHT 8
+#define CURSOR_HOTSPOT_X 0
+#define CURSOR_HOTSPOT_Y 0
+
+struct CursorState {
+    int x;
+    int y;
+    uint32_t background_buffer[CURSOR_WIDTH * CURSOR_HEIGHT];
+    int active; // 0 for hidden, 1 for visible
+};
+
+
+/* ----------------------------
  * Server Functions
  * ---------------------------- */
 
 /**
- * Initialize the BGCE server socket.
- * Returns 0 on success, -1 on error.
+ * Display
  */
-int bgce_server_init(struct ServerState* srv, const char* socket_path);
+int init_display();
 
-int init_display(struct ServerState* srv);
+void release_display(void);
+
+void set_drm_cursor(struct ServerState* srv, int x, int y);
 
 void draw(struct ServerState* srv, struct Client cli);
 
-void bgce_display_shutdown(void);
-
 /**
- * Run the main accept loop — listens for incoming clients and spawns threads.
+ * Input device related functions
+ * from input.c
  */
-void bgce_server_run(struct ServerState* srv);
+int init_input(void);
 
-/**
- * Clean up sockets and client buffers.
- */
-void bgce_server_shutdown(struct ServerState* srv);
+void* input_loop(void* arg);
 
-/**
- * Handle a single connected client (thread function).
+/*
+ * Client related stuff
+ * from loop.c mainly
  */
-void* bgce_handle_client(void* arg);
+void* client_thread(void* arg);
+
+int setup_vt_handling(void);
 
 #endif /* BGCE_SERVER_H */

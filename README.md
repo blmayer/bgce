@@ -27,13 +27,11 @@ void resizeBuffer(int width, int height); // Optional: resize client buffer
 
 ### Input
 - The server listens to keyboard and mouse events.
-- Input is written to a FIFO that clients can read from.
 - Focus determines which client receives input.
 
 ### Drawing
 - Each client owns its own off-screen buffer.
 - The server composites buffers into the display based on Z-order.
-- For now, **only one client** is supported.
 
 ### Privileges
 - BGCE must **run as a normal user** (no root, no setuid).
@@ -49,8 +47,8 @@ void resizeBuffer(int width, int height); // Optional: resize client buffer
 git clone <repo-url>
 cd BGCE
 make
-./bgced   # Start server
-./bgce-client  # Start test client
+./bgce   # Start server
+./client  # Start test client
 ```
 
 ## Goals

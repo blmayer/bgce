@@ -11,10 +11,10 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Externs from bgce_server.c */
+/* Externs from server.c */
 extern struct ServerState server;
 
-void* client_thread_main(void* arg) {
+void* client_thread(void* arg) {
 	int client_fd = *(int*)arg;
 	free(arg);
 
@@ -35,9 +35,9 @@ void* client_thread_main(void* arg) {
 		switch (msg.type) {
 		case MSG_GET_SERVER_INFO: {
 			struct ServerInfo info = {
-			        .width = server.display.mode.hdisplay,
-			        .height = server.display.mode.vdisplay,
-			        .color_depth = server.color_depth,
+			        .width = server.display_w,
+			        .height = server.display_h,
+			        .color_depth = server.display_bpp,
 			        .input_device_count = server.input.count,
 			};
 			for (int d = 0; d < server.input.count; d++) {
@@ -50,7 +50,7 @@ void* client_thread_main(void* arg) {
 		}
 
 		case MSG_GET_BUFFER: {
-			struct ClientBufferRequest req;
+			struct BufferRequest req;
 			memcpy(&req, msg.data, sizeof(req));
 			printf(
 			        "[BGCE] Client requested buffer of size %dx%d\n",
@@ -83,7 +83,7 @@ void* client_thread_main(void* arg) {
 			       client.width, client.height,
 			       client.shm_name);
 
-			struct ClientBufferReply reply = {0};
+			struct BufferReply reply = {0};
 			strncpy(reply.shm_name, client.shm_name, sizeof(reply.shm_name));
 			reply.width = req.width;
 			reply.height = req.height;

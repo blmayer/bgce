@@ -27,6 +27,7 @@ enum {
 	MSG_GET_BUFFER,
 	MSG_DRAW,
 	MSG_INPUT_EVENT,
+	MSG_BUFFER_CHANGE,
 	MSG_FOCUS_CHANGE,
 	MSG_SUBSCRIBE_INPUT
 };
@@ -54,12 +55,19 @@ struct ServerInfo {
 	struct BGCEInputDevice devices[MAX_INPUT_DEVICES];
 };
 
-struct ClientBufferRequest {
+struct BufferRequest {
 	uint32_t width;
 	uint32_t height;
 };
 
-struct ClientBufferReply {
+struct MoveBufferRequest {
+	uint32_t x;
+	uint32_t y;
+	uint32_t width;
+	uint32_t height;
+};
+
+struct BufferReply {
 	char shm_name[64];
 	uint32_t width;
 	uint32_t height;
@@ -104,7 +112,9 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
  * Fills in the reply structure with shm name and dimensions.
  * Returns 0 on success, -1 on failure.
  */
-void* bgce_get_buffer(int conn, const struct ClientBufferRequest req);
+void* bgce_get_buffer(int conn, const struct BufferRequest req);
+
+int bgce_move_buffer(int fd, const struct MoveBufferRequest req);
 
 /**
  * Send a draw command to the server, telling it to blit the
@@ -116,6 +126,6 @@ int bgce_draw(int fd);
 /**
  * Gracefully close connection and unmap any buffer.
  */
-void bgce_close(int fd);
+void bgce_disconnect(int fd);
 
 #endif /* BGCE_H */

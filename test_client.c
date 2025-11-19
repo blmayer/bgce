@@ -3,7 +3,6 @@
 #include <linux/input.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 
 int main(void) {
@@ -33,7 +32,7 @@ int main(void) {
 	int w = info.width;
 	int h = info.height;
 
-	struct ClientBufferRequest req = {.width = w, .height = h};
+	struct BufferRequest req = {.width = w, .height = h};
 	uint8_t* buf = bgce_get_buffer(conn, req);
 	if (!buf) {
 		fprintf(stderr, "[BGCE] Failed to get buffer\n");
@@ -86,7 +85,7 @@ int main(void) {
 	//	}
 	//}
 
-	bgce_close(conn);
+	bgce_disconnect(conn);
 
 	return 0;
 }

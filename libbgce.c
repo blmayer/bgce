@@ -75,7 +75,7 @@ int bgce_get_server_info(int conn, struct ServerInfo* info) {
 }
 
 /* Public API: Get shared buffer */
-void* bgce_get_buffer(int conn, struct ClientBufferRequest req) {
+void* bgce_get_buffer(int conn, struct BufferRequest req) {
 	if (conn < 0)
 		return NULL;
 
@@ -90,7 +90,7 @@ void* bgce_get_buffer(int conn, struct ClientBufferRequest req) {
 	if (bgce_recv_msg(conn, &msg) <= 0)
 		return NULL;
 
-	struct ClientBufferReply reply;
+	struct BufferReply reply;
 	memcpy(&reply, msg.data, sizeof(reply));
 
 	size_t size = reply.width * reply.height * 4;
@@ -110,6 +110,15 @@ void* bgce_get_buffer(int conn, struct ClientBufferRequest req) {
 	return buf;
 }
 
+int bgce_move_buffer(int conn, struct MoveBufferRequest req) {
+	struct BGCEMessage msg;
+	msg.type = MSG_BUFFER_CHANGE;
+	memcpy(msg.data, &req, sizeof(req));
+
+	int code = bgce_send_msg(conn, &msg);
+	return code;
+}
+
 /* Public API: Draw current buffer */
 int bgce_draw(int conn) {
 	if (conn < 0)
@@ -125,7 +134,7 @@ int bgce_draw(int conn) {
 }
 
 /* Public API: Disconnect */
-void bgce_close(int conn) {
+void bgce_disconnect(int conn) {
 	if (conn >= 0) {
 		close(conn);
 	}
