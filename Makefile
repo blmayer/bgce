@@ -13,8 +13,8 @@ bgce: $(SERVER_OBJS)
 libbgce.so: $(LIB_OBJS)
 	$(CC) -shared -o $@ $(LIB_OBJS) $(LDFLAGS)
 
-client: test_client.c bgce.h
-	$(CC) $(CFLAGS) -o $@ test_client.c -L. -lbgce $(LDFLAGS)
+client: client.c bgce.h
+	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce $(LDFLAGS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

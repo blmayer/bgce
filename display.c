@@ -35,21 +35,18 @@
 extern struct ServerState server;
 
 int drm_fd = -1;
-uint32_t fb_id = 0;
-uint32_t scanout_handle;
-uint64_t scanout_size;
-drmModeRes* resources = NULL;
-drmModeConnector* connector = NULL;
-drmModeEncoder* encoder = NULL;
-drmModeCrtc* saved_crtc = NULL;
-uint32_t conn_id = 0, crtc_id = 0;
-drmModeModeInfo chosen_mode;
-bool found = false;
+uint32_t conn_id = 0;
 uint32_t cur_fb = 0;
 uint32_t cur_handle;
 uint64_t cur_size;
 void* cur_map;
-
+uint32_t scanout_handle;
+uint64_t scanout_size;
+drmModeConnector* connector = NULL;
+uint32_t fb_id = 0;
+drmModeRes* resources = NULL;
+drmModeEncoder* encoder = NULL;
+drmModeCrtc* saved_crtc = NULL;
 /* wrappers for ioctl structures (from drm_mode.h) */
 static int drm_create_dumb(int fd, uint32_t width, uint32_t height, uint32_t bpp,
                            struct drm_mode_create_dumb* create) {
@@ -104,12 +101,8 @@ static void draw_cursor(uint8_t* buf, uint32_t stride, uint32_t w, uint32_t h) {
 	for (uint32_t y = 0; y < h; y++) {
 		uint32_t* line = (uint32_t*)(buf + y * stride);
 		for (uint32_t x = 0; x < w; x++) {
-			/* simple circle with alpha */
-			int cx = w / 2, cy = h / 2;
-			int dx = x - cx, dy = y - cy;
-			int dist2 = dx * dx + dy * dy;
-			int r = (w / 2);
-			if (dist2 <= r * r) {
+			/* simple triangle with alpha */
+			if (x < y && x > y/5 && x+y < 64) {
 				uint8_t alpha = 200;
 				uint8_t red = 255;
 				uint8_t green = (x * 255) / (w - 1);
@@ -123,6 +116,10 @@ static void draw_cursor(uint8_t* buf, uint32_t stride, uint32_t w, uint32_t h) {
 }
 
 int init_display() {
+	uint32_t crtc_id = 0;
+	drmModeModeInfo chosen_mode;
+	bool found = false;
+
 	const char* dri_card = "/dev/dri/card1";
 	drm_fd = open(dri_card, O_RDWR | O_CLOEXEC);
 	if (drm_fd < 0) {
@@ -131,10 +128,10 @@ int init_display() {
 	}
 	server.drm_fd = drm_fd;
 
-	//if (setup_vt_handling() < 0) {
+	// if (setup_vt_handling() < 0) {
 	//	close(server->drm_fd);
 	//	return -1;
-	//}
+	// }
 
 	resources = drmModeGetResources(drm_fd);
 	if (!resources) {
@@ -277,15 +274,17 @@ int init_display() {
 	/* ---------- Create dumb cursor buffer (small ARGB) ---------- */
 	const uint32_t cur_w = 64;
 	const uint32_t cur_h = 64;
+
 	struct drm_mode_create_dumb cur_create = {0};
 	if (drm_create_dumb(drm_fd, cur_w, cur_h, 32, &cur_create) < 0) {
 		fprintf(stderr, "Failed to create dumb buffer for cursor\n");
 		return -1;
 	}
 	cur_handle = cur_create.handle;
-	uint32_t cur_pitch = cur_create.pitch;
 	cur_size = cur_create.size;
+	
 	uint64_t cur_offset;
+	uint32_t cur_pitch = cur_create.pitch;
 	if (drm_map_dumb(drm_fd, cur_handle, &cur_offset) < 0) {
 		fprintf(stderr, "Failed to map dumb cursor\n");
 		return -1;
@@ -296,6 +295,7 @@ int init_display() {
 		return -1;
 	}
 	memset(cur_map, 0, cur_size);
+
 	draw_cursor((uint8_t*)cur_map, cur_pitch, cur_w, cur_h);
 
 #ifdef DRM_FORMAT_ARGB8888
@@ -331,9 +331,7 @@ int init_display() {
 		/* keep going — maybe hardware doesn't support cursor */
 	} else {
 		/* move cursor to near center */
-		int32_t cx = (width - cur_w) / 2;
-		int32_t cy = (height - cur_h) / 2;
-		if (drmModeMoveCursor(drm_fd, crtc_id, cx, cy) != 0) {
+		if (drmModeMoveCursor(drm_fd, crtc_id, width/2, height/2) != 0) {
 			fprintf(stderr, "drmModeMoveCursor failed\n");
 		}
 	}
@@ -341,7 +339,6 @@ int init_display() {
 	return 0;
 }
 
-/* Convert server RGB24 buffer to XRGB8888 and copy into drm_map */
 void draw(struct ServerState* srv, struct Client cli) {
 	if (!srv || !srv->framebuffer || !cli.buffer)
 		return;
