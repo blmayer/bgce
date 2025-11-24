@@ -165,11 +165,14 @@ static int handle_input_event(struct input_event ev) {
 		}
 
 		// Ctrl+Alt+Q combo
-		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL)
+		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
+			printf("[BGCE] Ctrl pressed.\n");
 			input_state.ctrl_down = 1;
-		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT)
+		}
+		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
+			printf("[BGCE] Alt pressed.\n");
 			input_state.alt_down = 1;
-
+		}
 		if (input_state.ctrl_down && input_state.alt_down && ev.code == KEY_Q) {
 			printf("[BGCE] Ctrl+Alt+Q pressed, exiting.\n");
 			return 1;
@@ -177,10 +180,14 @@ static int handle_input_event(struct input_event ev) {
 	}
 
 	if (ev.type == EV_KEY && ev.value == 0) { // Key release
-		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL)
+		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
+			printf("[BGCE] Ctrl released.\n");
 			input_state.ctrl_down = 0;
-		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT)
+		}
+		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
+			printf("[BGCE] Alt released.\n");
 			input_state.alt_down = 0;
+		}
 
 		// Stop drag on button release
 		if (((ev.code == BTN_LEFT && input_state.drag.type == DRAG_MOVE) ||
@@ -262,7 +269,6 @@ static int handle_input_event(struct input_event ev) {
 
 		// Set the cursor position
 		printf("[BGCE] new mouse position: (%u,%u).\n", input_state.mouse_x, input_state.mouse_y);
-		printf("[BGCE] server: %u %u.\n", server.drm_fd, server.crtc_id);
 		drmModeMoveCursor(
 		        server.drm_fd,
 		        server.crtc_id,
@@ -327,56 +333,56 @@ void* input_loop(void* arg) {
 			struct input_event ev;
 
 			if (input_state.fds[i].revents & POLLIN) {
-				while (1) {
-					ssize_t n = read(input_state.fds[i].fd, &ev, sizeof(ev));
-					if (n == -1) {
-						if (errno == EAGAIN || errno == EWOULDBLOCK)
-							break;
-						perror("read input");
+				printf("[BGCE] Reading from device: %s\n", server.input.devs[i].name);
+				ssize_t n = read(input_state.fds[i].fd, &ev, sizeof(ev));
+				if (n == -1) {
+					if (errno == EAGAIN || errno == EWOULDBLOCK) {
+						perror("[BGCE] read input");
 						break;
 					}
-					if (n != sizeof(ev))
-						break;
+					perror("read input");
+					break;
+				}
+				if (n != sizeof(ev))
+					break;
+				printf("[BGCE] Received input: type=%d code=%d value=%d device=%s\n",
+				       ev.type, ev.code, ev.value, server.input.devs[i].name);
 
-					printf("input: type=%d code=%d value=%d\n",
-					       ev.type, ev.code, ev.value);
+				if (handle_input_event(ev)) {
+					printf("[BGCE] Event handled\n");
+					continue;
+				}
 
-					if (handle_input_event(ev)) {
-						printf("[BGCE] Event handled\n");
-						continue;
-					}
+				if (!server.focused_client) {
+					continue;
+				}
 
-					if (!server.focused_client) {
-						continue;
-					}
+				struct BGCEInputEvent e = {0};
 
-					struct BGCEInputEvent e = {0};
+				if (ev.type == EV_KEY) {
+					e.type = INPUT_KEYBOARD;
+					e.code = ev.code;
+					e.value = ev.value;
+				} else if (ev.type == EV_REL) {
+					e.type = INPUT_MOUSE_MOVE;
+					if (ev.code == REL_X)
+						e.x = ev.value;
+					else if (ev.code == REL_Y)
+						e.y = ev.value;
+				} else if (ev.type == EV_SYN) {
+					continue;
+				} else {
+					continue;
+				}
 
-					if (ev.type == EV_KEY) {
-						e.type = INPUT_KEYBOARD;
-						e.code = ev.code;
-						e.value = ev.value;
-					} else if (ev.type == EV_REL) {
-						e.type = INPUT_MOUSE_MOVE;
-						if (ev.code == REL_X)
-							e.x = ev.value;
-						else if (ev.code == REL_Y)
-							e.y = ev.value;
-					} else if (ev.type == EV_SYN) {
-						continue;
-					} else {
-						continue;
-					}
+				for (int sub = 0; sub < MAX_INPUT_DEVICES; sub++) {
+					if (server.focused_client->inputs[sub] == i) {
+						/* Send to focused client */
+						struct BGCEMessage msg;
+						msg.type = MSG_INPUT_EVENT;
+						memcpy(msg.data, &ev, sizeof(ev));
 
-					for (int sub = 0; sub < MAX_INPUT_DEVICES; sub++) {
-						if (server.focused_client->inputs[sub] == i) {
-							/* Send to focused client */
-							struct BGCEMessage msg;
-							msg.type = MSG_INPUT_EVENT;
-							memcpy(msg.data, &ev, sizeof(ev));
-
-							bgce_send_msg(server.focused_client->fd, &msg);
-						}
+						bgce_send_msg(server.focused_client->fd, &msg);
 					}
 				}
 			}

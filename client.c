@@ -3,6 +3,8 @@
 #include <linux/input.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 int main(void) {
@@ -28,9 +30,8 @@ int main(void) {
 		       info.devices[i].name,
 		       info.devices[i].type_mask);
 	}
-
-	int w = info.width;
-	int h = info.height;
+	int w = 800;
+	int h = 600;
 
 	struct BufferRequest req = {.width = w, .height = h};
 	uint8_t* buf = bgce_get_buffer(conn, req);
@@ -60,30 +61,37 @@ int main(void) {
 
 	printf("[BGCE] Frame drawn. Check /tmp/bgce_frame.ppm\n");
 
-	// while (1) {
-	//	struct BGCEMessage msg;
-	//	ssize_t rc = bgce_recv_msg(conn, &msg);
-	//	if (rc <= 0) {
-	//		printf("[BGCE Client] Disconnected from server\n");
-	//		break;
-	//	}
+	time_t start_time = time(NULL);
+	while (1) {
+		struct BGCEMessage msg;
+		ssize_t rc = bgce_recv_msg(conn, &msg);
+		if (rc <= 0) {
+			printf("[BGCE Client] Disconnected from server\n");
+			break;
+		}
 
-	//	switch (msg.type) {
-	//	case MSG_INPUT_EVENT: {
-	//		struct input_event ev;
-	//		memcpy(&ev, msg.data, sizeof(ev));
+		switch (msg.type) {
+		case MSG_INPUT_EVENT: {
+			struct input_event ev;
+			memcpy(&ev, msg.data, sizeof(ev));
 
-	//		/* Example: Print keyboard/mouse input */
-	//		printf("[BGCE Client] Input event: type=%hu code=%hu value=%d\n",
-	//		       ev.type, ev.code, ev.value);
-	//		break;
-	//	}
+			/* Example: Print keyboard/mouse input */
+			printf("[BGCE Client] Input event: type=%hu code=%hu value=%d\n",
+			       ev.type, ev.code, ev.value);
+			break;
+		}
 
-	//	default:
-	//		printf("[BGCE Client] Unknown message type %d\n", msg.type);
-	//		break;
-	//	}
-	//}
+		default:
+			printf("[BGCE Client] Unknown message type %d\n", msg.type);
+			break;
+		}
+
+		// Check if 10 seconds have passed
+		if (time(NULL) - start_time >= 10) {
+			printf("[BGCE Client] Timeout reached, exiting...\n");
+			break;
+		}
+	}
 
 	bgce_disconnect(conn);
 
