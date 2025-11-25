@@ -47,6 +47,7 @@ uint32_t fb_id = 0;
 drmModeRes* resources = NULL;
 drmModeEncoder* encoder = NULL;
 drmModeCrtc* saved_crtc = NULL;
+
 /* wrappers for ioctl structures (from drm_mode.h) */
 static int drm_create_dumb(int fd, uint32_t width, uint32_t height, uint32_t bpp,
                            struct drm_mode_create_dumb* create) {
@@ -102,7 +103,7 @@ static void draw_cursor(uint8_t* buf, uint32_t stride, uint32_t w, uint32_t h) {
 		uint32_t* line = (uint32_t*)(buf + y * stride);
 		for (uint32_t x = 0; x < w; x++) {
 			/* simple triangle with alpha */
-			if (x < y && x > y/5 && x+y < 64) {
+			if (x < y && x > y / 5 && x + y < 64) {
 				uint8_t alpha = 200;
 				uint8_t red = 255;
 				uint8_t green = (x * 255) / (w - 1);
@@ -282,7 +283,7 @@ int init_display() {
 	}
 	cur_handle = cur_create.handle;
 	cur_size = cur_create.size;
-	
+
 	uint64_t cur_offset;
 	uint32_t cur_pitch = cur_create.pitch;
 	if (drm_map_dumb(drm_fd, cur_handle, &cur_offset) < 0) {
@@ -331,7 +332,7 @@ int init_display() {
 		/* keep going — maybe hardware doesn't support cursor */
 	} else {
 		/* move cursor to near center */
-		if (drmModeMoveCursor(drm_fd, crtc_id, width/2, height/2) != 0) {
+		if (drmModeMoveCursor(drm_fd, crtc_id, width / 2, height / 2) != 0) {
 			fprintf(stderr, "drmModeMoveCursor failed\n");
 		}
 	}
@@ -386,6 +387,74 @@ void draw(struct ServerState* srv, struct Client cli) {
 		uint32_t* drow = dst + (start_y + y) * screen_stride_pixels + start_x;
 		uint32_t* srow = src + (src_start_y + y) * client_w + src_start_x;
 		memcpy(drow, srow, copy_w * 4);
+	}
+}
+
+void redraw_region(struct ServerState* srv, int old_x, int old_y, int new_x, int new_y, int width, int height) {
+	if (!srv || !srv->framebuffer)
+		return;
+
+	uint32_t screen_w = srv->display_w;
+	uint32_t screen_h = srv->display_h;
+
+	/* Calculate the exposed area (difference between old and new regions) */
+	int exposed_start_x = old_x < new_x ? old_x : new_x;
+	int exposed_end_x = old_x + width > new_x + width ? old_x + width : new_x + width;
+	int exposed_start_y = old_y < new_y ? old_y : new_y;
+	int exposed_end_y = old_y + height > new_y + height ? old_y + height : new_y + height;
+
+	/* Only redraw the non-overlapping part */
+	if (old_x < new_x) {
+		exposed_end_x = old_x + (new_x - old_x);
+	} else if (old_x > new_x) {
+		exposed_start_x = new_x + width;
+	}
+
+	if (old_y < new_y) {
+		exposed_end_y = old_y + (new_y - old_y);
+	} else if (old_y > new_y) {
+		exposed_start_y = new_y + height;
+	}
+
+	/* Clip the exposed region to the screen boundaries */
+	int start_x = exposed_start_x < 0 ? 0 : exposed_start_x;
+	int start_y = exposed_start_y < 0 ? 0 : exposed_start_y;
+
+	int end_x = exposed_end_x > (int)screen_w ? screen_w : exposed_end_x;
+	int end_y = exposed_end_y > (int)screen_h ? screen_h : exposed_end_y;
+
+	if (start_x >= end_x || start_y >= end_y)
+		return;
+
+	int copy_w = end_x - start_x;
+	int copy_h = end_y - start_y;
+
+	uint32_t screen_stride_pixels = screen_w;
+
+	/* Iterate over clients to find overlapping ones */
+	for (int i = 0; i < srv->client_count; i++) {
+		struct Client* cli = &srv->clients[i];
+		if (!cli->buffer)
+			continue;
+
+		/* Check if this client overlaps with the exposed region */
+		int cli_end_x = cli->x + cli->width;
+		int cli_end_y = cli->y + cli->height;
+
+		int overlap_start_x = start_x > cli->x ? start_x : cli->x;
+		int overlap_start_y = start_y > cli->y ? start_y : cli->y;
+
+		int overlap_end_x = end_x < cli_end_x ? end_x : cli_end_x;
+		int overlap_end_y = end_y < cli_end_y ? end_y : cli_end_y;
+
+		if (overlap_start_x < overlap_end_x && overlap_start_y < overlap_end_y) {
+			/* Redraw the overlapping part of the client */
+			for (int y = overlap_start_y; y < overlap_end_y; y++) {
+				uint32_t* drow = (uint32_t*)srv->framebuffer + y * screen_stride_pixels + overlap_start_x;
+				uint32_t* srow = (uint32_t*)cli->buffer + (y - cli->y) * cli->width + (overlap_start_x - cli->x);
+				memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
+			}
+		}
 	}
 }
 

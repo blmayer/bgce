@@ -36,15 +36,10 @@ enum {
  * Data Structures
  * ---------------------------- */
 
-struct BGCEMessage {
-	uint32_t type;
-	char data[512];
-};
-
 struct BGCEInputDevice {
 	uint16_t id;        // internal index of server
 	uint16_t type_mask; // bitmask: KEY, REL, ABS, etc
-	char name[64];
+	char name[256];
 };
 
 struct ServerInfo {
@@ -79,12 +74,24 @@ enum BGCEInputType {
 	INPUT_MOUSE_BUTTON,
 };
 
-struct BGCEInputEvent {
+struct InputEvent {
 	enum BGCEInputType type;
 	uint32_t code; /* key code or button code */
 	int32_t value; /* press=1, release=0, or delta */
 	int32_t x;     /* optional: for mouse move */
 	int32_t y;     /* optional: for mouse move */
+};
+
+struct BGCEMessage {
+	uint32_t type;
+	union {
+		struct ServerInfo server_info;
+		struct BufferRequest buffer_request;
+		struct BufferReply buffer_reply;
+		struct MoveBufferRequest move_buffer_request;
+		struct InputEvent input_event;
+		
+	} data;
 };
 
 /* ----------------------------

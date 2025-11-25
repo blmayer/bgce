@@ -86,6 +86,8 @@ void set_drm_cursor(struct ServerState* srv, int x, int y);
 
 void draw(struct ServerState* srv, struct Client cli);
 
+void redraw_region(struct ServerState* srv, int old_x, int old_y, int new_x, int new_y, int width, int height);
+
 /**
  * Input device related functions
  * from input.c

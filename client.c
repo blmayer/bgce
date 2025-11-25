@@ -72,8 +72,7 @@ int main(void) {
 
 		switch (msg.type) {
 		case MSG_INPUT_EVENT: {
-			struct input_event ev;
-			memcpy(&ev, msg.data, sizeof(ev));
+			struct InputEvent ev = msg.data.input_event;
 
 			/* Example: Print keyboard/mouse input */
 			printf("[BGCE Client] Input event: type=%hu code=%hu value=%d\n",

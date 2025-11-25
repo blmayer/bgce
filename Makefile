@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -O2 -std=c99 -fPIC -g -I/usr/include/libdrm
+CFLAGS = -Wall -O0 -std=c99 -fPIC -g -I/usr/include/libdrm
 LDFLAGS = -lrt -ldrm
 
 SERVER_OBJS = server.o loop.o libbgce.so input.o display.o

@@ -23,6 +23,10 @@ static void handle_sigint(int sig) {
 
 int main(void) {
 	signal(SIGINT, handle_sigint);
+
+	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
+	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
+	
 	memset(&server, 0, sizeof(struct ServerState));
 	server.drm_fd = -1;
 	server.framebuffer = NULL;
@@ -56,7 +60,7 @@ int main(void) {
 
 	if (init_display() != 0) {
 		fprintf(stderr, "display init failed\n");
-		release_display(); 
+		release_display();
 		return 1;
 	}
 	printf("[BGCE] Display initialised\n");

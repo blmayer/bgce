@@ -16,29 +16,29 @@
 #define test_bit(bit, array) ((array)[(bit) / 8] & (1 << ((bit) % 8)))
 #define INPUT_DIR "/dev/input"
 
-static struct {
-	size_t count;
-	struct pollfd fds[MAX_INPUT_DEVICES];
-	int ctrl_down;
-	int alt_down;
-	int mouse_x;
-	int mouse_y;
-	struct {
-		int active;
-		struct Client* target;
-		int start_mouse_x;
-		int start_mouse_y;
-		uint32_t start_win_x;
-		uint32_t start_win_y;
-		uint32_t start_win_width;
-		uint32_t start_win_height;
-		enum {
-			DRAG_NONE,
-			DRAG_MOVE,
-			DRAG_RESIZE
-		} type;
-	} drag;
-} input_state;
+int ctrl_down;
+int alt_down;
+int mouse_x;
+int mouse_y;
+
+size_t count;
+struct pollfd fds[MAX_INPUT_DEVICES];
+
+struct {
+	int active;
+	struct Client* target;
+	int start_mouse_x;
+	int start_mouse_y;
+	uint32_t start_win_x;
+	uint32_t start_win_y;
+	uint32_t start_win_width;
+	uint32_t start_win_height;
+	enum {
+		DRAG_NONE,
+		DRAG_MOVE,
+		DRAG_RESIZE
+	} type;
+} drag;
 
 extern struct ServerState server;
 
@@ -56,33 +56,11 @@ struct Client* pick_client(int x, int y) {
 	return picked;
 }
 
-void move_client(struct Client* c, uint32_t x, uint32_t y,
-                 uint32_t width, uint32_t height) {
-	c->x = x;
-	c->y = y;
-	c->width = width;
-	c->height = height;
-
-	struct BGCEMessage msg;
-	msg.type = MSG_BUFFER_CHANGE;
-	struct MoveBufferRequest req = {
-	        .x = x,
-	        .y = y,
-	        .width = width,
-	        .height = height};
-	memcpy(msg.data, &req, sizeof(req));
-	bgce_send_msg(c->fd, &msg);
-}
-
 int init_input(void) {
-	input_state.count = 0;
-	input_state.ctrl_down = 0;
-	input_state.alt_down = 0;
-	input_state.mouse_x = server.display_w / 2;
-	input_state.mouse_y = server.display_h / 2;
-	input_state.drag.active = 0;
-	input_state.drag.target = NULL;
-	input_state.drag.type = DRAG_NONE;
+	count = 0;
+	drag.type = DRAG_NONE;
+	mouse_x = server.display_w / 2;
+	mouse_y = server.display_h / 2;
 
 	DIR* dir = opendir(INPUT_DIR);
 	if (!dir) {
@@ -91,7 +69,7 @@ int init_input(void) {
 	}
 
 	struct dirent* ent;
-	while ((ent = readdir(dir)) != NULL && input_state.count < 8) {
+	while ((ent = readdir(dir)) != NULL && count < MAX_INPUT_DEVICES) {
 		if (strncmp(ent->d_name, "event", 5) != 0)
 			continue;
 
@@ -121,13 +99,13 @@ int init_input(void) {
 		if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0)
 			strcpy(name, "Unknown");
 
-		input_state.fds[input_state.count].fd = fd;
-		input_state.fds[input_state.count].events = POLLIN;
+		fds[count].fd = fd;
+		fds[count].events = POLLIN;
 
-		server.input.devs[input_state.count].id = input_state.count;
-		strcpy(server.input.devs[input_state.count].name, name);
+		server.input.devs[count].id = count;
+		strcpy(server.input.devs[count].name, name);
 
-		input_state.count++;
+		count++;
 
 		printf("[BGCE] Input device accepted: %s (%s)%s%s\n",
 		       path, name,
@@ -137,11 +115,11 @@ int init_input(void) {
 
 	closedir(dir);
 
-	if (input_state.count == 0) {
+	if (count == 0) {
 		fprintf(stderr, "[BGCE] No suitable input devices found\n");
 		return -1;
 	}
-	server.input.count = input_state.count;
+	server.input.count = count;
 
 	return 0;
 }
@@ -167,13 +145,13 @@ static int handle_input_event(struct input_event ev) {
 		// Ctrl+Alt+Q combo
 		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
 			printf("[BGCE] Ctrl pressed.\n");
-			input_state.ctrl_down = 1;
+			ctrl_down = 1;
 		}
 		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
 			printf("[BGCE] Alt pressed.\n");
-			input_state.alt_down = 1;
+			alt_down = 1;
 		}
-		if (input_state.ctrl_down && input_state.alt_down && ev.code == KEY_Q) {
+		if (ctrl_down == 1 && alt_down == 1 && ev.code == KEY_Q) {
 			printf("[BGCE] Ctrl+Alt+Q pressed, exiting.\n");
 			return 1;
 		}
@@ -182,129 +160,124 @@ static int handle_input_event(struct input_event ev) {
 	if (ev.type == EV_KEY && ev.value == 0) { // Key release
 		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
 			printf("[BGCE] Ctrl released.\n");
-			input_state.ctrl_down = 0;
+			ctrl_down = 0;
 		}
 		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
 			printf("[BGCE] Alt released.\n");
-			input_state.alt_down = 0;
+			alt_down = 0;
 		}
 
 		// Stop drag on button release
-		if (((ev.code == BTN_LEFT && input_state.drag.type == DRAG_MOVE) ||
-		     (ev.code == BTN_RIGHT && input_state.drag.type == DRAG_RESIZE)) &&
-		    input_state.drag.active) { // Only stop if it was an active drag of that type
-			// Send final buffer change message to client
-			struct Client* c = input_state.drag.target;
-			if (c) {
-				move_client(c, c->x, c->y, c->width, c->height);
-			}
-			input_state.drag.active = 0;
-			input_state.drag.target = NULL;
-			input_state.drag.type = DRAG_NONE;
-			printf("[BGCE] drag event.\n");
+		if (((ev.code == BTN_LEFT && drag.type == DRAG_MOVE) ||
+		     (ev.code == BTN_RIGHT && drag.type == DRAG_RESIZE)) &&
+		    drag.active) { // Only stop if it was an active drag of that type
+			printf("[BGCE] End of drag event.\n");
+			drag.active = 0;
+			drag.target = NULL;
+			drag.type = DRAG_NONE;
 			return 1;
 		}
 	}
 
+	if (ev.type == EV_KEY && ev.code == BTN_LEFT && ev.value == 1) {
+		int mx = mouse_x;
+		int my = mouse_y;
+		printf("[BGCE] Left click detected at (%d, %d).\n", mx, my);
+	}
 	if (ev.type == EV_KEY && ev.code == BTN_LEFT &&
-	    ev.value == 1 && input_state.alt_down) { // Alt + Left click down
-		int mx = input_state.mouse_x;
-		int my = input_state.mouse_y;
+	    ev.value == 1 && alt_down == 1) { // Alt + Left click down
+		int mx = mouse_x;
+		int my = mouse_y;
+		printf("[BGCE] Alt + Left click detected at (%d, %d).\n", mx, my);
 
 		struct Client* c = pick_client(mx, my);
 		if (c) {
+			printf("[BGCE] Left click detected at client %s.\n", c->shm_name);
 			server.focused_client = c;
-			input_state.drag.active = 1;
-			input_state.drag.target = c;
-			input_state.drag.start_mouse_x = mx;
-			input_state.drag.start_mouse_y = my;
-			input_state.drag.start_win_x = c->x;
-			input_state.drag.start_win_y = c->y;
-			input_state.drag.start_win_width = c->width;
-			input_state.drag.start_win_height = c->height;
-			input_state.drag.type = DRAG_MOVE;
+			drag.active = 1;
+			drag.target = c;
+			drag.start_mouse_x = mx;
+			drag.start_mouse_y = my;
+			drag.start_win_x = c->x;
+			drag.start_win_y = c->y;
+			drag.start_win_width = c->width;
+			drag.start_win_height = c->height;
+			drag.type = DRAG_MOVE;
 			printf("[BGCE] move event.\n");
 			return 1;
 		}
 	}
 
 	if (ev.type == EV_KEY && ev.code == BTN_RIGHT &&
-	    ev.value == 1 && input_state.alt_down) { // Alt + Right click down
-		int mx = input_state.mouse_x;
-		int my = input_state.mouse_y;
+	    ev.value == 1 && alt_down) { // Alt + Right click down
+		int mx = mouse_x;
+		int my = mouse_y;
 
 		struct Client* c = pick_client(mx, my);
-		if (c) {
-			server.focused_client = c;
-			input_state.drag.active = 1;
-			input_state.drag.target = c;
-			input_state.drag.start_mouse_x = mx;
-			input_state.drag.start_mouse_y = my;
-			input_state.drag.start_win_x = c->x;
-			input_state.drag.start_win_y = c->y;
-			input_state.drag.start_win_width = c->width;
-			input_state.drag.start_win_height = c->height;
-			input_state.drag.type = DRAG_RESIZE;
-			printf("[BGCE] resize event.\n");
+		if (!c) {
+			printf("[BGCE] No client found at (%d, %d).\n", mx, my);
 			return 1;
 		}
+		server.focused_client = c;
+		drag.active = 1;
+		drag.target = c;
+		drag.start_mouse_x = mx;
+		drag.start_mouse_y = my;
+		drag.start_win_x = c->x;
+		drag.start_win_y = c->y;
+		drag.start_win_width = c->width;
+		drag.start_win_height = c->height;
+		drag.type = DRAG_RESIZE;
+		printf("[BGCE] resize event.\n");
+		return 1;
 	}
 
 	if (ev.type == EV_REL) {
 		if (ev.code == REL_X)
-			input_state.mouse_x += ev.value;
+			mouse_x += ev.value;
 		else if (ev.code == REL_Y)
-			input_state.mouse_y += ev.value;
-		printf("[BGCE] mouse position: (%u,%u).\n", input_state.mouse_x, input_state.mouse_y);
+			mouse_y += ev.value;
 
 		// Clamp mouse coordinates to screen boundaries
-		if (input_state.mouse_x < 0)
-			input_state.mouse_x = 0;
-		if (input_state.mouse_y < 0)
-			input_state.mouse_y = 0;
-		if (input_state.mouse_x > server.display_w)
-			input_state.mouse_x = server.display_w;
-		if (input_state.mouse_y > server.display_h)
-			input_state.mouse_y = server.display_h;
+		if (mouse_x < 0)
+			mouse_x = 0;
+		if (mouse_y < 0)
+			mouse_y = 0;
+		if (mouse_x > server.display_w)
+			mouse_x = server.display_w;
+		if (mouse_y > server.display_h)
+			mouse_y = server.display_h;
 
-		// Set the cursor position
-		printf("[BGCE] new mouse position: (%u,%u).\n", input_state.mouse_x, input_state.mouse_y);
 		drmModeMoveCursor(
 		        server.drm_fd,
 		        server.crtc_id,
-		        input_state.mouse_x,
-		        input_state.mouse_y);
+		        mouse_x,
+		        mouse_y);
 
-		if (input_state.drag.active) {
-			int dx = input_state.mouse_x - input_state.drag.start_mouse_x;
-			int dy = input_state.mouse_y - input_state.drag.start_mouse_y;
+		if (drag.active && drag.type == DRAG_MOVE) {
+			printf("[BGCE] Draging client\n");
 
-			struct Client* c = input_state.drag.target;
-			if (!c)
+			int dx = mouse_x - drag.start_mouse_x;
+			int dy = mouse_y - drag.start_mouse_y;
+
+			struct Client* c = drag.target;
+			if (!c) {
+				printf("[BGCE] No client to drag\n");
 				return 1; // Should not happen
-
-			uint32_t new_x = c->x;
-			uint32_t new_y = c->y;
-			uint32_t new_width = c->width;
-			uint32_t new_height = c->height;
-
-			if (input_state.drag.type == DRAG_MOVE) {
-				new_x = input_state.drag.start_win_x + dx;
-				new_y = input_state.drag.start_win_y + dy;
-			} else if (input_state.drag.type == DRAG_RESIZE) {
-				new_width = input_state.drag.start_win_width + dx;
-				new_height = input_state.drag.start_win_height + dy;
-
-				if (new_width < 10)
-					new_width = 10; // Minimum width
-				if (new_height < 10)
-					new_height = 10; // Minimum height
 			}
-			// Update client's position/size directly for visual feedback
+
+			uint32_t old_x = c->x;
+			uint32_t old_y = c->y;
+			uint32_t new_x = drag.start_win_x + dx;
+			uint32_t new_y = drag.start_win_y + dy;
+
+			// Redraw the old region before moving
+			redraw_region(&server, old_x, old_y, new_x, new_y, c->width, c->height);
+
+			// Update client's position
 			c->x = new_x;
 			c->y = new_y;
-			c->width = new_width;
-			c->height = new_height;
+			draw(&server, *c);
 			return 1;
 		}
 	}
@@ -316,10 +289,8 @@ static int handle_input_event(struct input_event ev) {
 void* input_loop(void* arg) {
 	(void)arg;
 
-	printf("[BGCE] Input thread started\n");
-
 	while (1) {
-		int ret = poll(input_state.fds, input_state.count, -1);
+		int ret = poll(fds, count, -1);
 		if (ret < 0) {
 			if (errno == EINTR) {
 				printf("EINTR\n");
@@ -329,12 +300,11 @@ void* input_loop(void* arg) {
 			break;
 		}
 
-		for (size_t i = 0; i < input_state.count; i++) {
+		for (size_t i = 0; i < count; i++) {
 			struct input_event ev;
 
-			if (input_state.fds[i].revents & POLLIN) {
-				printf("[BGCE] Reading from device: %s\n", server.input.devs[i].name);
-				ssize_t n = read(input_state.fds[i].fd, &ev, sizeof(ev));
+			if (fds[i].revents & POLLIN) {
+				ssize_t n = read(fds[i].fd, &ev, sizeof(ev));
 				if (n == -1) {
 					if (errno == EAGAIN || errno == EWOULDBLOCK) {
 						perror("[BGCE] read input");
@@ -345,8 +315,6 @@ void* input_loop(void* arg) {
 				}
 				if (n != sizeof(ev))
 					break;
-				printf("[BGCE] Received input: type=%d code=%d value=%d device=%s\n",
-				       ev.type, ev.code, ev.value, server.input.devs[i].name);
 
 				if (handle_input_event(ev)) {
 					printf("[BGCE] Event handled\n");
@@ -357,7 +325,7 @@ void* input_loop(void* arg) {
 					continue;
 				}
 
-				struct BGCEInputEvent e = {0};
+				struct InputEvent e = {0};
 
 				if (ev.type == EV_KEY) {
 					e.type = INPUT_KEYBOARD;
@@ -380,7 +348,7 @@ void* input_loop(void* arg) {
 						/* Send to focused client */
 						struct BGCEMessage msg;
 						msg.type = MSG_INPUT_EVENT;
-						memcpy(msg.data, &ev, sizeof(ev));
+						msg.data.input_event = e;
 
 						bgce_send_msg(server.focused_client->fd, &msg);
 					}

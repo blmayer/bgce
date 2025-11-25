@@ -18,9 +18,30 @@ void* client_thread(void* arg) {
 	int client_fd = *(int*)arg;
 	free(arg);
 
-	struct Client client = {0};
-	client.fd = client_fd;
-	server.focused_client = &client; /* last connected client gets focus */
+	// Allocate memory for the client
+	struct Client* client = calloc(1, sizeof(struct Client));
+	if (!client) {
+		perror("Failed to allocate memory for client");
+		close(client_fd);
+		return NULL;
+	}
+
+	client->fd = client_fd;
+
+	// Add client to the linked list
+	client->next = server.clients;
+	server.clients = client;
+	server.focused_client = client; /* last connected client gets focus */
+
+	if (!client) {
+		fprintf(stderr, "[BGCE] No available client slots\n");
+		close(client_fd);
+		return NULL;
+	}
+
+	// Initialize the client
+	client->fd = client_fd;
+	server.focused_client = client; /* last connected client gets focus */
 
 	printf("[BGCE] Thread started for client fd=%d\n", client_fd);
 
@@ -44,23 +65,22 @@ void* client_thread(void* arg) {
 				info.devices[d] = server.input.devs[d];
 			}
 
-			memcpy(msg.data, &info, sizeof(info));
+			msg.data.server_info = info;
 			bgce_send_msg(client_fd, &msg);
 			break;
 		}
 
 		case MSG_GET_BUFFER: {
-			struct BufferRequest req;
-			memcpy(&req, msg.data, sizeof(req));
+			struct BufferRequest req = msg.data.buffer_request;
 			printf(
 			        "[BGCE] Client requested buffer of size %dx%d\n",
 			        req.width,
 			        req.height);
 
-			snprintf(client.shm_name, sizeof(client.shm_name),
+			snprintf(client->shm_name, sizeof(client->shm_name),
 			         "/bgce_buf_%d_%ld", getpid(), time(NULL));
 
-			int shm_fd = shm_open(client.shm_name, O_CREAT | O_RDWR, 0600);
+			int shm_fd = shm_open(client->shm_name, O_CREAT | O_RDWR, 0600);
 			if (shm_fd < 0) {
 				perror("shm_open");
 				break;
@@ -73,56 +93,78 @@ void* client_thread(void* arg) {
 				break;
 			}
 
-			client.buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-			client.width = req.width;
-			client.height = req.height;
+			client->buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+			client->width = req.width;
+			client->height = req.height;
 			close(shm_fd);
 			printf("Server buffer: %p size=%zu (%dx%d) name=%s\n",
-			       client.buffer,
-			       client.width * client.height * 4UL,
-			       client.width, client.height,
-			       client.shm_name);
+			       client->buffer,
+			       client->width * client->height * 4UL,
+			       client->width, client->height,
+			       client->shm_name);
 
 			struct BufferReply reply = {0};
-			strncpy(reply.shm_name, client.shm_name, sizeof(reply.shm_name));
+			strncpy(reply.shm_name, client->shm_name, sizeof(reply.shm_name));
 			reply.width = req.width;
 			reply.height = req.height;
-			memcpy(msg.data, &reply, sizeof(reply));
+			msg.data.buffer_reply = reply;
 			bgce_send_msg(client_fd, &msg);
 			break;
 		}
 
 		case MSG_DRAW: {
 			printf("[BGCE] Drawing from client %d (%dx%d)\n",
-			       client.fd, client.width, client.height);
-
+			       client->fd, client->width, client->height);
 			if (client_fd == server.focused_client->fd) {
-				if (!client.buffer) {
+				if (!client->buffer) {
 					fprintf(stderr, "[BGCE] Client has no buffer!\n");
 					break;
 				}
 				printf("[BGCE] Drawing from focused client %d\n", client_fd);
-				printf("[BGCE] First pixel: %08x\n", ((uint32_t*)client.buffer)[0]);
-
-				draw(&server, client);
-			} else {
-				printf("[BGCE] Ignoring draw from unfocused client %d\n", client_fd);
+				printf("[BGCE] First pixel: %08x\n", ((uint32_t*)client->buffer)[0]);
 			}
+
+			draw(&server, *client);
 			break;
 		}
-
 		default:
 			fprintf(stderr, "[BGCE] Unknown message type %d\n", msg.type);
 			break;
 		}
 	}
 
-	if (client.buffer) {
-		munmap(client.buffer, client.width * client.height * 3);
-		shm_unlink(client.shm_name);
+	if (client->buffer) {
+		munmap(client->buffer, client->width * client->height * 4);
+		shm_unlink(client->shm_name);
 	}
-	close(client_fd);
 
-	printf("[BGCE] Thread exiting for client fd=%d\n", client_fd);
+	// Remove client from the linked list
+	struct Client* prev = NULL;
+	struct Client* curr = server.clients;
+	while (curr) {
+		if (curr == client) {
+			if (prev) {
+				prev->next = curr->next;
+			} else {
+				server.clients = curr->next;
+			}
+			break;
+		}
+		prev = curr;
+		curr = curr->next;
+	}
+
+	if (server.focused_client == client) {
+		server.focused_client = NULL;
+	}
+
+	if (server.focused_client == client) {
+		server.focused_client = NULL;
+	}
+
+	close(client->fd);
+
+	printf("[BGCE] Thread exiting for client fd=%d\n", client->fd);
+	free(client);
 	return NULL;
 }
