@@ -69,7 +69,7 @@ int bgce_get_server_info(int conn, struct ServerInfo* info) {
 	if (bgce_recv_msg(conn, &msg) <= 0)
 		return -3;
 
-	memcpy(info, msg.data, sizeof(struct ServerInfo));
+	*info = msg.data.server_info;
 
 	return 0;
 }
@@ -81,7 +81,7 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
 
 	struct BGCEMessage msg;
 	msg.type = MSG_GET_BUFFER;
-	memcpy(msg.data, &req, sizeof(req));
+	msg.data.buffer_request = req;
 
 	int code = bgce_send_msg(conn, &msg);
 	if (code <= 0)
@@ -91,7 +91,7 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
 		return NULL;
 
 	struct BufferReply reply;
-	memcpy(&reply, msg.data, sizeof(reply));
+	reply = msg.data.buffer_reply;
 
 	size_t size = reply.width * reply.height * 4;
 	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
@@ -108,15 +108,6 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
 	}
 
 	return buf;
-}
-
-int bgce_move_buffer(int conn, struct MoveBufferRequest req) {
-	struct BGCEMessage msg;
-	msg.type = MSG_BUFFER_CHANGE;
-	memcpy(msg.data, &req, sizeof(req));
-
-	int code = bgce_send_msg(conn, &msg);
-	return code;
 }
 
 /* Public API: Draw current buffer */

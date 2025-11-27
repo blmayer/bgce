@@ -23,6 +23,7 @@ struct Client {
 	uint32_t height;
 	uint32_t x;
 	uint32_t y;
+	uint32_t z;
 	struct Client* next;
 	int inputs[MAX_INPUT_DEVICES];
 };
@@ -33,7 +34,7 @@ struct Client {
 
 struct InputState {
 	int fds[MAX_INPUT_DEVICES];
-	struct BGCEInputDevice devs[MAX_INPUT_DEVICES];
+	struct InputDevice devs[MAX_INPUT_DEVICES];
 	size_t count;
 };
 
@@ -58,17 +59,10 @@ struct ServerState {
  * Cursor
  * ---------------------------- */
 
-#define CURSOR_WIDTH 8
-#define CURSOR_HEIGHT 8
+#define CURSOR_WIDTH 64
+#define CURSOR_HEIGHT 64
 #define CURSOR_HOTSPOT_X 0
 #define CURSOR_HOTSPOT_Y 0
-
-struct CursorState {
-    int x;
-    int y;
-    uint32_t background_buffer[CURSOR_WIDTH * CURSOR_HEIGHT];
-    int active; // 0 for hidden, 1 for visible
-};
 
 
 /* ----------------------------
@@ -86,7 +80,7 @@ void set_drm_cursor(struct ServerState* srv, int x, int y);
 
 void draw(struct ServerState* srv, struct Client cli);
 
-void redraw_region(struct ServerState* srv, int old_x, int old_y, int new_x, int new_y, int width, int height);
+void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
 
 /**
  * Input device related functions

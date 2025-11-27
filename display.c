@@ -83,19 +83,19 @@ static int drm_destroy_dumb(int fd, uint32_t handle) {
 	return 0;
 }
 
-static void draw_gradient(uint8_t* buf, uint32_t stride, uint32_t width, uint32_t height) {
-	/* Buf is assumed 32bpp (ARGB or XRGB), stride in bytes */
-	for (uint32_t y = 0; y < height; y++) {
-		uint32_t* line = (uint32_t*)(buf + y * stride);
-		for (uint32_t x = 0; x < width; x++) {
-			uint8_t r = (x * 255) / (width - 1);
-			uint8_t g = (y * 255) / (height - 1);
-			uint8_t b = 128;
-			/* Use XRGB (no alpha) for scanout */
-			line[x] = (r << 16) | (g << 8) | b;
-		}
-	}
-}
+// static void draw_gradient(uint8_t* buf, uint32_t stride, uint32_t width, uint32_t height) {
+// 	/* Buf is assumed 32bpp (ARGB or XRGB), stride in bytes */
+// 	for (uint32_t y = 0; y < height; y++) {
+// 		uint32_t* line = (uint32_t*)(buf + y * stride);
+// 		for (uint32_t x = 0; x < width; x++) {
+// 			uint8_t r = (x * 255) / (width - 1);
+// 			uint8_t g = (y * 255) / (height - 1);
+// 			uint8_t b = 128;
+// 			/* Use XRGB (no alpha) for scanout */
+// 			line[x] = (r << 16) | (g << 8) | b;
+// 		}
+// 	}
+// }
 
 static void draw_cursor(uint8_t* buf, uint32_t stride, uint32_t w, uint32_t h) {
 	/* Cursor is ARGB8888 */
@@ -241,7 +241,6 @@ int init_display() {
 
 	/* Clear/draw content */
 	memset(server.framebuffer, 0x00, scanout_size);
-	draw_gradient((uint8_t*)server.framebuffer, scanout_pitch, width, height);
 
 	/* Create framebuffer object for scanout.
 	 * Prefer drmModeAddFB2 (for specifying pixel-format), fallback to drmModeAddFB.
@@ -273,11 +272,9 @@ int init_display() {
 	}
 
 	/* ---------- Create dumb cursor buffer (small ARGB) ---------- */
-	const uint32_t cur_w = 64;
-	const uint32_t cur_h = 64;
 
 	struct drm_mode_create_dumb cur_create = {0};
-	if (drm_create_dumb(drm_fd, cur_w, cur_h, 32, &cur_create) < 0) {
+	if (drm_create_dumb(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, 32, &cur_create) < 0) {
 		fprintf(stderr, "Failed to create dumb buffer for cursor\n");
 		return -1;
 	}
@@ -297,7 +294,7 @@ int init_display() {
 	}
 	memset(cur_map, 0, cur_size);
 
-	draw_cursor((uint8_t*)cur_map, cur_pitch, cur_w, cur_h);
+	draw_cursor((uint8_t*)cur_map, cur_pitch, CURSOR_WIDTH, CURSOR_HEIGHT);
 
 #ifdef DRM_FORMAT_ARGB8888
 	{
@@ -314,7 +311,7 @@ int init_display() {
 	if (!cur_fb) {
 		/* Legacy fb creation for cursor might not support alpha; still try */
 		uint32_t depth = 24;
-		if (drmModeAddFB(drm_fd, cur_w, cur_h, depth, 32, cur_pitch, cur_handle, &cur_fb) != 0) {
+		if (drmModeAddFB(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, depth, 32, cur_pitch, cur_handle, &cur_fb) != 0) {
 			fprintf(stderr, "drmModeAddFB for cursor failed\n");
 			return -1;
 		}
@@ -327,7 +324,7 @@ int init_display() {
 	}
 
 	/* ---------- Set cursor ---------- */
-	if (drmModeSetCursor(drm_fd, crtc_id, cur_handle, cur_w, cur_h) != 0) {
+	if (drmModeSetCursor(drm_fd, crtc_id, cur_handle, CURSOR_WIDTH, CURSOR_HEIGHT) != 0) {
 		fprintf(stderr, "drmModeSetCursor failed: %s\n", strerror(errno));
 		/* keep going — maybe hardware doesn't support cursor */
 	} else {
@@ -341,8 +338,10 @@ int init_display() {
 }
 
 void draw(struct ServerState* srv, struct Client cli) {
-	if (!srv || !srv->framebuffer || !cli.buffer)
+	if (!srv || !srv->framebuffer || !cli.buffer) {
+		fprintf(stderr, "Draw: Invalid server, framebuffer, or client buffer\n");
 		return;
+	}
 
 	uint32_t screen_w = srv->display_w;
 	uint32_t screen_h = srv->display_h;
@@ -370,8 +369,10 @@ void draw(struct ServerState* srv, struct Client cli) {
 		end_y = screen_h;
 
 	/* Entire window is outside screen */
-	if (start_x >= end_x || start_y >= end_y)
+	if (start_x >= end_x || start_y >= end_y) {
+		fprintf(stderr, "Draw: Client entirely outside screen\n");
 		return;
+	}
 
 	int src_start_x = start_x - cx;
 	int src_start_y = start_y - cy;
@@ -390,71 +391,101 @@ void draw(struct ServerState* srv, struct Client cli) {
 	}
 }
 
-void redraw_region(struct ServerState* srv, int old_x, int old_y, int new_x, int new_y, int width, int height) {
-	if (!srv || !srv->framebuffer)
+/*
+ * The situation:
+ *
+ *                         . (x,y)
+ *                         +----------------+
+ *                         |     rect A     | dy
+ *                         +----+-----------+----+
+ *                         |    |                |
+ *                         |    |                |
+ *                         |    |                |
+ *                         |  B |                |
+ *                         +----+                |
+ *                           dx |                |
+ *                              +----------------+
+ *
+ * So we redraw the rectangles:
+ * A: (x, y) (x+width, y+dy) and
+ * B: (x, y+dy) (x+dx, y+height)
+ */
+void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy) {
+	if (!srv || !srv->framebuffer) {
+		fprintf(stderr, "Redraw: Invalid server, framebuffer, or client\n");
 		return;
+	}
 
+	uint32_t width = c.width;
+	uint32_t height = c.height;
 	uint32_t screen_w = srv->display_w;
 	uint32_t screen_h = srv->display_h;
 
-	/* Calculate the exposed area (difference between old and new regions) */
-	int exposed_start_x = old_x < new_x ? old_x : new_x;
-	int exposed_end_x = old_x + width > new_x + width ? old_x + width : new_x + width;
-	int exposed_start_y = old_y < new_y ? old_y : new_y;
-	int exposed_end_y = old_y + height > new_y + height ? old_y + height : new_y + height;
+	/* Rectangle A: Exposed area in y-direction */
+	int rect_a_start_x = c.x;
+	int rect_a_start_y = dy > 0 ? c.y : c.y + height + dy;
+	int rect_a_end_x = c.x + width;
+	int rect_a_end_y = dy > 0 ? c.y + dy : c.y + height;
 
-	/* Only redraw the non-overlapping part */
-	if (old_x < new_x) {
-		exposed_end_x = old_x + (new_x - old_x);
-	} else if (old_x > new_x) {
-		exposed_start_x = new_x + width;
-	}
+	/* Rectangle B: Exposed area in x-direction */
+	int rect_b_start_x = dx > 0 ? c.x : c.x + width + dx;
+	int rect_b_start_y = c.y + (dy > 0 ? dy : 0);
+	int rect_b_end_x = dx > 0 ? c.x + dx : c.x + width;
+	int rect_b_end_y = c.y + height + (dy > 0 ? dy : 0);
 
-	if (old_y < new_y) {
-		exposed_end_y = old_y + (new_y - old_y);
-	} else if (old_y > new_y) {
-		exposed_start_y = new_y + height;
-	}
+	/* Clip rectangles to screen boundaries */
+	rect_a_start_x = rect_a_start_x < 0 ? 0 : rect_a_start_x;
+	rect_a_start_y = rect_a_start_y < 0 ? 0 : rect_a_start_y;
+	rect_a_end_x = rect_a_end_x > (int)screen_w ? screen_w : rect_a_end_x;
+	rect_a_end_y = rect_a_end_y > (int)screen_h ? screen_h : rect_a_end_y;
 
-	/* Clip the exposed region to the screen boundaries */
-	int start_x = exposed_start_x < 0 ? 0 : exposed_start_x;
-	int start_y = exposed_start_y < 0 ? 0 : exposed_start_y;
+	rect_b_start_x = rect_b_start_x < 0 ? 0 : rect_b_start_x;
+	rect_b_start_y = rect_b_start_y < 0 ? 0 : rect_b_start_y;
+	rect_b_end_x = rect_b_end_x > (int)screen_w ? screen_w : rect_b_end_x;
+	rect_b_end_y = rect_b_end_y > (int)screen_h ? screen_h : rect_b_end_y;
 
-	int end_x = exposed_end_x > (int)screen_w ? screen_w : exposed_end_x;
-	int end_y = exposed_end_y > (int)screen_h ? screen_h : exposed_end_y;
+	struct Client* cli = c.next;
+	while (cli) {
+		/* Redraw Rectangle A */
+		if (dy) {
+			int cli_end_x = cli->x + cli->width;
+			int cli_end_y = cli->y + cli->height;
 
-	if (start_x >= end_x || start_y >= end_y)
-		return;
+			int overlap_start_x = rect_a_start_x > cli->x ? rect_a_start_x : cli->x;
+			int overlap_start_y = rect_a_start_y > cli->y ? rect_a_start_y : cli->y;
 
-	int copy_w = end_x - start_x;
-	int copy_h = end_y - start_y;
+			int overlap_end_x = rect_a_end_x < cli_end_x ? rect_a_end_x : cli_end_x;
+			int overlap_end_y = rect_a_end_y < cli_end_y ? rect_a_end_y : cli_end_y;
 
-	uint32_t screen_stride_pixels = screen_w;
-
-	/* Iterate over clients to find overlapping ones */
-	for (int i = 0; i < srv->client_count; i++) {
-		struct Client* cli = &srv->clients[i];
-		if (!cli->buffer)
-			continue;
-
-		/* Check if this client overlaps with the exposed region */
-		int cli_end_x = cli->x + cli->width;
-		int cli_end_y = cli->y + cli->height;
-
-		int overlap_start_x = start_x > cli->x ? start_x : cli->x;
-		int overlap_start_y = start_y > cli->y ? start_y : cli->y;
-
-		int overlap_end_x = end_x < cli_end_x ? end_x : cli_end_x;
-		int overlap_end_y = end_y < cli_end_y ? end_y : cli_end_y;
-
-		if (overlap_start_x < overlap_end_x && overlap_start_y < overlap_end_y) {
-			/* Redraw the overlapping part of the client */
-			for (int y = overlap_start_y; y < overlap_end_y; y++) {
-				uint32_t* drow = (uint32_t*)srv->framebuffer + y * screen_stride_pixels + overlap_start_x;
-				uint32_t* srow = (uint32_t*)cli->buffer + (y - cli->y) * cli->width + (overlap_start_x - cli->x);
-				memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
+			if (overlap_start_x < overlap_end_x && overlap_start_y < overlap_end_y) {
+				for (int y = overlap_start_y; y < overlap_end_y; y++) {
+					uint32_t* drow = (uint32_t*)srv->framebuffer + y * screen_w + overlap_start_x;
+					uint32_t* srow = (uint32_t*)cli->buffer + (y - cli->y) * cli->width + (overlap_start_x - cli->x);
+					memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
+				}
 			}
 		}
+
+		/* Redraw Rectangle B */
+		if (dx) {
+			int cli_end_x = cli->x + cli->width;
+			int cli_end_y = cli->y + cli->height;
+
+			int overlap_start_x = rect_b_start_x > cli->x ? rect_b_start_x : cli->x;
+			int overlap_start_y = rect_b_start_y > cli->y ? rect_b_start_y : cli->y;
+
+			int overlap_end_x = rect_b_end_x < cli_end_x ? rect_b_end_x : cli_end_x;
+			int overlap_end_y = rect_b_end_y < cli_end_y ? rect_b_end_y : cli_end_y;
+
+			if (overlap_start_x < overlap_end_x && overlap_start_y < overlap_end_y) {
+				for (int y = overlap_start_y; y < overlap_end_y; y++) {
+					uint32_t* drow = (uint32_t*)srv->framebuffer + y * screen_w + overlap_start_x;
+					uint32_t* srow = (uint32_t*)cli->buffer + (y - cli->y) * cli->width + (overlap_start_x - cli->x);
+					memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
+				}
+			}
+		}
+		cli = cli->next;
 	}
 }
 

@@ -39,10 +39,6 @@ void* client_thread(void* arg) {
 		return NULL;
 	}
 
-	// Initialize the client
-	client->fd = client_fd;
-	server.focused_client = client; /* last connected client gets focus */
-
 	printf("[BGCE] Thread started for client fd=%d\n", client_fd);
 
 	while (1) {
@@ -96,8 +92,10 @@ void* client_thread(void* arg) {
 			client->buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 			client->width = req.width;
 			client->height = req.height;
+			client->x = 0;
+			client->y = 0;
 			close(shm_fd);
-			printf("Server buffer: %p size=%zu (%dx%d) name=%s\n",
+			printf("[BGCE] Client buffer: %p size=%zu (%dx%d) name=%s\n",
 			       client->buffer,
 			       client->width * client->height * 4UL,
 			       client->width, client->height,
@@ -113,15 +111,10 @@ void* client_thread(void* arg) {
 		}
 
 		case MSG_DRAW: {
-			printf("[BGCE] Drawing from client %d (%dx%d)\n",
-			       client->fd, client->width, client->height);
-			if (client_fd == server.focused_client->fd) {
-				if (!client->buffer) {
-					fprintf(stderr, "[BGCE] Client has no buffer!\n");
-					break;
-				}
-				printf("[BGCE] Drawing from focused client %d\n", client_fd);
-				printf("[BGCE] First pixel: %08x\n", ((uint32_t*)client->buffer)[0]);
+			printf("[BGCE] Received draw event from client %s\n", client->shm_name);
+			if (client_fd != server.focused_client->fd) {
+				printf("[BGCE] Client is not focused!\n");
+				break;
 			}
 
 			draw(&server, *client);
@@ -152,10 +145,6 @@ void* client_thread(void* arg) {
 		}
 		prev = curr;
 		curr = curr->next;
-	}
-
-	if (server.focused_client == client) {
-		server.focused_client = NULL;
 	}
 
 	if (server.focused_client == client) {

@@ -36,7 +36,7 @@ enum {
  * Data Structures
  * ---------------------------- */
 
-struct BGCEInputDevice {
+struct InputDevice {
 	uint16_t id;        // internal index of server
 	uint16_t type_mask; // bitmask: KEY, REL, ABS, etc
 	char name[256];
@@ -47,7 +47,7 @@ struct ServerInfo {
 	uint32_t height;
 	uint32_t color_depth;
 	uint16_t input_device_count;
-	struct BGCEInputDevice devices[MAX_INPUT_DEVICES];
+	struct InputDevice devices[MAX_INPUT_DEVICES];
 };
 
 struct BufferRequest {
@@ -68,18 +68,18 @@ struct BufferReply {
 	uint32_t height;
 };
 
-enum BGCEInputType {
+enum InputType {
 	INPUT_KEYBOARD,
 	INPUT_MOUSE_MOVE,
 	INPUT_MOUSE_BUTTON,
 };
 
 struct InputEvent {
-	enum BGCEInputType type;
 	uint32_t code; /* key code or button code */
 	int32_t value; /* press=1, release=0, or delta */
 	int32_t x;     /* optional: for mouse move */
 	int32_t y;     /* optional: for mouse move */
+	struct InputDevice device;
 };
 
 struct BGCEMessage {
@@ -90,7 +90,7 @@ struct BGCEMessage {
 		struct BufferReply buffer_reply;
 		struct MoveBufferRequest move_buffer_request;
 		struct InputEvent input_event;
-		
+
 	} data;
 };
 
@@ -120,8 +120,6 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
  * Returns 0 on success, -1 on failure.
  */
 void* bgce_get_buffer(int conn, const struct BufferRequest req);
-
-int bgce_move_buffer(int fd, const struct MoveBufferRequest req);
 
 /**
  * Send a draw command to the server, telling it to blit the

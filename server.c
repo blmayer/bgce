@@ -26,11 +26,12 @@ int main(void) {
 
 	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
 	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
-	
+
 	memset(&server, 0, sizeof(struct ServerState));
 	server.drm_fd = -1;
 	server.framebuffer = NULL;
 	server.crtc_id = 0;
+	server.client_count = 0;
 
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -64,6 +65,21 @@ int main(void) {
 		return 1;
 	}
 	printf("[BGCE] Display initialised\n");
+
+	/* Add a background client */
+	struct Client background_client;
+	background_client.x = 0;
+	background_client.y = 0;
+	background_client.z = -1; // Special case
+	background_client.width = server.display_w;
+	background_client.height = server.display_h;
+	background_client.buffer = malloc(server.display_w * server.display_h * 4);
+	memset(background_client.buffer, 0xaa, server.display_w * server.display_h * 4);
+	background_client.next = NULL;
+	server.clients = &background_client;
+
+	puts("[BGCE] Drawing background");
+	draw(&server, background_client);
 
 	if (init_input() != 0) {
 		perror("[BGCE] Failed to start input thread");

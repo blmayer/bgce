@@ -50,6 +50,7 @@ struct Client* pick_client(int x, int y) {
 		if (x >= c->x && x <= (c->x + c->width) &&
 		    y >= c->y && y <= (c->y + c->height)) {
 			picked = c;
+			break;
 		}
 		c = c->next;
 	}
@@ -153,7 +154,7 @@ static int handle_input_event(struct input_event ev) {
 		}
 		if (ctrl_down == 1 && alt_down == 1 && ev.code == KEY_Q) {
 			printf("[BGCE] Ctrl+Alt+Q pressed, exiting.\n");
-			return 1;
+			exit(1);
 		}
 	}
 
@@ -203,7 +204,7 @@ static int handle_input_event(struct input_event ev) {
 			drag.start_win_width = c->width;
 			drag.start_win_height = c->height;
 			drag.type = DRAG_MOVE;
-			printf("[BGCE] move event.\n");
+			printf("[BGCE] Starting move event.\n");
 			return 1;
 		}
 	}
@@ -255,10 +256,11 @@ static int handle_input_event(struct input_event ev) {
 		        mouse_y);
 
 		if (drag.active && drag.type == DRAG_MOVE) {
-			printf("[BGCE] Draging client\n");
-
 			int dx = mouse_x - drag.start_mouse_x;
 			int dy = mouse_y - drag.start_mouse_y;
+			drag.start_mouse_x = mouse_x;
+			drag.start_mouse_y = mouse_y;
+			printf("[BGCE] Draging client: dx=%d, dy=%d\n", dx, dy);
 
 			struct Client* c = drag.target;
 			if (!c) {
@@ -266,17 +268,12 @@ static int handle_input_event(struct input_event ev) {
 				return 1; // Should not happen
 			}
 
-			uint32_t old_x = c->x;
-			uint32_t old_y = c->y;
-			uint32_t new_x = drag.start_win_x + dx;
-			uint32_t new_y = drag.start_win_y + dy;
-
 			// Redraw the old region before moving
-			redraw_region(&server, old_x, old_y, new_x, new_y, c->width, c->height);
+			redraw_region(&server, *c, dx, dy);
 
 			// Update client's position
-			c->x = new_x;
-			c->y = new_y;
+			c->x = c->x + dx;
+			c->y = c->y + dy;
 			draw(&server, *c);
 			return 1;
 		}
@@ -317,7 +314,6 @@ void* input_loop(void* arg) {
 					break;
 
 				if (handle_input_event(ev)) {
-					printf("[BGCE] Event handled\n");
 					continue;
 				}
 
@@ -326,33 +322,27 @@ void* input_loop(void* arg) {
 				}
 
 				struct InputEvent e = {0};
+				e.device = server.input.devs[i];
+				e.code = ev.code;
 
 				if (ev.type == EV_KEY) {
-					e.type = INPUT_KEYBOARD;
-					e.code = ev.code;
 					e.value = ev.value;
 				} else if (ev.type == EV_REL) {
-					e.type = INPUT_MOUSE_MOVE;
 					if (ev.code == REL_X)
-						e.x = ev.value;
+						e.value = ev.value;
 					else if (ev.code == REL_Y)
-						e.y = ev.value;
+						e.value = ev.value;
 				} else if (ev.type == EV_SYN) {
 					continue;
 				} else {
 					continue;
 				}
 
-				for (int sub = 0; sub < MAX_INPUT_DEVICES; sub++) {
-					if (server.focused_client->inputs[sub] == i) {
-						/* Send to focused client */
-						struct BGCEMessage msg;
-						msg.type = MSG_INPUT_EVENT;
-						msg.data.input_event = e;
-
-						bgce_send_msg(server.focused_client->fd, &msg);
-					}
-				}
+				/* Send to focused client */
+				struct BGCEMessage msg;
+				msg.type = MSG_INPUT_EVENT;
+				msg.data.input_event = e;
+				bgce_send_msg(server.focused_client->fd, &msg);
 			}
 		}
 	}

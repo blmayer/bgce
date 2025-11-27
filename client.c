@@ -3,11 +3,13 @@
 #include <linux/input.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 int main(void) {
+	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
+	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
+
 	int conn = bgce_connect();
 	if (conn < 0) {
 		fprintf(stderr, "[BGCE] Failed to connect\n");
@@ -75,8 +77,8 @@ int main(void) {
 			struct InputEvent ev = msg.data.input_event;
 
 			/* Example: Print keyboard/mouse input */
-			printf("[BGCE Client] Input event: type=%hu code=%hu value=%d\n",
-			       ev.type, ev.code, ev.value);
+			printf("[BGCE Client] Input event: device=%s code=%hu value=%d\n",
+			       ev.device.name, ev.code, ev.value);
 			break;
 		}
 
