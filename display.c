@@ -394,17 +394,17 @@ void draw(struct ServerState* srv, struct Client cli) {
 /*
  * The situation:
  *
- *                         . (x,y)
- *                         +----------------+
- *                         |     rect A     | dy
- *                         +----+-----------+----+
- *                         |    |                |
- *                         |    |                |
- *                         |    |                |
- *                         |  B |                |
- *                         +----+                |
- *                           dx |                |
- *                              +----------------+
+ *     . (x,y)
+ *     +----------------+
+ *     |     rect A     | dy
+ *     +----+-----------+----+
+ *     |    |                |
+ *     |    |                |
+ *     |    |                |
+ *     |  B |                |
+ *     +----+                |
+ *       dx |                |
+ *          +----------------+
  *
  * So we redraw the rectangles:
  * A: (x, y) (x+width, y+dy) and
@@ -526,5 +526,5 @@ void release_display(void) {
 		drmModeFreeEncoder(encoder);
 
 	close(drm_fd);
-	printf("Done, cleaned up.\n");
+	printf("[BGCE] Display released.\n");
 }

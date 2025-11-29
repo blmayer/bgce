@@ -63,6 +63,7 @@ struct MoveBufferRequest {
 };
 
 struct BufferReply {
+	int status; // 0 for success, -1 for failure
 	char shm_name[64];
 	uint32_t width;
 	uint32_t height;

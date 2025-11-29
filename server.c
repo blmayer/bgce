@@ -16,8 +16,13 @@ struct ServerState server = {}; /* Global server state */
 /* Cleanup on Ctrl+C */
 static void handle_sigint(int sig) {
 	(void)sig;
+	printf("[BGCE] Got sigint, shutting down.\n");
+
 	unlink(SOCKET_PATH);
+	release_display();
+	free(server.framebuffer);
 	printf("\n[BGCE] Server terminated.\n");
+	
 	exit(0);
 }
 
@@ -70,7 +75,7 @@ int main(void) {
 	struct Client background_client;
 	background_client.x = 0;
 	background_client.y = 0;
-	background_client.z = -1; // Special case
+	background_client.z = 0; // Special case
 	background_client.width = server.display_w;
 	background_client.height = server.display_h;
 	background_client.buffer = malloc(server.display_w * server.display_h * 4);
