@@ -6,6 +6,24 @@
 #include <time.h>
 #include <unistd.h>
 
+int w = 800;
+int h = 600;
+uint8_t* buf = NULL;
+
+void draw_gradient() {
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			uint32_t* p = (uint32_t*)buf + (y * w + x);
+
+			uint8_t r = (x * 255) / w;
+			uint8_t g = (y * 255) / h;
+			uint8_t b = 128;
+
+			*p = 0xFF000000 | (r << 16) | (g << 8) | b; // ARGB
+		}
+	}
+}
+
 int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
 	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
@@ -32,11 +50,9 @@ int main(void) {
 		       info.devices[i].name,
 		       info.devices[i].type_mask);
 	}
-	int w = 800;
-	int h = 600;
 
 	struct BufferRequest req = {.width = w, .height = h};
-	uint8_t* buf = bgce_get_buffer(conn, req);
+	buf = bgce_get_buffer(conn, req);
 	if (!buf) {
 		fprintf(stderr, "[BGCE] Failed to get buffer\n");
 		return 3;
@@ -44,17 +60,7 @@ int main(void) {
 	printf("Client got buffer at: %p\n", buf);
 
 	printf("[BGCE] Drawing gradient...\n");
-	for (int y = 0; y < h; y++) {
-		for (int x = 0; x < w; x++) {
-			uint32_t* p = (uint32_t*)buf + (y * w + x);
-
-			uint8_t r = (x * 255) / w;
-			uint8_t g = (y * 255) / h;
-			uint8_t b = 128;
-
-			*p = 0xFF000000 | (r << 16) | (g << 8) | b; // ARGB
-		}
-	}
+	draw_gradient();
 
 	if (bgce_draw(conn) < 0) {
 		fprintf(stderr, "[BGCE] Draw failed\n");
@@ -79,6 +85,23 @@ int main(void) {
 			/* Example: Print keyboard/mouse input */
 			printf("[BGCE Client] Input event: device=%s code=%hu value=%d\n",
 			       ev.device.name, ev.code, ev.value);
+			break;
+		}
+		case MSG_BUFFER_CHANGE: {
+			struct BufferReply b = msg.data.buffer_reply;
+			printf("[BGCE] Buffer change event: w=%u h=%u shm_name=%s\n", b.width, b.height, b.shm_name);
+
+			buf = bgce_resize_buffer(b);
+			w = b.width;
+			h = b.height;
+
+			printf("[BGCE] Drawing gradient...\n");
+			draw_gradient();
+
+			if (bgce_draw(conn) < 0) {
+				fprintf(stderr, "[BGCE] Draw failed\n");
+				return 4;
+			}
 			break;
 		}
 

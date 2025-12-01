@@ -82,6 +82,8 @@ void draw(struct ServerState* srv, struct Client cli);
 
 void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
 
+void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);
+
 /**
  * Input device related functions
  * from input.c

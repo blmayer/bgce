@@ -30,6 +30,7 @@ void* client_thread(void* arg) {
 
 	// Add client to the linked list
 	client->next = server.clients;
+	client->z = server.clients->z + 1;
 	server.clients = client;
 	server.focused_client = client; /* last connected client gets focus */
 
@@ -39,7 +40,7 @@ void* client_thread(void* arg) {
 		return NULL;
 	}
 
-	printf("[BGCE] Thread started for client fd=%d\n", client_fd);
+	printf("[BGCE] Thread started for client fd=%d z=%d\n", client_fd, client->z);
 
 	while (1) {
 		struct BGCEMessage msg;
@@ -74,7 +75,7 @@ void* client_thread(void* arg) {
 			        req.height);
 
 			snprintf(client->shm_name, sizeof(client->shm_name),
-			         "/bgce_buf_%d_%ld", getpid(), time(NULL));
+			         "bgce_buf_%d_%ld", getpid(), time(NULL));
 
 			int shm_fd = shm_open(client->shm_name, O_CREAT | O_RDWR, 0600);
 			if (shm_fd < 0) {

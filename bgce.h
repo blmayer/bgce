@@ -122,6 +122,9 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
  */
 void* bgce_get_buffer(int conn, const struct BufferRequest req);
 
+// TODO: add comment
+void* bgce_resize_buffer(const struct BufferReply reply);
+
 /**
  * Send a draw command to the server, telling it to blit the
  * shared memory contents to the framebuffer.

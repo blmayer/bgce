@@ -394,17 +394,17 @@ void draw(struct ServerState* srv, struct Client cli) {
 /*
  * The situation:
  *
- *     . (x,y)
- *     +----------------+
- *     |     rect A     | dy
- *     +----+-----------+----+
- *     |    |                |
- *     |    |                |
- *     |    |                |
- *     |  B |                |
- *     +----+                |
- *       dx |                |
- *          +----------------+
+ * dx<0:                             dx>0:  . (x,y)
+ * dy<0:  +----------------+         dy>0:  +----------------+
+ *        |     (x,y)      | dx             |     rect A     | dy
+ *        |    .           +----+           +----+-----------+----+
+ *        |                |    |           |    |                |
+ *        |                |    |           |    |                |
+ *        |                |    |           |    |                |
+ *        |                | B  |           |  B |                |
+ *        +----+-----------+----+           +----+                |
+ *          dy |     rect A     |             dx |                |
+ *             +----------------+                +----------------+
  *
  * So we redraw the rectangles:
  * A: (x, y) (x+width, y+dy) and
@@ -486,6 +486,70 @@ void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy) {
 			}
 		}
 		cli = cli->next;
+	}
+}
+
+static void redraw_exposed_rect(struct ServerState* srv, const struct Client* resized_client,
+                                int exposed_x, int exposed_y, int exposed_width, int exposed_height) {
+	if (exposed_width <= 0 || exposed_height <= 0) {
+		return; // Nothing to draw
+	}
+
+	uint32_t screen_w = srv->display_w;
+
+	// Now, iterate through clients behind the resized_client and draw them if they overlap
+	struct Client* cli = resized_client->next;
+	while (cli) {
+		// Calculate overlap between the exposed rectangle and the current client 'cli'
+		int cli_end_x = cli->x + cli->width;
+		int cli_end_y = cli->y + cli->height;
+
+		int overlap_start_x = exposed_x > cli->x ? exposed_x : cli->x;
+		int overlap_start_y = exposed_y > cli->y ? exposed_y : cli->y;
+
+		int overlap_end_x = (exposed_x + exposed_width) < cli_end_x ? (exposed_x + exposed_width) : cli_end_x;
+		int overlap_end_y = (exposed_y + exposed_height) < cli_end_y ? (exposed_y + exposed_height) : cli_end_y;
+
+		if (overlap_start_x < overlap_end_x && overlap_start_y < overlap_end_y) {
+			// There's an overlap, copy from client's buffer to framebuffer
+			for (int y = overlap_start_y; y < overlap_end_y; y++) {
+				uint32_t* drow = (uint32_t*)srv->framebuffer + y * screen_w + overlap_start_x;
+				uint32_t* srow = (uint32_t*)cli->buffer + (y - cli->y) * cli->width + (overlap_start_x - cli->x);
+				memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
+			}
+		}
+		cli = cli->next;
+	}
+}
+
+void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
+	if (!srv || !srv->framebuffer) {
+		fprintf(stderr, "Redraw from resize: Invalid server or framebuffer\n");
+		return;
+	}
+
+	// Calculate the client's old dimensions
+	int old_width = c.width - dx;
+	int old_height = c.height - dy;
+
+	// Handle horizontal shrinkage (area on the right)
+	if (dx < 0) {
+		int exposed_x = c.x + c.width; // Start of the exposed area
+		int exposed_y = c.y;
+		int exposed_width = -dx;       // The amount it shrunk
+		int exposed_height = old_height; // This should be the old height
+
+		redraw_exposed_rect(srv, &c, exposed_x, exposed_y, exposed_width, exposed_height);
+	}
+
+	// Handle vertical shrinkage (area at the bottom)
+	if (dy < 0) {
+		int exposed_x = c.x;
+		int exposed_y = c.y + c.height; // Start of the exposed area
+		int exposed_width = old_width;   // This should be the old width
+		int exposed_height = -dy;       // The amount it shrunk
+
+		redraw_exposed_rect(srv, &c, exposed_x, exposed_y, exposed_width, exposed_height);
 	}
 }
 
