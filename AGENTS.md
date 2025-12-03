@@ -25,25 +25,34 @@ Implement a minimal Linux graphical environment that runs without root, manages 
   - Efficient dirty-region drawing
   - Minimal window manager support
 
+
 ## Current Milestone
 
-Phase 1: Single-client prototype with framebuffer output and working IPC communication.
+### BGTK (Brian's Graphical Toolkit)
 
-### Components to Implement First
+[x] **Step 1: Analyze Client API**
+    *   Check `bgce.h` to see what functions are available for client connection, buffer retrieval, and especially **event handling**.
+    *   Check `client.c` to see how an application currently interacts with `libbgce.so`.
 
-1. `bgced` server skeleton:
-   - Open `/dev/fb0`
-   - Create UNIX socket for client connections
-   - Manage shared memory for client buffers
-   - Composite and blit to display buffer
+[ ] **Step 2: Define BGTK Interface (`bgtk.h`)**
+    * Define the core structure for a widget (`struct BGTK_Widget`).
+    * Define the event structure (`struct BGTK_Event`).
+    [ ] Improve widget structure: add options (like alignment), child widgets.
+    * Define API functions:
+        * `BGTK_Context *bgtk_init(void)`: Connects to BGCE server, gets buffer/dimensions.
+        * `void bgtk_main_loop(BGTK_Context *ctx)`: Blocking loop to handle events and redraws.
+        * `BGTK_Widget *bgtk_label_new(const char *text)`: Creates a label.
+        * `BGTK_Widget *bgtk_button_new(const char *text, void (*callback)(void))`
+        * `void bgtk_add_widget(BGTK_Context *ctx, BGTK_Widget *widget, int x, int y, int w, int h)`: Simple absolute positioning for now.
 
-2. `libbgce.so`:
-   - Connect to server
-   - Allocate shared buffer
-   - Implement API stubs (`getServerInfo`, `getBuffer`, `draw`)
+[ ] **Step 3: Implement BGTK Core (`bgtk.c`)**
+    [X] Implement initialization, event queueing, and simple drawing (e.g., drawing rectangles for buttons, text rendering).
+    [ ] Only call draw when changes are made, like input.
+    [ ] Implement proper hit detection: using widget trees and coordinates, e.g. click on x,y -> search the tree until last widget is found, then send the input to that widget.
 
-3. `bgce-client`:
-   - Simple test: fill buffer with color, send draw request
+[x] **Step 4: Integrate and Test**
+    [X] Create a new client file (or update `client.c`) to demonstrate a basic BGTK application. -> app.c
+    [ ] Ensure events (like mouse clicks) are routed to the appropriate widget callbacks. This needs server-side changes.
 
 ---
 

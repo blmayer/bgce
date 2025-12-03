@@ -386,22 +386,30 @@ void* input_loop(void* arg) {
 				if (!server.focused_client) {
 					continue;
 				}
+				struct Client c = *server.focused_client;
 
 				struct InputEvent e = {0};
 				e.device = server.input.devs[i];
 				e.code = ev.code;
 
-				// TODO: send x, y for mouse move
-				if (ev.type == EV_KEY) {
+				switch (ev.type) {
+				case EV_KEY:
 					e.value = ev.value;
-				} else if (ev.type == EV_REL) {
-					if (ev.code == REL_X)
-						e.value = ev.value;
-					else if (ev.code == REL_Y)
-						e.value = ev.value;
-				} else if (ev.type == EV_SYN) {
-					continue;
-				} else {
+					if (ev.code != BTN_LEFT && ev.code != BTN_RIGHT) {
+						break;
+					}
+				case EV_REL: {
+					int in = mouse_x >= c.x && mouse_x <= c.x + c.width &&
+					         mouse_y >= c.y && mouse_y <= c.y + c.height;
+					if (!in) {
+						continue;
+					}
+
+					e.x = mouse_x - c.x;
+					e.y = mouse_y - c.y;
+					break;
+				}
+				default:
 					continue;
 				}
 
@@ -409,7 +417,7 @@ void* input_loop(void* arg) {
 				struct BGCEMessage msg;
 				msg.type = MSG_INPUT_EVENT;
 				msg.data.input_event = e;
-				bgce_send_msg(server.focused_client->fd, &msg);
+				bgce_send_msg(c.fd, &msg);
 			}
 		}
 	}

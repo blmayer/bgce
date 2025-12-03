@@ -1,11 +1,11 @@
 CC = gcc
-CFLAGS = -Wall -O0 -std=c99 -fPIC -g -I/usr/include/libdrm
-LDFLAGS = -lrt -ldrm
+CFLAGS = -Wall -O0 -std=c99 -fPIC -g -I/usr/include/libdrm -I/usr/include/freetype2 -I/usr/include/harfbuzz
+LDFLAGS = -lrt -ldrm -lfreetype
 
 SERVER_OBJS = server.o loop.o libbgce.so input.o display.o
 LIB_OBJS = libbgce.o
 
-all: bgce libbgce.so client
+all: bgce libbgce.so client app
 
 bgce: $(SERVER_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) -L. -lbgce $(LDFLAGS)
@@ -16,11 +16,14 @@ libbgce.so: $(LIB_OBJS)
 client: client.c bgce.h
 	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce $(LDFLAGS)
 
+app: app.c bgtk.h bgtk.o
+	$(CC) $(CFLAGS) -o $@ app.c bgtk.o -L. -lbgce $(LDFLAGS)
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f *.o bgce libbgce.so client
+	rm -f *.o bgce libbgce.so client app
 
 .PHONY: test
 test-server: bgce

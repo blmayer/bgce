@@ -69,12 +69,6 @@ struct BufferReply {
 	uint32_t height;
 };
 
-enum InputType {
-	INPUT_KEYBOARD,
-	INPUT_MOUSE_MOVE,
-	INPUT_MOUSE_BUTTON,
-};
-
 struct InputEvent {
 	uint32_t code; /* key code or button code */
 	int32_t value; /* press=1, release=0, or delta */
