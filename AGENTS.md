@@ -28,31 +28,18 @@ Implement a minimal Linux graphical environment that runs without root, manages 
 
 ## Current Milestone
 
-### BGTK (Brian's Graphical Toolkit)
+### High-evel features
+[ ] Implement config file
+[ ] Implement a cache file to memorize the last location of clients, in order to reopen them on the same place
 
-[x] **Step 1: Analyze Client API**
-    *   Check `bgce.h` to see what functions are available for client connection, buffer retrieval, and especially **event handling**.
-    *   Check `client.c` to see how an application currently interacts with `libbgce.so`.
+### Protocol features
+[ ] Add suport for requesting a buffer at a specific location
+[ ] Add suport for resizing a buffer
 
-[ ] **Step 2: Define BGTK Interface (`bgtk.h`)**
-    * Define the core structure for a widget (`struct BGTK_Widget`).
-    * Define the event structure (`struct BGTK_Event`).
-    [ ] Improve widget structure: add options (like alignment), child widgets.
-    * Define API functions:
-        * `BGTK_Context *bgtk_init(void)`: Connects to BGCE server, gets buffer/dimensions.
-        * `void bgtk_main_loop(BGTK_Context *ctx)`: Blocking loop to handle events and redraws.
-        * `BGTK_Widget *bgtk_label_new(const char *text)`: Creates a label.
-        * `BGTK_Widget *bgtk_button_new(const char *text, void (*callback)(void))`
-        * `void bgtk_add_widget(BGTK_Context *ctx, BGTK_Widget *widget, int x, int y, int w, int h)`: Simple absolute positioning for now.
+### Internal stuff
+[ ] Create more tests
+  - [ ] test if events go to the correct client and only the one
 
-[ ] **Step 3: Implement BGTK Core (`bgtk.c`)**
-    [X] Implement initialization, event queueing, and simple drawing (e.g., drawing rectangles for buttons, text rendering).
-    [ ] Only call draw when changes are made, like input.
-    [ ] Implement proper hit detection: using widget trees and coordinates, e.g. click on x,y -> search the tree until last widget is found, then send the input to that widget.
-
-[x] **Step 4: Integrate and Test**
-    [X] Create a new client file (or update `client.c`) to demonstrate a basic BGTK application. -> app.c
-    [ ] Ensure events (like mouse clicks) are routed to the appropriate widget callbacks. This needs server-side changes.
 
 ---
 

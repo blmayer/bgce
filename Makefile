@@ -1,11 +1,11 @@
 CC = gcc
-CFLAGS = -Wall -O0 -std=c99 -fPIC -g -I/usr/include/libdrm -I/usr/include/freetype2 -I/usr/include/harfbuzz
-LDFLAGS = -lrt -ldrm -lfreetype
+CFLAGS = -Wall -O1 -std=c99 -fPIC -g -I/usr/include/libdrm
+LDFLAGS = -lrt -ldrm
 
 SERVER_OBJS = server.o loop.o libbgce.so input.o display.o
 LIB_OBJS = libbgce.o
 
-all: bgce libbgce.so client app
+all: bgce libbgce.so
 
 bgce: $(SERVER_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) -L. -lbgce $(LDFLAGS)
@@ -16,14 +16,25 @@ libbgce.so: $(LIB_OBJS)
 client: client.c bgce.h
 	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce $(LDFLAGS)
 
-app: app.c bgtk.h bgtk.o
-	$(CC) $(CFLAGS) -o $@ app.c bgtk.o -L. -lbgce $(LDFLAGS)
-
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
 	rm -f *.o bgce libbgce.so client app
+
+INSTALL_BIN = /usr/bin
+INSTALL_LIB = /usr/lib
+INSTALL_INCLUDE = /usr/include
+
+.PHONY: install
+install: bgce libbgce.so bgce.h
+	install -d $(INSTALL_BIN)
+	install -m 755 bgce $(INSTALL_BIN)
+	install -d $(INSTALL_LIB)
+	install -m 755 libbgce.so $(INSTALL_LIB)
+	install -d $(INSTALL_INCLUDE)
+	install -m 644 bgce.h $(INSTALL_INCLUDE)
+	ldconfig
 
 .PHONY: test
 test-server: bgce
