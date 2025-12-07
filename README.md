@@ -7,7 +7,7 @@ BGCE is a minimal graphical environment for Linux written in C. It acts as a bar
 The system is split into two components:
 
 - **Server:** Manages video buffer, input events, and window stacking.
-- **Client:** Applications that render to their own buffers and request drawing through the server.
+- **Client:** Sample application that renders its own buffer by requesting the server.
 
 The server maintains:
 - A **real display buffer** (the VGA framebuffer)
@@ -20,9 +20,7 @@ The client communicates with the server via a shared library exposing these APIs
 ```c
 ServerInfo getServerInfo(); // Returns buffer resolution, color depth, etc.
 Buffer* getBuffer(int width, int height); // Returns a pointer to the client’s buffer
-void draw(int x, int y, int z); // Requests server to draw client buffer at position
-bool getFocus(); // Checks if this client has input focus
-void resizeBuffer(int width, int height); // Optional: resize client buffer
+void draw(); // Requests server to draw the client buffer
 ```
 
 ### Input
@@ -46,7 +44,7 @@ void resizeBuffer(int width, int height); // Optional: resize client buffer
 ```bash
 git clone <repo-url>
 cd BGCE
-make
+make all client
 ./bgce   # Start server
 ./client  # Start test client
 ```
@@ -59,4 +57,4 @@ make
 
 ## License
 
-MIT License
+BSD 2-clause.
