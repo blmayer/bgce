@@ -7,12 +7,18 @@
 <link rel=alternate type="application/rss+xml" title=log href=feed.xml />
 <style>pre{width:52ch;margin:2ch auto}a{color:#ff00ff}</style>
 <pre>
-	┌────────────────────────┐
-	│                        │
-	│ BGCE.                  │
-	│     |\                 │
-	│      ^                 │
-	└────────────────────────┘
+	┌──────────────────────────────────────┐
+	│ BGCE.                                │
+	│     |\                               │
+	│      ^                               │
+	│                   ┌───────┐          │
+	│      ┌───────┐    │       │          │
+	│      │       │    │       │          │
+	│      │       │    │       │          │
+	│      │       │    │       │          │
+	│      └───────┘    └───────┘          │
+	│                                      │
+	└──────────────────────────────────────┘
 
 <i><b>BGCE: Brian's Graphical Computer Environment</b></i>
 
@@ -31,14 +37,16 @@ The system is split into two components:
 - <b>Client:</b> Applications that render to their own
   buffers and request drawing through the server.
 
+To keep track of the develoment check the commit log
+on the <a href=feed.xml>feed</a>.
 
 <b>Build Instructions</b>
 
 	git clone https://terminal.pink/bgce
 	cd bgce
 	make all client
-	./bgce   # Start server
-	./client  # Start test client
+	./bgce   # run server
+	./client # run test client (in another TTY)
 
 
 <b>Goals</b>
