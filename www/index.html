@@ -7,18 +7,18 @@
 <link rel=alternate type="application/rss+xml" title=log href=feed.xml />
 <style>pre{width:52ch;margin:2ch auto}a{color:#ff00ff}</style>
 <pre>
-	┌──────────────────────────────────────┐
-	│ BGCE.                                │
-	│     |\                               │
-	│      ^                               │
-	│                   ┌───────┐          │
-	│      ┌───────┐    │       │          │
-	│      │       │    │       │          │
-	│      │       │    │       │          │
-	│      │       │    │       │          │
-	│      └───────┘    └───────┘          │
-	│                                      │
-	└──────────────────────────────────────┘
+	┌────────────────────────────────────┐
+	│ BGCE.                              │
+	│     |\                             │
+	│      ^                             │
+	│                   ┌───────┐        │
+	│      ┌───────┐    │       │        │
+	│      │       │    │       │        │
+	│      │       │    │       │        │
+	│      │       │    │       │        │
+	│      └───────┘    └───────┘        │
+	│                                    │
+	└────────────────────────────────────┘
 
 <i><b>BGCE: Brian's Graphical Computer Environment</b></i>
 
@@ -40,6 +40,7 @@ The system is split into two components:
 To keep track of the develoment check the commit log
 on the <a href=feed.xml>feed</a>.
 
+
 <b>Build Instructions</b>
 
 	git clone https://terminal.pink/bgce
@@ -49,6 +50,21 @@ on the <a href=feed.xml>feed</a>.
 	./client # run test client (in another TTY)
 
 
+<i>Developing client applications</i>
+
+BGCE clients should write directly to the buffer
+and call draw(), so the server will draw it to the
+screen. When users resize the window an event is
+sent to the client, applications then should adjust
+its content and call draw().
+
+You are free to choose any libraries to help with
+drawing graphical elements. To be honest I don't
+know if the most common ones can directly handle
+buffers. So I am creating a toolkit: <a href=/bgtk/index.html>BGTK</a>, check it
+out if you want.
+
+ 
 <b>Goals</b>
 
 - Minimal, understandable graphics stack in C
