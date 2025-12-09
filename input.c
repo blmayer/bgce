@@ -267,7 +267,7 @@ static int handle_input_event(struct input_event ev) {
 		}
 
 		if (!alt_down) {
-			return 0; // Alt + Left click down
+			return 0; // Left click
 		}
 
 		printf("[BGCE] Alt is pressed, starting move/resize.\n");
@@ -341,8 +341,8 @@ static int handle_input_event(struct input_event ev) {
 				drag.dx += dx;
 				drag.dy += dy;
 			}
+			return 1;
 		}
-		return 1;
 	}
 
 	// This means nothing was handled
@@ -391,10 +391,10 @@ void* input_loop(void* arg) {
 				struct InputEvent e = {0};
 				e.device = server.input.devs[i];
 				e.code = ev.code;
+				e.value = ev.value;
 
 				switch (ev.type) {
 				case EV_KEY:
-					e.value = ev.value;
 					if (ev.code != BTN_LEFT && ev.code != BTN_RIGHT) {
 						break;
 					}
