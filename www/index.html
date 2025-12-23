@@ -40,6 +40,14 @@ The system is split into two components:
 To keep track of the develoment check the commit log
 on the <a href=feed.xml>feed</a>.
 
+ 
+<i>Goals</i>
+
+- Minimal, understandable graphics stack in C
+- No external dependencies like OpenGL, X11 etc
+- Educational reference for framebuffer-based
+  compositing and IPC
+
 
 <b>Build Instructions</b>
 
@@ -49,8 +57,53 @@ on the <a href=feed.xml>feed</a>.
 	./bgce   # run server
 	./client # run test client (in another TTY)
 
+  
+<b>Configuration</b>
 
-<i>Developing client applications</i>
+BGCE supports configuration for the background through a config file. By default, it looks for `~/.config/bgce.conf`.
+
+<i>Config File Format</i>
+
+```ini
+[background]
+# Background type: "color" or "image"
+type = color
+
+# For color background:
+color = #RRGGBB   # Hex color code (e.g., #FF0000 for red)
+# or
+color = #RRGGBBAA # Hex color with alpha (e.g., #FF000080 for semi-transparent red)
+
+# For image background:
+#path = /path/to/image.png
+#mode = tiled     # or "scaled"
+```
+
+
+<i>Example Config File</i>
+
+```ini
+[background]
+type = color
+color = #336699
+```
+
+or
+
+```ini
+[background]
+type = image
+path = /usr/share/backgrounds/default.png
+mode = scaled
+```
+
+
+<i>Notes</i>
+
+- Scaled images look horrible.
+
+
+<b>Developing client applications</b>
 
 BGCE clients should write directly to the buffer
 and call draw(), so the server will draw it to the
@@ -63,15 +116,6 @@ drawing graphical elements. To be honest I don't
 know if the most common ones can directly handle
 buffers. So I am creating a toolkit: <a href=/bgtk/index.html>BGTK</a>, check it
 out if you want.
-
- 
-<b>Goals</b>
-
-- Minimal, understandable graphics stack in C
-- No external dependencies like OpenGL, X11 etc
-- Educational reference for framebuffer-based
-  compositing and IPC
-
 
 <b>License</b>
 
