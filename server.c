@@ -22,7 +22,7 @@ static void handle_sigint(int sig) {
 	release_display();
 	free(server.framebuffer);
 	printf("\n[BGCE] Server terminated.\n");
-	
+
 	exit(0);
 }
 
@@ -37,6 +37,15 @@ int main(void) {
 	server.framebuffer = NULL;
 	server.crtc_id = 0;
 	server.client_count = 0;
+
+	struct BackgroundConfig config;
+	char* home = getenv("HOME");
+	if (home) {
+		char user_config[512];
+		snprintf(user_config, sizeof(user_config), "%s/.config/bgce.conf", home);
+		parse_config(&config);
+	}
+	printf("[BGCE] Loaded config type=%u, path=%s, mode=%u\n", config.type, config.path, config.mode);
 
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -79,9 +88,11 @@ int main(void) {
 	background_client.width = server.display_w;
 	background_client.height = server.display_h;
 	background_client.buffer = malloc(server.display_w * server.display_h * 4);
-	memset(background_client.buffer, 0xaa, server.display_w * server.display_h * 4);
 	background_client.next = NULL;
 	server.clients = &background_client;
+
+	// Apply background based on config
+	apply_background(&config, background_client.buffer, server.display_w, server.display_h);
 
 	puts("[BGCE] Drawing background");
 	draw(&server, background_client);

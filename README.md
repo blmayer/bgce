@@ -15,8 +15,8 @@
 	└────────────────────────────────────┘
 ```
 
-
 BGCE is a minimal graphical environment for Linux written in C. It acts as a bare-bones window system, similar in concept to Xorg or Wayland, but much simpler and designed to run **without root privileges**.
+
 
 ## Overview
 
@@ -81,6 +81,51 @@ make all client
 # Go to a different tty
 ./client  # Start test client
 ```
+
+
+## Configuration
+
+BGCE supports configuration for the background through a config file. By default, it looks for `~/.config/bgce.conf`.
+
+
+### Config File Format
+
+```ini
+[background]
+# Background type: "color" or "image"
+type = color
+
+# For color background:
+color = #RRGGBB   # Hex color code (e.g., #FF0000 for red)
+# or
+color = #RRGGBBAA # Hex color with alpha (e.g., #FF000080 for semi-transparent red)
+
+# For image background:
+#path = /path/to/image.png
+#mode = tiled     # or "scaled"
+```
+
+### Example Config File
+
+```ini
+[background]
+type = color
+color = #336699
+```
+
+or
+
+```ini
+[background]
+type = image
+path = /usr/share/backgrounds/default.png
+mode = scaled
+```
+
+
+### Notes
+
+- Scaled images look horrible.
 
 
 ## Developing client applications

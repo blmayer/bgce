@@ -10,6 +10,8 @@
 #include <sys/types.h>
 #include <xf86drmMode.h>
 
+#define MAX_PATH_LEN 512
+
 /* ----------------------------
  * Client Representation
  * ---------------------------- */
@@ -55,6 +57,30 @@ struct ServerState {
 	struct Client* focused_client;
 };
 
+// Background types
+typedef enum {
+	BG_COLOR,
+	BG_IMAGE
+} BackgroundType;
+
+// Image display modes
+typedef enum {
+	IMAGE_TILED,
+	IMAGE_SCALED
+} ImageMode;
+
+// Background configuration
+struct BackgroundConfig {
+	BackgroundType type;
+	uint32_t color; // RGBA format
+	ImageMode mode;
+	char path[MAX_PATH_LEN];
+};
+
+// Parse config file
+int parse_config(struct BackgroundConfig* config);
+int apply_background(struct BackgroundConfig* config, uint32_t* buffer, uint32_t width, uint32_t height);
+
 /* ----------------------------
  * Cursor
  * ---------------------------- */
@@ -63,7 +89,6 @@ struct ServerState {
 #define CURSOR_HEIGHT 64
 #define CURSOR_HOTSPOT_X 0
 #define CURSOR_HOTSPOT_Y 0
-
 
 /* ----------------------------
  * Server Functions

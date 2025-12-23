@@ -1,8 +1,8 @@
 CC = gcc
 CFLAGS = -Wall -O1 -std=c99 -fPIC -g -I/usr/include/libdrm
-LDFLAGS = -lrt -ldrm
+LDFLAGS = -lrt -ldrm -lm
 
-SERVER_OBJS = server.o loop.o libbgce.so input.o display.o
+SERVER_OBJS = server.o loop.o libbgce.so input.o display.o config.o
 LIB_OBJS = libbgce.o
 
 all: bgce libbgce.so

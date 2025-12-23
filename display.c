@@ -83,20 +83,6 @@ static int drm_destroy_dumb(int fd, uint32_t handle) {
 	return 0;
 }
 
-// static void draw_gradient(uint8_t* buf, uint32_t stride, uint32_t width, uint32_t height) {
-// 	/* Buf is assumed 32bpp (ARGB or XRGB), stride in bytes */
-// 	for (uint32_t y = 0; y < height; y++) {
-// 		uint32_t* line = (uint32_t*)(buf + y * stride);
-// 		for (uint32_t x = 0; x < width; x++) {
-// 			uint8_t r = (x * 255) / (width - 1);
-// 			uint8_t g = (y * 255) / (height - 1);
-// 			uint8_t b = 128;
-// 			/* Use XRGB (no alpha) for scanout */
-// 			line[x] = (r << 16) | (g << 8) | b;
-// 		}
-// 	}
-// }
-
 static void draw_cursor(uint8_t* buf, uint32_t stride, uint32_t w, uint32_t h) {
 	/* Cursor is ARGB8888 */
 	for (uint32_t y = 0; y < h; y++) {
@@ -213,7 +199,7 @@ int init_display() {
 	server.display_h = chosen_mode.vdisplay;
 	server.display_bpp = bpp;
 
-	printf("Using connector %u, CRTC %u, mode %ux%u@%u\n",
+	printf("[BGCE] Setting up connector %u, CRTC %u, mode %ux%u@%u\n",
 	       conn_id, crtc_id, width, height, chosen_mode.vrefresh);
 
 	/* ---------- Create dumb scanout buffer ---------- */
