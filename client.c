@@ -91,7 +91,6 @@ int main(void) {
 			struct BufferReply b = msg.data.buffer_reply;
 			printf("[BGCE] Buffer change event: w=%u h=%u shm_name=%s\n", b.width, b.height, b.shm_name);
 
-			buf = bgce_resize_buffer(b);
 			w = b.width;
 			h = b.height;
 

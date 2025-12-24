@@ -110,25 +110,6 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
 	return buf;
 }
 
-// TODO: unmap old mem
-void* bgce_resize_buffer(struct BufferReply reply) {
-	size_t size = reply.width * reply.height * 4;
-	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
-	if (shm_fd < 0) {
-		perror("shm_open (client)");
-		return NULL;
-	}
-
-	void* buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-	if (buf == MAP_FAILED) {
-		perror("mmap (client)");
-		close(shm_fd);
-		return NULL;
-	}
-
-	return buf;
-}
-
 /* Public API: Draw current buffer */
 int bgce_draw(int conn) {
 	if (conn < 0)
@@ -136,6 +117,21 @@ int bgce_draw(int conn) {
 
 	struct BGCEMessage msg = {0};
 	msg.type = MSG_DRAW;
+
+	if (bgce_send_msg(conn, &msg) <= 0)
+		return -1;
+
+	return 0;
+}
+
+int bgce_move(int conn, int x, int y) {
+	if (conn < 0)
+		return -1;
+
+	struct BGCEMessage msg = {0};
+	msg.type = MSG_MOVE;
+	msg.data.move_request.x = x;
+	msg.data.move_request.y = y;
 
 	if (bgce_send_msg(conn, &msg) <= 0)
 		return -1;

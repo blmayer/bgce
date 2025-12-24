@@ -77,6 +77,13 @@ void* client_thread(void* arg) {
 			snprintf(client->shm_name, sizeof(client->shm_name),
 			         "bgce_buf_%d_%ld", getpid(), time(NULL));
 
+			// Unmap and unlink the existing buffer: for resize
+			if (client->buffer) {
+				printf("[BGCE] Client already has a buffer, unmapping.\n",
+				munmap(client->buffer, client->width * client->height * 4);
+				shm_unlink(client->shm_name);
+			}
+
 			int shm_fd = shm_open(client->shm_name, O_CREAT | O_RDWR, 0600);
 			if (shm_fd < 0) {
 				perror("shm_open");
@@ -121,9 +128,20 @@ void* client_thread(void* arg) {
 			draw(&server, *client);
 			break;
 		}
+		case MSG_MOVE: {
+			struct MoveRequest move_req = msg.data.move_request;
+			printf(
+				"[BGCE] Client requested move to position (%d, %d)\n",
+				move_req.x, move_req.y);
+
+			// Update client position
+			client->x = move_req.x;
+			client->y = move_req.y;
+
+			break;
+		}
 		default:
 			fprintf(stderr, "[BGCE] Unknown message type %d\n", msg.type);
-			break;
 		}
 	}
 

@@ -29,7 +29,8 @@ enum {
 	MSG_INPUT_EVENT,
 	MSG_BUFFER_CHANGE,
 	MSG_FOCUS_CHANGE,
-	MSG_SUBSCRIBE_INPUT
+	MSG_SUBSCRIBE_INPUT,
+	MSG_MOVE
 };
 
 /* ----------------------------
@@ -55,9 +56,12 @@ struct BufferRequest {
 	uint32_t height;
 };
 
-struct MoveBufferRequest {
-	uint32_t x;
-	uint32_t y;
+struct MoveRequest {
+	int32_t x;
+	int32_t y;
+};
+
+struct ResizeRequest {
 	uint32_t width;
 	uint32_t height;
 };
@@ -69,14 +73,6 @@ struct BufferReply {
 	uint32_t height;
 };
 
-struct InputEvent {
-	uint32_t code; /* key code or button code */
-	int32_t value; /* press=1, release=0, or delta */
-	int32_t x;     /* optional: for mouse move */
-	int32_t y;     /* optional: for mouse move */
-	struct InputDevice device;
-};
-
 struct BGCEMessage {
 	uint32_t type;
 	union {
@@ -85,7 +81,7 @@ struct BGCEMessage {
 		struct BufferReply buffer_reply;
 		struct MoveBufferRequest move_buffer_request;
 		struct InputEvent input_event;
-
+		struct MoveRequest move_request;
 	} data;
 };
 
@@ -116,8 +112,7 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
  */
 void* bgce_get_buffer(int conn, const struct BufferRequest req);
 
-// TODO: add comment
-void* bgce_resize_buffer(const struct BufferReply reply);
+int bgce_move(int fd, int x, int y);
 
 /**
  * Send a draw command to the server, telling it to blit the
