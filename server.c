@@ -13,22 +13,7 @@
 
 struct ServerState server = {}; /* Global server state */
 
-/* Cleanup on Ctrl+C */
-static void handle_sigint(int sig) {
-	(void)sig;
-	printf("[BGCE] Got sigint, shutting down.\n");
-
-	unlink(SOCKET_PATH);
-	release_display();
-	free(server.framebuffer);
-	printf("\n[BGCE] Server terminated.\n");
-
-	exit(0);
-}
-
 int main(void) {
-	signal(SIGINT, handle_sigint);
-
 	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
 	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
 
@@ -38,7 +23,7 @@ int main(void) {
 	server.crtc_id = 0;
 	server.client_count = 0;
 
-	struct BackgroundConfig config;
+	struct config config;
 	char* home = getenv("HOME");
 	if (home) {
 		char user_config[512];

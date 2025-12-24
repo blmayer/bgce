@@ -40,7 +40,7 @@ static uint32_t parse_hex_color(const char* str) {
 }
 
 // Parse config file
-int parse_config(struct BackgroundConfig* config) {
+int parse_config(struct config* config) {
 	const char* home = getenv("HOME");
 	char user_config[512];
 	if (!home) {
@@ -112,7 +112,7 @@ int parse_config(struct BackgroundConfig* config) {
 }
 
 // Apply background to a buffer
-int apply_background(struct BackgroundConfig* config, uint32_t* buffer, uint32_t width, uint32_t height) {
+int apply_background(struct config* config, uint32_t* buffer, uint32_t width, uint32_t height) {
 	if (config->type == BG_COLOR) {
 		// Fill with solid color
 		for (uint32_t i = 0; i < width * height; i++) {

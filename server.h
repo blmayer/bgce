@@ -69,8 +69,8 @@ typedef enum {
 	IMAGE_SCALED
 } ImageMode;
 
-// Background configuration
-struct BackgroundConfig {
+// Background configuration for now
+struct config {
 	BackgroundType type;
 	uint32_t color; // RGBA format
 	ImageMode mode;
@@ -78,8 +78,8 @@ struct BackgroundConfig {
 };
 
 // Parse config file
-int parse_config(struct BackgroundConfig* config);
-int apply_background(struct BackgroundConfig* config, uint32_t* buffer, uint32_t width, uint32_t height);
+int parse_config(struct config* config);
+int apply_background(struct config* config, uint32_t* buffer, uint32_t width, uint32_t height);
 
 /* ----------------------------
  * Cursor
