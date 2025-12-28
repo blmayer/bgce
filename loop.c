@@ -79,7 +79,7 @@ void* client_thread(void* arg) {
 
 			// Unmap and unlink the existing buffer: for resize
 			if (client->buffer) {
-				printf("[BGCE] Client already has a buffer, unmapping.\n",
+				printf("[BGCE] Client already has a buffer, unmapping.\n");
 				munmap(client->buffer, client->width * client->height * 4);
 				shm_unlink(client->shm_name);
 			}

@@ -73,13 +73,21 @@ struct BufferReply {
 	uint32_t height;
 };
 
+struct InputEvent {
+       uint32_t code; /* key code or button code */
+       int32_t value; /* press=1, release=0, or delta */
+       int32_t x;     /* optional: for mouse move */
+       int32_t y;     /* optional: for mouse move */
+       struct InputDevice device;
+};
+
 struct BGCEMessage {
 	uint32_t type;
 	union {
 		struct ServerInfo server_info;
 		struct BufferRequest buffer_request;
 		struct BufferReply buffer_reply;
-		struct MoveBufferRequest move_buffer_request;
+		struct MoveRequest move_buffer_request;
 		struct InputEvent input_event;
 		struct MoveRequest move_request;
 	} data;
