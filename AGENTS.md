@@ -29,12 +29,13 @@ Implement a minimal Linux graphical environment that runs without root, manages 
 ## Current Milestone
 
 ### High-evel features
-[ ] Implement config file
+[X] Implement config file
+[X] Implement taking screenshots
 [ ] Implement a cache file to memorize the last location of clients, in order to reopen them on the same place
 
 ### Protocol features
-[ ] Add suport for requesting a buffer at a specific location
-[ ] Add suport for resizing a buffer
+[X] Add suport for moving a buffer at a specific location
+[X] Add suport for resizing a buffer -> clients should just ask for a buffer, the same way
 
 ### Internal stuff
 [ ] Create more tests

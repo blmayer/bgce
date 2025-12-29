@@ -188,6 +188,11 @@ static int handle_input_event(struct input_event ev) {
 			printf("[BGCE] Ctrl+Alt+Q pressed, exiting.\n");
 			exit(1);
 		}
+		if (ev.code == KEY_SYSRQ) {
+			printf("[BGCE] Print Screen key pressed, taking screenshot.\n");
+			take_screenshot("screenshot.png");
+			return 1;
+		}
 	}
 
 	if (ev.type == EV_KEY && ev.value == 0) { // Key release

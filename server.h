@@ -110,6 +110,12 @@ void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);
 
 /**
+ * Capture the current framebuffer and save it as a screenshot.
+ * Returns 0 on success, -1 on failure.
+ */
+int take_screenshot(const char* filename);
+
+/**
  * Input device related functions
  * from input.c
  */

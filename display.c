@@ -16,6 +16,8 @@
  * real production code should be more thorough and handle more corner cases.
  */
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+
 #include "server.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -31,6 +33,7 @@
 #include <drm/drm_mode.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <stb_image_write.h>
 
 extern struct ServerState server;
 
@@ -577,4 +580,33 @@ void release_display(void) {
 
 	close(drm_fd);
 	printf("[BGCE] Display released.\n");
+}
+
+int take_screenshot(const char* filename) {
+    if (!server.framebuffer) {
+        fprintf(stderr, "No framebuffer available for screenshot.\n");
+        return -1;
+    }
+
+    uint32_t width = server.display_w;
+    uint32_t height = server.display_h;
+    uint32_t stride = width * BGCE_BYTES_PER_PIXEL;
+
+    // Write the framebuffer to a PNG file
+    int result = stbi_write_png(
+        filename,
+        width,
+        height,
+        BGCE_BYTES_PER_PIXEL,
+        server.framebuffer,
+        stride
+    );
+
+    if (!result) {
+        fprintf(stderr, "Failed to save screenshot to %s.\n", filename);
+        return -1;
+    }
+
+    printf("Screenshot saved to %s.\n", filename);
+    return 0;
 }
