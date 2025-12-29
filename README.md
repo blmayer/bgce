@@ -39,7 +39,12 @@ Buffer* getBuffer(int width, int height); // Returns a pointer to the client’s
 void draw(); // Requests server to draw the client buffer
 ```
 
-I posted a video on my blog:
+But talk is cheap, BGCE now can take screenshots, so here's one:
+
+![](https://terminal.pink/bgce/screenshot.png)
+
+
+I also posted a video on my blog:
 
 [Post](https://blog.terminal.pink/posts/bgce.html)
 
