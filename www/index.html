@@ -62,42 +62,37 @@ Here's a <a href=screenshot.png>screenshot</a>.
   
 <b>Configuration</b>
 
-BGCE supports configuration for the background through a config file. By default, it looks for `~/.config/bgce.conf`.
+BGCE supports configuration through a config file.
+By default, it looks for `~/.config/bgce.conf`.
 
 <i>Config File Format</i>
 
-```ini
 [background]
 # Background type: "color" or "image"
 type = color
 
 # For color background:
-color = #RRGGBB   # Hex color code (e.g., #FF0000 for red)
+color = #RRGGBB   # Hex color code
 # or
-color = #RRGGBBAA # Hex color with alpha (e.g., #FF000080 for semi-transparent red)
+color = #RRGGBBAA # Hex color with alpha
 
 # For image background:
 #path = /path/to/image.png
 #mode = tiled     # or "scaled"
-```
 
 
 <i>Example Config File</i>
 
-```ini
 [background]
 type = color
 color = #336699
-```
 
 or
 
-```ini
 [background]
 type = image
 path = /usr/share/backgrounds/default.png
 mode = scaled
-```
 
 
 <i>Notes</i>
