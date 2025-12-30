@@ -583,30 +583,30 @@ void release_display(void) {
 }
 
 int take_screenshot(const char* filename) {
-    if (!server.framebuffer) {
-        fprintf(stderr, "No framebuffer available for screenshot.\n");
-        return -1;
-    }
+	if (!server.framebuffer) {
+		fprintf(stderr, "No framebuffer available for screenshot.\n");
+		return -1;
+	}
 
-    uint32_t width = server.display_w;
-    uint32_t height = server.display_h;
-    uint32_t stride = width * BGCE_BYTES_PER_PIXEL;
+	uint32_t width = server.display_w;
+	uint32_t height = server.display_h;
+	uint32_t stride = width * BGCE_BYTES_PER_PIXEL;
 
-    // Write the framebuffer to a PNG file
-    int result = stbi_write_png(
-        filename,
-        width,
-        height,
-        BGCE_BYTES_PER_PIXEL,
-        server.framebuffer,
-        stride
-    );
+	// Write the framebuffer to a PNG file
+	int result = stbi_write_png(
+		filename,
+		width,
+		height,
+		BGCE_BYTES_PER_PIXEL,
+		server.framebuffer,
+		stride
+	);
 
-    if (!result) {
-        fprintf(stderr, "Failed to save screenshot to %s.\n", filename);
-        return -1;
-    }
+	if (!result) {
+		fprintf(stderr, "Failed to save screenshot to %s.\n", filename);
+		return -1;
+	}
 
-    printf("Screenshot saved to %s.\n", filename);
-    return 0;
+	printf("Screenshot saved to %s.\n", filename);
+	return 0;
 }

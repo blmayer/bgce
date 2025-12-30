@@ -190,6 +190,9 @@ static int handle_input_event(struct input_event ev) {
 		}
 		if (ev.code == KEY_SYSRQ) {
 			printf("[BGCE] Print Screen key pressed, taking screenshot.\n");
+			if (server.focused_client) {
+				return 0;
+			}
 			take_screenshot("screenshot.png");
 			return 1;
 		}
@@ -248,6 +251,7 @@ static int handle_input_event(struct input_event ev) {
 		// switch focuse
 		struct Client* c = pick_client(mouse_x, mouse_y);
 		if (!c) {
+			server.focused_client = NULL;
 			return 0;
 		}
 		printf("[BGCE] Click detected at client %s z=%d.\n", c->shm_name, c->z);
