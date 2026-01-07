@@ -125,7 +125,12 @@ int apply_background(struct config* config, uint32_t* buffer, uint32_t width, ui
 		unsigned char* img_data = stbi_load(config->path, &img_width, &img_height, &img_channels, 4);
 		if (!img_data) {
 			fprintf(stderr, "Failed to load image: %s\n", config->path);
-			return -1;
+			// Fallback to a default color (dark gray with full opacity)
+			fprintf(stderr, "[BGCE] Falling back to default color #333333\n");
+			for (uint32_t i = 0; i < width * height; i++) {
+				buffer[i] = 0xFF333333;
+			}
+			return 0;
 		}
 
 		if (config->mode == IMAGE_TILED) {

@@ -36,7 +36,7 @@ install: bgce libbgce.so bgce.h
 	install -m 644 bgce.h $(INSTALL_INCLUDE)
 	ldconfig
 
-.PHONY: test
+.PHONY: test-server
 test-server: bgce
 	@echo "[MAKE] Starting BGCE server..."
 	@LD_LIBRARY_PATH=. ./bgce > $(SERVER_LOG) 2>&1 & echo $$! > $(SERVER_PID)
