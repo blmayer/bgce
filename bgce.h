@@ -74,8 +74,9 @@ struct BufferReply {
 };
 
 struct InputEvent {
-       uint32_t code; /* key code or button code */
+       int32_t type; /* press=1, release=0, or delta */
        int32_t value; /* press=1, release=0, or delta */
+       uint32_t code; /* key code or button code */
        int32_t x;     /* optional: for mouse move */
        int32_t y;     /* optional: for mouse move */
        struct InputDevice device;

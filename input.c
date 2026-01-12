@@ -398,6 +398,7 @@ void* input_loop(void* arg) {
 				struct Client c = *server.focused_client;
 
 				struct InputEvent e = {0};
+				e.type = ev.type;
 				e.device = server.input.devs[i];
 				e.code = ev.code;
 				e.value = ev.value;
