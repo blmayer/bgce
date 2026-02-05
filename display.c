@@ -24,11 +24,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
 #include <xf86drm.h>
@@ -380,6 +380,67 @@ void draw(struct ServerState* srv, struct Client cli) {
 	}
 }
 
+static void blit_client_overlap(struct ServerState* srv, const struct Client* cli,
+                                int rx0, int ry0, int rx1, int ry1) {
+	if (!srv || !srv->framebuffer || !cli || !cli->buffer)
+		return;
+
+	int cx0 = (int)cli->x;
+	int cy0 = (int)cli->y;
+	int cx1 = (int)cli->x + (int)cli->width;
+	int cy1 = (int)cli->y + (int)cli->height;
+
+	int ox0 = rx0 > cx0 ? rx0 : cx0;
+	int oy0 = ry0 > cy0 ? ry0 : cy0;
+	int ox1 = rx1 < cx1 ? rx1 : cx1;
+	int oy1 = ry1 < cy1 ? ry1 : cy1;
+
+	if (ox0 >= ox1 || oy0 >= oy1)
+		return;
+
+	uint32_t screen_w = srv->display_w;
+	uint32_t* dst = (uint32_t*)srv->framebuffer;
+	uint32_t* src = (uint32_t*)cli->buffer;
+
+	for (int y = oy0; y < oy1; y++) {
+		uint32_t* drow = dst + y * (int)screen_w + ox0;
+		uint32_t* srow = src + (y - cy0) * (int)cli->width + (ox0 - cx0);
+		memcpy(drow, srow, (size_t)(ox1 - ox0) * 4);
+	}
+}
+
+static void composite_chain_to_rect(struct ServerState* srv, struct Client* first,
+                                   int rx0, int ry0, int rx1, int ry1) {
+	if (!srv || !srv->framebuffer)
+		return;
+	if (rx0 >= rx1 || ry0 >= ry1)
+		return;
+
+	int n = 0;
+	for (struct Client* c = first; c; c = c->next)
+		n++;
+	if (n <= 0)
+		return;
+
+	struct Client** stack = malloc((size_t)n * sizeof(*stack));
+	if (!stack)
+		return;
+
+	int i = 0;
+	for (struct Client* c = first; c; c = c->next)
+		stack[i++] = c;
+
+	/* The linked-list is ordered top->bottom.
+	 * For correct composition we must draw bottom->top so that higher windows
+	 * overwrite lower ones (background is typically last in the chain).
+	 */
+	for (i = n - 1; i >= 0; i--) {
+		blit_client_overlap(srv, stack[i], rx0, ry0, rx1, ry1);
+	}
+
+	free(stack);
+}
+
 /*
  * The situation:
  *
@@ -410,105 +471,80 @@ void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy) {
 	uint32_t screen_w = srv->display_w;
 	uint32_t screen_h = srv->display_h;
 
-	/* Rectangle A: Exposed area in y-direction */
-	int rect_a_start_x = c.x;
-	int rect_a_start_y = dy > 0 ? c.y : c.y + height + dy;
-	int rect_a_end_x = c.x + width;
-	int rect_a_end_y = dy > 0 ? c.y + dy : c.y + height;
+	/* Rectangle A: exposed area in y-direction (top or bottom strip of the old location) */
+	int rect_a_start_x = (int)c.x;
+	int rect_a_end_x = (int)c.x + (int)width;
+	int rect_a_start_y;
+	int rect_a_end_y;
+	if (dy > 0) {
+		rect_a_start_y = (int)c.y;
+		rect_a_end_y = (int)c.y + dy;
+	} else {
+		rect_a_start_y = (int)c.y + (int)height + dy;
+		rect_a_end_y = (int)c.y + (int)height;
+	}
 
-	/* Rectangle B: Exposed area in x-direction */
-	int rect_b_start_x = dx > 0 ? c.x : c.x + width + dx;
-	int rect_b_start_y = c.y + (dy > 0 ? dy : 0);
-	int rect_b_end_x = dx > 0 ? c.x + dx : c.x + width;
-	int rect_b_end_y = c.y + height + (dy > 0 ? dy : 0);
+	/* Rectangle B: exposed area in x-direction (left or right strip of the old location) */
+	int rect_b_start_x;
+	int rect_b_end_x;
+	if (dx > 0) {
+		rect_b_start_x = (int)c.x;
+		rect_b_end_x = (int)c.x + dx;
+	} else {
+		rect_b_start_x = (int)c.x + (int)width + dx;
+		rect_b_end_x = (int)c.x + (int)width;
+	}
 
-	/* Clip rectangles to screen boundaries */
-	rect_a_start_x = rect_a_start_x < 0 ? 0 : rect_a_start_x;
-	rect_a_start_y = rect_a_start_y < 0 ? 0 : rect_a_start_y;
-	rect_a_end_x = rect_a_end_x > (int)screen_w ? screen_w : rect_a_end_x;
-	rect_a_end_y = rect_a_end_y > (int)screen_h ? screen_h : rect_a_end_y;
+	int rect_b_start_y = (int)c.y;
+	int rect_b_end_y = (int)c.y + (int)height;
+	/* Avoid overdrawing the corner already covered by rect A (optional) */
+	if (dy > 0)
+		rect_b_start_y += dy;
+	if (dy < 0)
+		rect_b_end_y += dy;
 
-	rect_b_start_x = rect_b_start_x < 0 ? 0 : rect_b_start_x;
-	rect_b_start_y = rect_b_start_y < 0 ? 0 : rect_b_start_y;
-	rect_b_end_x = rect_b_end_x > (int)screen_w ? screen_w : rect_b_end_x;
-	rect_b_end_y = rect_b_end_y > (int)screen_h ? screen_h : rect_b_end_y;
+	/* Clip to screen boundaries */
+	if (rect_a_start_x < 0)
+		rect_a_start_x = 0;
+	if (rect_a_start_y < 0)
+		rect_a_start_y = 0;
+	if (rect_a_end_x > (int)screen_w)
+		rect_a_end_x = (int)screen_w;
+	if (rect_a_end_y > (int)screen_h)
+		rect_a_end_y = (int)screen_h;
 
-	struct Client* cli = c.next;
-	while (cli) {
-		/* Redraw Rectangle A */
-		if (dy) {
-			int cli_end_x = cli->x + cli->width;
-			int cli_end_y = cli->y + cli->height;
+	if (rect_b_start_x < 0)
+		rect_b_start_x = 0;
+	if (rect_b_start_y < 0)
+		rect_b_start_y = 0;
+	if (rect_b_end_x > (int)screen_w)
+		rect_b_end_x = (int)screen_w;
+	if (rect_b_end_y > (int)screen_h)
+		rect_b_end_y = (int)screen_h;
 
-			int overlap_start_x = rect_a_start_x > cli->x ? rect_a_start_x : cli->x;
-			int overlap_start_y = rect_a_start_y > cli->y ? rect_a_start_y : cli->y;
-
-			int overlap_end_x = rect_a_end_x < cli_end_x ? rect_a_end_x : cli_end_x;
-			int overlap_end_y = rect_a_end_y < cli_end_y ? rect_a_end_y : cli_end_y;
-
-			if (overlap_start_x < overlap_end_x && overlap_start_y < overlap_end_y) {
-				for (int y = overlap_start_y; y < overlap_end_y; y++) {
-					uint32_t* drow = (uint32_t*)srv->framebuffer + y * screen_w + overlap_start_x;
-					uint32_t* srow = (uint32_t*)cli->buffer + (y - cli->y) * cli->width + (overlap_start_x - cli->x);
-					memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
-				}
-			}
-		}
-
-		/* Redraw Rectangle B */
-		if (dx) {
-			int cli_end_x = cli->x + cli->width;
-			int cli_end_y = cli->y + cli->height;
-
-			int overlap_start_x = rect_b_start_x > cli->x ? rect_b_start_x : cli->x;
-			int overlap_start_y = rect_b_start_y > cli->y ? rect_b_start_y : cli->y;
-
-			int overlap_end_x = rect_b_end_x < cli_end_x ? rect_b_end_x : cli_end_x;
-			int overlap_end_y = rect_b_end_y < cli_end_y ? rect_b_end_y : cli_end_y;
-
-			if (overlap_start_x < overlap_end_x && overlap_start_y < overlap_end_y) {
-				for (int y = overlap_start_y; y < overlap_end_y; y++) {
-					uint32_t* drow = (uint32_t*)srv->framebuffer + y * screen_w + overlap_start_x;
-					uint32_t* srow = (uint32_t*)cli->buffer + (y - cli->y) * cli->width + (overlap_start_x - cli->x);
-					memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
-				}
-			}
-		}
-		cli = cli->next;
+	/* Composite underlying clients (background -> ... -> topmost behind 'c') */
+	if (dy && rect_a_start_x < rect_a_end_x && rect_a_start_y < rect_a_end_y) {
+		composite_chain_to_rect(srv, c.next, rect_a_start_x, rect_a_start_y, rect_a_end_x, rect_a_end_y);
+	}
+	if (dx && rect_b_start_x < rect_b_end_x && rect_b_start_y < rect_b_end_y) {
+		composite_chain_to_rect(srv, c.next, rect_b_start_x, rect_b_start_y, rect_b_end_x, rect_b_end_y);
 	}
 }
-
 static void redraw_exposed_rect(struct ServerState* srv, const struct Client* resized_client,
-                                int exposed_x, int exposed_y, int exposed_width, int exposed_height) {
+                                 int exposed_x, int exposed_y, int exposed_width, int exposed_height) {
 	if (exposed_width <= 0 || exposed_height <= 0) {
 		return; // Nothing to draw
 	}
 
-	uint32_t screen_w = srv->display_w;
-
-	// Now, iterate through clients behind the resized_client and draw them if they overlap
-	struct Client* cli = resized_client->next;
-	while (cli) {
-		// Calculate overlap between the exposed rectangle and the current client 'cli'
-		int cli_end_x = cli->x + cli->width;
-		int cli_end_y = cli->y + cli->height;
-
-		int overlap_start_x = exposed_x > cli->x ? exposed_x : cli->x;
-		int overlap_start_y = exposed_y > cli->y ? exposed_y : cli->y;
-
-		int overlap_end_x = (exposed_x + exposed_width) < cli_end_x ? (exposed_x + exposed_width) : cli_end_x;
-		int overlap_end_y = (exposed_y + exposed_height) < cli_end_y ? (exposed_y + exposed_height) : cli_end_y;
-
-		if (overlap_start_x < overlap_end_x && overlap_start_y < overlap_end_y) {
-			// There's an overlap, copy from client's buffer to framebuffer
-			for (int y = overlap_start_y; y < overlap_end_y; y++) {
-				uint32_t* drow = (uint32_t*)srv->framebuffer + y * screen_w + overlap_start_x;
-				uint32_t* srow = (uint32_t*)cli->buffer + (y - cli->y) * cli->width + (overlap_start_x - cli->x);
-				memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
-			}
-		}
-		cli = cli->next;
-	}
+	/* Composite everything behind the resized client into the exposed rectangle.
+	 * Must be composed bottom->top to preserve correct stacking.
+	 */
+	composite_chain_to_rect(srv,
+	                        resized_client ? resized_client->next : NULL,
+	                        exposed_x,
+	                        exposed_y,
+	                        exposed_x + exposed_width,
+	                        exposed_y + exposed_height);
 }
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
