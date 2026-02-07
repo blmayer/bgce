@@ -32,13 +32,16 @@ void* client_thread(void* arg) {
 	client->next = server.clients;
 	client->z = server.clients->z + 1;
 	server.clients = client;
-	server.focused_client = client; /* last connected client gets focus */
 
-	if (!client) {
-		fprintf(stderr, "[BGCE] No available client slots\n");
-		close(client_fd);
-		return NULL;
+	/* last connected client gets focus (notify old focus only; don't notify the new client yet) */
+	struct Client* old_focus = server.focused_client;
+	if (old_focus && old_focus != client) {
+		struct BGCEMessage lost = {0};
+		lost.type = MSG_FOCUS_CHANGE;
+		lost.data.focus_event.state = 0;
+		bgce_send_msg(old_focus->fd, &lost);
 	}
+	server.focused_client = client;
 
 	printf("[BGCE] Thread started for client fd=%d z=%d\n", client_fd, client->z);
 
@@ -120,11 +123,10 @@ void* client_thread(void* arg) {
 
 		case MSG_DRAW: {
 			printf("[BGCE] Received draw event from client %s\n", client->shm_name);
-			if (client_fd != server.focused_client->fd) {
-				printf("[BGCE] Client is not focused!\n");
-				break;
-			}
-
+			/*
+			 * Drawing must be allowed even when the client is not focused.
+			 * Focus only affects input routing.
+			 */
 			draw(&server, *client);
 			break;
 		}
@@ -167,9 +169,13 @@ void* client_thread(void* arg) {
 	}
 
 	if (server.focused_client == client) {
+		/* notify focused client it lost focus before we clear */
+		struct BGCEMessage lost = {0};
+		lost.type = MSG_FOCUS_CHANGE;
+		lost.data.focus_event.state = 0;
+		bgce_send_msg(client->fd, &lost);
 		server.focused_client = NULL;
 	}
-
 	close(client->fd);
 
 	printf("[BGCE] Thread exiting for client fd=%d\n", client->fd);

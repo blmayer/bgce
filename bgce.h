@@ -82,6 +82,11 @@ struct InputEvent {
        struct InputDevice device;
 };
 
+/* Focus event: state=0 (lost), state=1 (gained) */
+struct FocusEvent {
+	int32_t state;
+};
+
 struct BGCEMessage {
 	uint32_t type;
 	union {
@@ -90,6 +95,7 @@ struct BGCEMessage {
 		struct BufferReply buffer_reply;
 		struct MoveRequest move_buffer_request;
 		struct InputEvent input_event;
+		struct FocusEvent focus_event;
 		struct MoveRequest move_request;
 	} data;
 };

@@ -87,6 +87,11 @@ int main(void) {
 			       ev.device.name, ev.code, ev.value);
 			break;
 		}
+		case MSG_FOCUS_CHANGE: {
+			int state = msg.data.focus_event.state;
+			printf("[BGCE Client] Focus %s\n", state ? "gained" : "lost");
+			break;
+		}
 		case MSG_BUFFER_CHANGE: {
 			struct BufferReply b = msg.data.buffer_reply;
 			printf("[BGCE] Buffer change event: w=%u h=%u shm_name=%s\n", b.width, b.height, b.shm_name);
@@ -108,7 +113,6 @@ int main(void) {
 			printf("[BGCE Client] Unknown message type %d\n", msg.type);
 			break;
 		}
-
 		// Check if 10 seconds have passed
 		if (time(NULL) - start_time >= 10) {
 			printf("[BGCE Client] Timeout reached, exiting...\n");

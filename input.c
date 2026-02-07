@@ -92,7 +92,7 @@ struct Client* pick_client(int x, int y) {
 		}
 		c = c->next;
 	}
-	return picked->z > 0 ? picked : NULL; // avoid getting the background
+	return (picked && picked->z > 0) ? picked : NULL; // avoid getting the background
 }
 
 int init_input(void) {
@@ -248,9 +248,16 @@ static int handle_input_event(struct input_event ev) {
 	if (ev.type == EV_KEY && (ev.code == BTN_LEFT || ev.code == BTN_RIGHT) && ev.value == 1) {
 		printf("[BGCE] Click detected at (%d, %d).\n", mouse_x, mouse_y);
 
-		// switch focuse
+		/* switch focus */
 		struct Client* c = pick_client(mouse_x, mouse_y);
+		struct Client* old_focus = server.focused_client;
 		if (!c) {
+			if (old_focus) {
+				struct BGCEMessage lost = {0};
+				lost.type = MSG_FOCUS_CHANGE;
+				lost.data.focus_event.state = 0;
+				bgce_send_msg(old_focus->fd, &lost);
+			}
 			server.focused_client = NULL;
 			return 0;
 		}
@@ -268,9 +275,26 @@ static int handle_input_event(struct input_event ev) {
 				server.clients = c;
 			}
 		}
-		if (c != server.focused_client) {
-			c->z = server.focused_client->z + 1;
+
+		if (c != old_focus) {
+			if (old_focus) {
+				struct BGCEMessage lost = {0};
+				lost.type = MSG_FOCUS_CHANGE;
+				lost.data.focus_event.state = 0;
+				bgce_send_msg(old_focus->fd, &lost);
+			}
+
+			/* keep z monotonic (if no previous focus, keep current z) */
+			if (old_focus) {
+				c->z = old_focus->z + 1;
+			}
 			server.focused_client = c;
+
+			struct BGCEMessage got = {0};
+			got.type = MSG_FOCUS_CHANGE;
+			got.data.focus_event.state = 1;
+			bgce_send_msg(c->fd, &got);
+
 			draw(&server, *c);
 			printf("[BGCE] Client focused.\n");
 		}
