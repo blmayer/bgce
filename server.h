@@ -69,12 +69,46 @@ typedef enum {
 	IMAGE_SCALED
 } ImageMode;
 
+/* ----------------------------
+ * Keyboard shortcuts
+ * ---------------------------- */
+#define MAX_SHORTCUTS 16
+
+struct key_combo {
+	int ctrl;
+	int alt;
+	int shift;
+	uint16_t key; // Linux key code (KEY_* from linux/input.h)
+};
+
+enum shortcut_type {
+	SHORTCUT_NONE = 0,
+	SHORTCUT_BUILTIN,
+	SHORTCUT_COMMAND,
+};
+
+enum shortcut_parse_result {
+	SHORTCUT_PARSE_OK = 0,
+	SHORTCUT_PARSE_BAD_FORMAT,
+	SHORTCUT_PARSE_UNSUPPORTED_BUILTIN,
+	SHORTCUT_PARSE_EMPTY_COMMAND,
+};
+
+struct shortcut {
+	struct key_combo combo;
+	enum shortcut_type type;
+	char value[256]; // for builtin: "exit" or "screenshot"; for command: the command line to run
+};
+
 // Background configuration for now
 struct config {
 	BackgroundType type;
 	uint32_t color; // RGBA format
 	ImageMode mode;
 	char path[MAX_PATH_LEN];
+
+	struct shortcut shortcuts[MAX_SHORTCUTS];
+	int shortcut_count;
 };
 
 // Parse config file

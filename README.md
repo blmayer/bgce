@@ -108,6 +108,20 @@ color = #RRGGBBAA # Hex color with alpha (e.g., #FF000080 for semi-transparent r
 # For image background:
 #path = /path/to/image.png
 #mode = tiled     # or "scaled"
+
+[shortcuts]
+# Define keyboard shortcuts. Format:
+# <combo> = <type>:<value>
+#
+# type is one of:
+#   builtin  - value must be "exit" or "screenshot"
+#   command  - value is a shell command to run in a new process
+#
+# Combo examples: ctrl+alt+q, sysrq, f12, ctrl+shift+s, super+r
+
+# Defaults (active when no [shortcuts] section is present or it is empty):
+# ctrl+alt+q = builtin:exit
+# sysrq = builtin:screenshot
 ```
 
 ### Example Config File
@@ -125,6 +139,19 @@ or
 type = image
 path = /usr/share/backgrounds/default.png
 mode = scaled
+```
+
+With custom shortcuts:
+
+```ini
+[shortcuts]
+ctrl+alt+q = builtin:exit
+sysrq = builtin:screenshot
+
+# Launch programs (commands run via /bin/sh -c in a separate process)
+ctrl+alt+t = command:alacritty
+super+r = command:rofi -show drun
+f12 = command:sh -c 'import -window root ~/screenshot.png'
 ```
 
 

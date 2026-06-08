@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #define test_bit(bit, array) ((array)[(bit) / 8] & (1 << ((bit) % 8)))
@@ -37,6 +38,7 @@ struct {
 } drag;
 
 extern struct ServerState server;
+extern struct config config;
 
 int resize_buffer(struct Client* c, int dx, int dy) {
 	// for resize we must reallocate the buffer
@@ -164,18 +166,32 @@ int init_input(void) {
 }
 
 /*
- * This is the key mappings handling part, for now this is hardcoded
- * but in the future will be read from config.
- * Shortcuts available:
- *  CTRL + ALT + q: exit
- *  ALT + CLICK + DRAG: move
+ * Check if current modifier+key state matches a configured shortcut.
+ * Returns pointer to the matching shortcut, or NULL.
+ */
+static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t key) {
+	for (int i = 0; i < config.shortcut_count; i++) {
+		struct shortcut* sc = &config.shortcuts[i];
+		if (sc->combo.ctrl == ctrl &&
+		    sc->combo.alt == alt &&
+		    sc->combo.shift == shift &&
+		    sc->combo.key == key) {
+			return sc;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Keyboard shortcuts are configured via the config file ([shortcuts] section).
+ * Built-in behavior for mouse modifiers:
+ *  ALT + LEFT_CLICK + DRAG: move
  *  ALT + RIGHT_CLICK + DRAG: resize
  *
  *  Returns if shortcut was handled
  */
 static int handle_input_event(struct input_event ev) {
 	if (ev.type == EV_KEY && ev.value == 1) { // Key press
-		// Ctrl+Alt+Q combo
 		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
 			printf("[BGCE] Ctrl pressed.\n");
 			ctrl_down = 1;
@@ -184,17 +200,34 @@ static int handle_input_event(struct input_event ev) {
 			printf("[BGCE] Alt pressed.\n");
 			alt_down = 1;
 		}
-		if (ctrl_down && alt_down && ev.code == KEY_Q) {
-			printf("[BGCE] Ctrl+Alt+Q pressed, exiting.\n");
-			exit(1);
-		}
-		if (ev.code == KEY_SYSRQ) {
-			printf("[BGCE] Print Screen key pressed, taking screenshot.\n");
-			if (server.focused_client) {
-				return 0;
+
+		// Check configured keyboard shortcuts (key press)
+		struct shortcut *sc = match_shortcut(ctrl_down, alt_down, 0, ev.code);
+		if (sc) {
+			if (sc->type == SHORTCUT_BUILTIN) {
+				if (strcmp(sc->value, "exit") == 0) {
+					printf("[BGCE] Exit shortcut triggered, exiting.\n");
+					exit(1);
+				} else if (strcmp(sc->value, "screenshot") == 0) {
+					printf("[BGCE] Screenshot shortcut triggered.\n");
+					if (server.focused_client) {
+						return 0;
+					}
+					take_screenshot("screenshot.png");
+					return 1;
+				}
+			} else if (sc->type == SHORTCUT_COMMAND) {
+				printf("[BGCE] Command shortcut triggered: %s\n", sc->value);
+				pid_t pid = fork();
+				if (pid == 0) {
+					/* child: run command via shell, do not block server */
+					execl("/bin/sh", "sh", "-c", sc->value, (char *)NULL);
+					_exit(127);
+				} else if (pid < 0) {
+					perror("[BGCE] fork for shortcut command");
+				}
+				return 1;
 			}
-			take_screenshot("screenshot.png");
-			return 1;
 		}
 	}
 

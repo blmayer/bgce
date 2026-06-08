@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,10 +12,14 @@
 #include <unistd.h>
 
 struct ServerState server = {}; /* Global server state */
+struct config config = {};            /* Global config (background + shortcuts) */
 
 int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
 	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
+
+	/* Auto-reap child processes so command shortcuts don't leave zombies */
+	signal(SIGCHLD, SIG_IGN);
 
 	memset(&server, 0, sizeof(struct ServerState));
 	server.drm_fd = -1;
@@ -22,14 +27,14 @@ int main(void) {
 	server.crtc_id = 0;
 	server.client_count = 0;
 
-	struct config config;
 	char* home = getenv("HOME");
 	if (home) {
 		char user_config[512];
 		snprintf(user_config, sizeof(user_config), "%s/.config/bgce.conf", home);
 		parse_config(&config);
 	}
-	printf("[BGCE] Loaded config type=%u, path=%s, mode=%u\n", config.type, config.path, config.mode);
+	printf("[BGCE] Loaded config type=%u, path=%s, mode=%u, shortcuts=%d\n",
+	       config.type, config.path, config.mode, config.shortcut_count);
 
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
