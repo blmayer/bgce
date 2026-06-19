@@ -53,20 +53,20 @@ int resize_buffer(struct Client* c, int dx, int dy) {
 	         "bgce_buf_%d_%ld", getpid(), time(NULL));
 	int shm_fd = shm_open(c->shm_name, O_CREAT | O_RDWR, 0600);
 	if (shm_fd < 0) {
-		perror("shm_open for resize");
+		perror("[BGCE] shm_open for resize");
 		return 0;
 	}
 
 	size_t buf_size = (c->width + dx) * (c->height + dy) * BGCE_BYTES_PER_PIXEL;
 	if (ftruncate(shm_fd, buf_size) < 0) {
-		perror("ftruncate for resize");
+		perror("[BGCE] ftruncate for resize");
 		close(shm_fd);
 		return 0;
 	}
 
 	c->buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 	if (c->buffer == MAP_FAILED) {
-		perror("mmap for resize");
+		perror("[BGCE] mmap for resize");
 		close(shm_fd);
 		return 0;
 	}
@@ -117,9 +117,13 @@ int init_input(void) {
 		char path[256 + 12];
 		snprintf(path, sizeof(path), "%s/%s", INPUT_DIR, ent->d_name);
 
-		int fd = open(path, O_RDONLY);
-		if (fd < 0)
+		int fd = open(path, O_RDONLY | O_NONBLOCK);
+		if (fd < 0) {
+			if (errno == EACCES || errno == EPERM) {
+				fprintf(stderr, "[BGCE] Permission denied for %s (try adding your user to the 'input' group)\n", path);
+			}
 			continue; // skip inaccessible devices
+		}
 
 		unsigned long ev_bits[(EV_MAX + 7) / 8] = {0};
 		if (ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) < 0) {
@@ -127,10 +131,33 @@ int init_input(void) {
 			continue;
 		}
 
-		// Filter for useful input types
 		int has_key = test_bit(EV_KEY, ev_bits);
 		int has_rel = test_bit(EV_REL, ev_bits);
-		if (!has_key && !has_rel) {
+		int has_abs = test_bit(EV_ABS, ev_bits);
+
+		if (!has_key && !has_rel && !has_abs) {
+			close(fd);
+			continue;
+		}
+
+		// Read detailed key bits for qualification
+		unsigned long key_bits[(KEY_MAX + 7) / 8] = {0};
+		if (has_key) {
+			ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits);
+		}
+
+		int has_mouse_btn = test_bit(BTN_LEFT, key_bits) || test_bit(BTN_RIGHT, key_bits) ||
+		                    test_bit(BTN_MIDDLE, key_bits) || test_bit(BTN_MOUSE, key_bits);
+		int has_kbd_key   = test_bit(KEY_A, key_bits) || test_bit(KEY_B, key_bits) ||
+		                    test_bit(KEY_SPACE, key_bits) || test_bit(KEY_ENTER, key_bits) ||
+		                    test_bit(KEY_ESC, key_bits);
+
+		// Accept mice (rel + or without explicit btn), touchpads (abs+btn), keyboards
+		int accept = 0;
+		if (has_rel) accept = 1;                         // mice, trackballs etc.
+		if (has_abs && has_mouse_btn) accept = 1;        // many touchpads / absolute pointers
+		if (has_key && (has_kbd_key || has_mouse_btn)) accept = 1;
+		if (!accept) {
 			close(fd);
 			continue;
 		}
@@ -148,17 +175,20 @@ int init_input(void) {
 
 		count++;
 
-		printf("[BGCE] Input device accepted: %s (%s)%s%s\n",
+		printf("[BGCE] Input device accepted: %s (%s)%s%s%s\n",
 		       path, name,
 		       has_key ? " [KEY]" : "",
-		       has_rel ? " [REL]" : "");
+		       has_rel ? " [REL]" : "",
+		       has_abs ? " [ABS]" : "");
 	}
 
 	closedir(dir);
 
 	if (count == 0) {
-		fprintf(stderr, "[BGCE] No suitable input devices found\n");
-		return -1;
+		fprintf(stderr, "[BGCE] No suitable input devices found (mouse/keyboard input will be unavailable)\n");
+		/* Do not fail hard: server can still run for drawing clients */
+		server.input.count = 0;
+		return 0;
 	}
 	server.input.count = count;
 
@@ -418,11 +448,17 @@ static int handle_input_event(struct input_event ev) {
 void* input_loop(void* arg) {
 	(void)arg;
 
+	if (count == 0) {
+		/* No input devices; park the thread */
+		while (1) pause();
+		return NULL;
+	}
+
 	while (1) {
 		int ret = poll(fds, count, -1);
 		if (ret < 0) {
 			if (errno == EINTR) {
-				printf("EINTR\n");
+				printf("[BGCE] EINTR\n");
 				continue;
 			}
 			perror("[BGCE] poll");
@@ -439,7 +475,7 @@ void* input_loop(void* arg) {
 						perror("[BGCE] read input");
 						break;
 					}
-					perror("read input");
+					perror("[BGCE] read input");
 					break;
 				}
 				if (n != sizeof(ev))

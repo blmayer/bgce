@@ -29,8 +29,28 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <drm/drm.h>
-#include <drm/drm_mode.h>
+#if defined(__has_include)
+#  if __has_include(<libdrm/drm.h>)
+#    include <libdrm/drm.h>
+#  elif __has_include(<drm/drm.h>)
+#    include <drm/drm.h>
+#  else
+#    include <drm/drm.h>
+#  endif
+#else
+#  include <drm/drm.h>
+#endif
+#if defined(__has_include)
+#  if __has_include(<libdrm/drm_mode.h>)
+#    include <libdrm/drm_mode.h>
+#  elif __has_include(<drm/drm_mode.h>)
+#    include <drm/drm_mode.h>
+#  else
+#    include <drm/drm_mode.h>
+#  endif
+#else
+#  include <drm/drm_mode.h>
+#endif
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <stb_image_write.h>
@@ -42,6 +62,8 @@ uint32_t conn_id = 0;
 uint32_t cur_fb = 0;
 uint32_t cur_handle;
 uint64_t cur_size;
+uint32_t cur_w = CURSOR_WIDTH;
+uint32_t cur_h = CURSOR_HEIGHT;
 void* cur_map;
 uint32_t scanout_handle;
 uint64_t scanout_size;
@@ -59,7 +81,7 @@ static int drm_create_dumb(int fd, uint32_t width, uint32_t height, uint32_t bpp
 	create->height = height;
 	create->bpp = bpp;
 	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, create) < 0) {
-		perror("DRM_IOCTL_MODE_CREATE_DUMB");
+		perror("[BGCE] DRM_IOCTL_MODE_CREATE_DUMB");
 		return -1;
 	}
 	return 0;
@@ -69,7 +91,7 @@ static int drm_map_dumb(int fd, uint32_t handle, uint64_t* offset) {
 	struct drm_mode_map_dumb map = {0};
 	map.handle = handle;
 	if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &map) < 0) {
-		perror("DRM_IOCTL_MODE_MAP_DUMB");
+		perror("[BGCE] DRM_IOCTL_MODE_MAP_DUMB");
 		return -1;
 	}
 	*offset = map.offset;
@@ -80,7 +102,7 @@ static int drm_destroy_dumb(int fd, uint32_t handle) {
 	struct drm_mode_destroy_dumb dest = {0};
 	dest.handle = handle;
 	if (ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dest) < 0) {
-		perror("DRM_IOCTL_MODE_DESTROY_DUMB");
+		perror("[BGCE] DRM_IOCTL_MODE_DESTROY_DUMB");
 		return -1;
 	}
 	return 0;
@@ -110,10 +132,17 @@ int init_display() {
 	drmModeModeInfo chosen_mode;
 	bool found = false;
 
-	const char* dri_card = "/dev/dri/card1";
-	drm_fd = open(dri_card, O_RDWR | O_CLOEXEC);
+	drm_fd = -1;
+	for (int card = 0; card < 10; card++) {
+		char path[64];
+		snprintf(path, sizeof(path), "/dev/dri/card%d", card);
+		drm_fd = open(path, O_RDWR | O_CLOEXEC);
+		if (drm_fd >= 0) {
+			break;
+		}
+	}
 	if (drm_fd < 0) {
-		perror("open drm device");
+		perror("[BGCE] open drm device (tried /dev/dri/card0..9)");
 		return 1;
 	}
 	server.drm_fd = drm_fd;
@@ -125,7 +154,7 @@ int init_display() {
 
 	resources = drmModeGetResources(drm_fd);
 	if (!resources) {
-		fprintf(stderr, "drmModeGetResources failed\n");
+		fprintf(stderr, "[BGCE] drmModeGetResources failed\n");
 		close(drm_fd);
 		return 1;
 	}
@@ -147,7 +176,7 @@ int init_display() {
 	}
 
 	if (!found) {
-		fprintf(stderr, "No connected connector with modes found\n");
+		fprintf(stderr, "[BGCE] No connected connector with modes found\n");
 		drmModeFreeResources(resources);
 		close(drm_fd);
 		return 1;
@@ -180,7 +209,7 @@ int init_display() {
 	}
 
 	if (!crtc_id) {
-		fprintf(stderr, "Failed to find a suitable CRTC\n");
+		fprintf(stderr, "[BGCE] Failed to find a suitable CRTC\n");
 		drmModeFreeConnector(connector);
 		drmModeFreeResources(resources);
 		close(drm_fd);
@@ -190,7 +219,7 @@ int init_display() {
 	/* Save current CRTC to restore later */
 	saved_crtc = drmModeGetCrtc(drm_fd, crtc_id);
 	if (!saved_crtc) {
-		fprintf(stderr, "drmModeGetCrtc failed\n");
+		fprintf(stderr, "[BGCE] drmModeGetCrtc failed\n");
 		/* continue anyway, but we'll try to restore nothing */
 	}
 
@@ -208,7 +237,7 @@ int init_display() {
 	/* ---------- Create dumb scanout buffer ---------- */
 	struct drm_mode_create_dumb create = {0};
 	if (drm_create_dumb(drm_fd, width, height, bpp, &create) < 0) {
-		fprintf(stderr, "Failed to create dumb buffer for scanout\n");
+		fprintf(stderr, "[BGCE] Failed to create dumb buffer for scanout\n");
 		return -1;
 	}
 	scanout_handle = create.handle;
@@ -218,13 +247,13 @@ int init_display() {
 	/* allocate map */
 	uint64_t scanout_offset;
 	if (drm_map_dumb(drm_fd, scanout_handle, &scanout_offset) < 0) {
-		fprintf(stderr, "Failed to map dumb buffer for scanout\n");
+		fprintf(stderr, "[BGCE] Failed to map dumb buffer for scanout\n");
 		return -1;
 	}
 
 	server.framebuffer = mmap(NULL, scanout_size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, scanout_offset);
 	if (server.framebuffer == MAP_FAILED) {
-		perror("mmap scanout");
+		perror("[BGCE] mmap scanout");
 		return -1;
 	}
 
@@ -255,7 +284,7 @@ int init_display() {
 		/* compute depth and bpp for legacy call */
 		uint32_t depth = 24;
 		if (drmModeAddFB(drm_fd, width, height, depth, bpp, scanout_pitch, scanout_handle, &fb_id) != 0) {
-			fprintf(stderr, "drmModeAddFB failed\n");
+			fprintf(stderr, "[BGCE] drmModeAddFB failed\n");
 			return -1;
 		}
 	}
@@ -264,7 +293,7 @@ int init_display() {
 
 	struct drm_mode_create_dumb cur_create = {0};
 	if (drm_create_dumb(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, 32, &cur_create) < 0) {
-		fprintf(stderr, "Failed to create dumb buffer for cursor\n");
+		fprintf(stderr, "[BGCE] Failed to create dumb buffer for cursor\n");
 		return -1;
 	}
 	cur_handle = cur_create.handle;
@@ -273,12 +302,12 @@ int init_display() {
 	uint64_t cur_offset;
 	uint32_t cur_pitch = cur_create.pitch;
 	if (drm_map_dumb(drm_fd, cur_handle, &cur_offset) < 0) {
-		fprintf(stderr, "Failed to map dumb cursor\n");
+		fprintf(stderr, "[BGCE] Failed to map dumb cursor\n");
 		return -1;
 	}
 	cur_map = mmap(NULL, cur_size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, cur_offset);
 	if (cur_map == MAP_FAILED) {
-		perror("mmap cursor");
+		perror("[BGCE] mmap cursor");
 		return -1;
 	}
 	memset(cur_map, 0, cur_size);
@@ -292,7 +321,7 @@ int init_display() {
 		uint32_t offsets[4] = {0, 0, 0, 0};
 		uint32_t format = DRM_FORMAT_ARGB8888;
 		if (drmModeAddFB2(drm_fd, cur_w, cur_h, format, handles, pitches, offsets, &cur_fb, 0) != 0) {
-			fprintf(stderr, "drmModeAddFB2 for cursor failed, trying legacy\n");
+			fprintf(stderr, "[BGCE] drmModeAddFB2 for cursor failed, trying legacy\n");
 			cur_fb = 0;
 		}
 	}
@@ -301,25 +330,25 @@ int init_display() {
 		/* Legacy fb creation for cursor might not support alpha; still try */
 		uint32_t depth = 24;
 		if (drmModeAddFB(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, depth, 32, cur_pitch, cur_handle, &cur_fb) != 0) {
-			fprintf(stderr, "drmModeAddFB for cursor failed\n");
+			fprintf(stderr, "[BGCE] drmModeAddFB for cursor failed\n");
 			return -1;
 		}
 	}
 
 	/* ---------- Set CRTC (scanout) ---------- */
 	if (drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &conn_id, 1, &chosen_mode) != 0) {
-		fprintf(stderr, "drmModeSetCrtc failed: %s\n", strerror(errno));
+		fprintf(stderr, "[BGCE] drmModeSetCrtc failed: %s\n", strerror(errno));
 		return -1;
 	}
 
 	/* ---------- Set cursor ---------- */
 	if (drmModeSetCursor(drm_fd, crtc_id, cur_handle, CURSOR_WIDTH, CURSOR_HEIGHT) != 0) {
-		fprintf(stderr, "drmModeSetCursor failed: %s\n", strerror(errno));
+		fprintf(stderr, "[BGCE] drmModeSetCursor failed: %s\n", strerror(errno));
 		/* keep going — maybe hardware doesn't support cursor */
 	} else {
 		/* move cursor to near center */
 		if (drmModeMoveCursor(drm_fd, crtc_id, width / 2, height / 2) != 0) {
-			fprintf(stderr, "drmModeMoveCursor failed\n");
+			fprintf(stderr, "[BGCE] drmModeMoveCursor failed\n");
 		}
 	}
 
@@ -328,7 +357,7 @@ int init_display() {
 
 void draw(struct ServerState* srv, struct Client cli) {
 	if (!srv || !srv->framebuffer || !cli.buffer) {
-		fprintf(stderr, "Draw: Invalid server, framebuffer, or client buffer\n");
+		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
 		return;
 	}
 
@@ -359,7 +388,7 @@ void draw(struct ServerState* srv, struct Client cli) {
 
 	/* Entire window is outside screen */
 	if (start_x >= end_x || start_y >= end_y) {
-		fprintf(stderr, "Draw: Client entirely outside screen\n");
+		fprintf(stderr, "[BGCE] Draw: Client entirely outside screen\n");
 		return;
 	}
 
@@ -462,7 +491,7 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
  */
 void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy) {
 	if (!srv || !srv->framebuffer) {
-		fprintf(stderr, "Redraw: Invalid server, framebuffer, or client\n");
+		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
 		return;
 	}
 
@@ -549,7 +578,7 @@ static void redraw_exposed_rect(struct ServerState* srv, const struct Client* re
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
 	if (!srv || !srv->framebuffer) {
-		fprintf(stderr, "Redraw from resize: Invalid server or framebuffer\n");
+		fprintf(stderr, "[BGCE] Redraw from resize: Invalid server or framebuffer\n");
 		return;
 	}
 
@@ -620,7 +649,7 @@ void release_display(void) {
 
 int take_screenshot(const char* filename) {
 	if (!server.framebuffer) {
-		fprintf(stderr, "No framebuffer available for screenshot.\n");
+		fprintf(stderr, "[BGCE] No framebuffer available for screenshot.\n");
 		return -1;
 	}
 
@@ -639,10 +668,10 @@ int take_screenshot(const char* filename) {
 	);
 
 	if (!result) {
-		fprintf(stderr, "Failed to save screenshot to %s.\n", filename);
+		fprintf(stderr, "[BGCE] Failed to save screenshot to %s.\n", filename);
 		return -1;
 	}
 
-	printf("Screenshot saved to %s.\n", filename);
+	printf("[BGCE] Screenshot saved to %s.\n", filename);
 	return 0;
 }

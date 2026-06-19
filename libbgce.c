@@ -17,7 +17,7 @@ ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg) {
 	ssize_t n = write(conn, msg, size);
 	if (n < 0) {
 		if (errno == EINTR)
-			perror("write");
+			perror("[BGCE] write");
 		return -1;
 	}
 	return n;
@@ -27,7 +27,7 @@ ssize_t bgce_recv_msg(int conn, struct BGCEMessage* msg) {
 	ssize_t n = read(conn, msg, sizeof(struct BGCEMessage));
 	if (n < 0) {
 		if (errno == EINTR)
-			perror("read");
+			perror("[BGCE] read");
 		return -1;
 	}
 	return n;
@@ -37,7 +37,7 @@ ssize_t bgce_recv_msg(int conn, struct BGCEMessage* msg) {
 int bgce_connect(void) {
 	int bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (bgce_fd < 0) {
-		perror("socket");
+		perror("[BGCE] socket");
 		return -1;
 	}
 
@@ -47,7 +47,7 @@ int bgce_connect(void) {
 	strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
 	if (connect(bgce_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-		perror("connect");
+		perror("[BGCE] connect");
 		close(bgce_fd);
 		bgce_fd = -1;
 		return -2;
@@ -96,13 +96,13 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
 	size_t size = reply.width * reply.height * 4;
 	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
 	if (shm_fd < 0) {
-		perror("shm_open (client)");
+		perror("[BGCE] shm_open (client)");
 		return NULL;
 	}
 
 	void* buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 	if (buf == MAP_FAILED) {
-		perror("mmap (client)");
+		perror("[BGCE] mmap (client)");
 		close(shm_fd);
 		return NULL;
 	}

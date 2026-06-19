@@ -2,19 +2,66 @@
 #include "bgce.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 struct ServerState server = {}; /* Global server state */
 struct config config = {};            /* Global config (background + shortcuts) */
 
+static void ensure_dir(const char *path) {
+	struct stat st;
+	if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+		return;
+	/* Try to create; ignore errors (parent may not exist, we'll fail open later) */
+	mkdir(path, 0755);
+}
+
+static void setup_log_file(void) {
+	const char *xdg = getenv("XDG_CACHE_HOME");
+	const char *home = getenv("HOME");
+	char dir[512];
+
+	if (xdg && xdg[0]) {
+		snprintf(dir, sizeof(dir), "%s/bgce", xdg);
+		ensure_dir(xdg);
+		ensure_dir(dir);
+	} else if (home && home[0]) {
+		char dotcache[512];
+		snprintf(dotcache, sizeof(dotcache), "%s/.cache", home);
+		snprintf(dir, sizeof(dir), "%s/.cache/bgce", home);
+		ensure_dir(dotcache);
+		ensure_dir(dir);
+	} else {
+		return;
+	}
+
+	char log_path[512];
+	snprintf(log_path, sizeof(log_path), "%s/bgce.log", dir);
+
+	int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+	if (fd < 0)
+		return;
+
+	/* Tell the user (on their original terminal) where logs are going */
+	dprintf(STDERR_FILENO, "[BGCE] Logging to %s\n", log_path);
+
+	/* Redirect all future stdout/stderr output into the log file */
+	dup2(fd, STDOUT_FILENO);
+	dup2(fd, STDERR_FILENO);
+	close(fd);
+}
+
 int main(void) {
+	setup_log_file();
+
 	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
 	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
 
@@ -38,7 +85,7 @@ int main(void) {
 
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
-		perror("socket");
+		perror("[BGCE] socket");
 		return 1;
 	}
 
@@ -49,13 +96,13 @@ int main(void) {
 	unlink(SOCKET_PATH);
 
 	if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-		perror("bind");
+		perror("[BGCE] bind");
 		close(fd);
 		return 1;
 	}
 
 	if (listen(fd, 8) < 0) {
-		perror("listen");
+		perror("[BGCE] listen");
 		close(fd);
 		return 1;
 	}
@@ -63,7 +110,7 @@ int main(void) {
 	server.server_fd = fd;
 
 	if (init_display() != 0) {
-		fprintf(stderr, "display init failed\n");
+		fprintf(stderr, "[BGCE] display init failed\n");
 		release_display();
 		return 1;
 	}
@@ -105,7 +152,7 @@ int main(void) {
 	while (1) {
 		int client_fd = accept(fd, NULL, NULL);
 		if (client_fd < 0) {
-			perror("accept");
+			perror("[BGCE] accept");
 			continue;
 		}
 
@@ -114,14 +161,14 @@ int main(void) {
 		pthread_t tid;
 		int* arg = malloc(sizeof(int));
 		if (!arg) {
-			perror("malloc");
+			perror("[BGCE] malloc");
 			close(client_fd);
 			continue;
 		}
 
 		*arg = client_fd;
 		if (pthread_create(&tid, NULL, client_thread, arg) != 0) {
-			perror("pthread_create input thread");
+			perror("[BGCE] pthread_create client thread");
 			free(arg);
 			close(client_fd);
 			continue;

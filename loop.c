@@ -21,7 +21,7 @@ void* client_thread(void* arg) {
 	// Allocate memory for the client
 	struct Client* client = calloc(1, sizeof(struct Client));
 	if (!client) {
-		perror("Failed to allocate memory for client");
+		perror("[BGCE] Failed to allocate memory for client");
 		close(client_fd);
 		return NULL;
 	}
@@ -89,13 +89,13 @@ void* client_thread(void* arg) {
 
 			int shm_fd = shm_open(client->shm_name, O_CREAT | O_RDWR, 0600);
 			if (shm_fd < 0) {
-				perror("shm_open");
+				perror("[BGCE] shm_open");
 				break;
 			}
 
 			size_t buf_size = req.width * req.height * 4;
 			if (ftruncate(shm_fd, buf_size) < 0) {
-				perror("ftruncate");
+				perror("[BGCE] ftruncate");
 				close(shm_fd);
 				break;
 			}

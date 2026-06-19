@@ -36,6 +36,9 @@ install: bgce libbgce.so bgce.h
 	install -m 644 bgce.h $(INSTALL_INCLUDE)
 	ldconfig
 
+SERVER_LOG ?= server.log
+SERVER_PID ?= server.pid
+
 .PHONY: test-server
 test-server: bgce
 	@echo "[MAKE] Starting BGCE server..."
@@ -52,6 +55,8 @@ test-server: bgce
 	@echo ""
 	@echo "=== SERVER LOG ==="
 	@tail -n 50 $(SERVER_LOG)
+
+CLIENT_LOG ?= client.log
 
 test-client: client
 	@echo "[MAKE] Running test client..."

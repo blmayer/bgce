@@ -4,7 +4,17 @@
 #define _XOPEN_SOURCE 700
 #include "bgce.h"
 
-#include <drm/drm_mode.h>
+#if defined(__has_include)
+#  if __has_include(<libdrm/drm_mode.h>)
+#    include <libdrm/drm_mode.h>
+#  elif __has_include(<drm/drm_mode.h>)
+#    include <drm/drm_mode.h>
+#  else
+#    include <drm/drm_mode.h>
+#  endif
+#else
+#  include <drm/drm_mode.h>
+#endif
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/types.h>

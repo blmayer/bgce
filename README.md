@@ -92,6 +92,15 @@ make all client
 
 BGCE supports configuration for the background through a config file. By default, it looks for `~/.config/bgce.conf`.
 
+## Logging
+
+All server messages are written to a default log file:
+
+- `$XDG_CACHE_HOME/bgce/bgce.log` (if `XDG_CACHE_HOME` is set)
+- otherwise `~/.cache/bgce/bgce.log`
+
+The path is printed to the terminal you used to start `bgce` so you know where to look (`tail -f` it, etc.). All `[BGCE]` output after that point goes into the log file.
+
 
 ### Config File Format
 
