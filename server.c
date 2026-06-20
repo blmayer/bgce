@@ -25,7 +25,7 @@ static void ensure_dir(const char *path) {
 }
 
 static void cleanup_and_exit(int sig) {
-	printf("[BGCE] Caught signal %d, cleaning up\n", sig);
+	(void)sig;
 	release_display();
 	_exit(0);
 }

@@ -646,6 +646,10 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
 }
 
 void release_display(void) {
+	/* Restore text mode first so the terminal is usable even if
+	 * the DRM teardown below hangs or crashes. */
+	release_vt();
+
 	if (cur_fb)
 		drmModeRmFB(drm_fd, cur_fb);
 
@@ -680,8 +684,6 @@ void release_display(void) {
 		drmModeFreeResources(resources);
 	if (encoder)
 		drmModeFreeEncoder(encoder);
-
-	release_vt();
 
 	close(drm_fd);
 	printf("[BGCE] Display released.\n");
