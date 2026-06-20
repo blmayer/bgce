@@ -24,6 +24,12 @@ static void ensure_dir(const char *path) {
 	mkdir(path, 0755);
 }
 
+static void cleanup_and_exit(int sig) {
+	printf("[BGCE] Caught signal %d, cleaning up\n", sig);
+	release_display();
+	_exit(0);
+}
+
 static void setup_log_file(void) {
 	const char *xdg = getenv("XDG_CACHE_HOME");
 	const char *home = getenv("HOME");
@@ -67,6 +73,10 @@ int main(void) {
 
 	/* Auto-reap child processes so command shortcuts don't leave zombies */
 	signal(SIGCHLD, SIG_IGN);
+
+	/* Ensure VT is restored on termination signals */
+	signal(SIGINT, cleanup_and_exit);
+	signal(SIGTERM, cleanup_and_exit);
 
 	memset(&server, 0, sizeof(struct ServerState));
 	server.drm_fd = -1;

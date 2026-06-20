@@ -21,6 +21,8 @@
 #include "server.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/kd.h>
+#include <linux/vt.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -56,6 +58,8 @@
 #include <stb_image_write.h>
 
 extern struct ServerState server;
+
+static int vt_fd = -1;
 
 int drm_fd = -1;
 uint32_t conn_id = 0;
@@ -127,6 +131,43 @@ static void draw_cursor(uint8_t* buf, uint32_t stride, uint32_t w, uint32_t h) {
 	}
 }
 
+int setup_vt_handling(void) {
+	/* Try the current tty first, then fall back to /dev/tty0 */
+	vt_fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
+	if (vt_fd < 0)
+		vt_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
+	if (vt_fd < 0) {
+		fprintf(stderr, "[BGCE] VT: cannot open tty: %s "
+		        "(keystrokes will echo on the console)\n",
+		        strerror(errno));
+		return -1;
+	}
+
+	if (ioctl(vt_fd, KDSETMODE, KD_GRAPHICS) < 0) {
+		fprintf(stderr, "[BGCE] VT: KDSETMODE KD_GRAPHICS failed: %s "
+		        "(keystrokes will echo on the console)\n",
+		        strerror(errno));
+		close(vt_fd);
+		vt_fd = -1;
+		return -1;
+	}
+
+	printf("[BGCE] VT: switched to KD_GRAPHICS mode\n");
+	return 0;
+}
+
+static void release_vt(void) {
+	if (vt_fd < 0)
+		return;
+	if (ioctl(vt_fd, KDSETMODE, KD_TEXT) < 0)
+		fprintf(stderr, "[BGCE] VT: KDSETMODE KD_TEXT failed: %s\n",
+		        strerror(errno));
+	else
+		printf("[BGCE] VT: restored KD_TEXT mode\n");
+	close(vt_fd);
+	vt_fd = -1;
+}
+
 int init_display() {
 	uint32_t crtc_id = 0;
 	drmModeModeInfo chosen_mode;
@@ -147,10 +188,7 @@ int init_display() {
 	}
 	server.drm_fd = drm_fd;
 
-	// if (setup_vt_handling() < 0) {
-	//	close(server->drm_fd);
-	//	return -1;
-	// }
+	setup_vt_handling();
 
 	resources = drmModeGetResources(drm_fd);
 	if (!resources) {
@@ -642,6 +680,8 @@ void release_display(void) {
 		drmModeFreeResources(resources);
 	if (encoder)
 		drmModeFreeEncoder(encoder);
+
+	release_vt();
 
 	close(drm_fd);
 	printf("[BGCE] Display released.\n");
