@@ -139,6 +139,21 @@ int bgce_move(int conn, int x, int y) {
 	return 0;
 }
 
+/* Public API: Set cursor type */
+int bgce_set_cursor(int conn, enum BGCECursorType type) {
+	if (conn < 0)
+		return -1;
+
+	struct BGCEMessage msg = {0};
+	msg.type = MSG_SET_CURSOR;
+	msg.data.cursor_request.cursor_type = (int32_t)type;
+
+	if (bgce_send_msg(conn, &msg) <= 0)
+		return -1;
+
+	return 0;
+}
+
 /* Public API: Disconnect */
 void bgce_disconnect(int conn) {
 	if (conn >= 0) {

@@ -401,6 +401,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		// Stop drag/move on button release
 		if ((ev.code == BTN_LEFT || ev.code == BTN_RIGHT) && drag.active) { // Only stop if it was an active drag of that type
 			printf("[BGCE] End of drag event.\n");
+			set_cursor_type(BGCE_CURSOR_DEFAULT);
 			if (drag.type == DRAG_MOVE) {
 				drag.active = 0;
 				drag.target = NULL;
@@ -501,9 +502,11 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 		if (ev.code == BTN_RIGHT) {
 			drag.type = DRAG_RESIZE;
+			set_cursor_type(BGCE_CURSOR_RESIZE_NWSE);
 			printf("[BGCE] Resize event.\n");
 		} else {
 			drag.type = DRAG_MOVE;
+			set_cursor_type(BGCE_CURSOR_MOVE);
 			printf("[BGCE] Move event.\n");
 		}
 

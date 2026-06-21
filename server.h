@@ -110,6 +110,13 @@ struct shortcut {
 	char value[256]; // for builtin: "exit" or "screenshot"; for command: the command line to run
 };
 
+// Cursor theme: per-type image data (ARGB, pre-scaled to CURSOR_WIDTH x CURSOR_HEIGHT)
+struct cursor_theme {
+	uint32_t* images[BGCE_CURSOR_COUNT]; // NULL = use built-in fallback
+	int hotspot_x[BGCE_CURSOR_COUNT];
+	int hotspot_y[BGCE_CURSOR_COUNT];
+};
+
 // Background configuration for now
 struct config {
 	BackgroundType type;
@@ -119,6 +126,8 @@ struct config {
 
 	struct shortcut shortcuts[MAX_SHORTCUTS];
 	int shortcut_count;
+
+	struct cursor_theme cursors;
 };
 
 // Parse config file
@@ -146,6 +155,8 @@ int init_display();
 void release_display(void);
 
 void set_drm_cursor(struct ServerState* srv, int x, int y);
+
+void set_cursor_type(enum BGCECursorType type);
 
 void draw(struct ServerState* srv, struct Client cli);
 

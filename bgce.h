@@ -30,7 +30,22 @@ enum {
 	MSG_BUFFER_CHANGE,
 	MSG_FOCUS_CHANGE,
 	MSG_SUBSCRIBE_INPUT,
-	MSG_MOVE
+	MSG_MOVE,
+	MSG_SET_CURSOR
+};
+
+/* ----------------------------
+ * Cursor Types
+ * ---------------------------- */
+enum BGCECursorType {
+	BGCE_CURSOR_DEFAULT = 0,
+	BGCE_CURSOR_TEXT,
+	BGCE_CURSOR_HAND,
+	BGCE_CURSOR_RESIZE_NS,
+	BGCE_CURSOR_RESIZE_EW,
+	BGCE_CURSOR_RESIZE_NWSE,
+	BGCE_CURSOR_MOVE,
+	BGCE_CURSOR_COUNT /* sentinel – must be last */
 };
 
 /* ----------------------------
@@ -66,6 +81,10 @@ struct ResizeRequest {
 	uint32_t height;
 };
 
+struct CursorRequest {
+	int32_t cursor_type; /* enum BGCECursorType */
+};
+
 struct BufferReply {
 	int status; // 0 for success, -1 for failure
 	char shm_name[64];
@@ -97,6 +116,7 @@ struct BGCEMessage {
 		struct InputEvent input_event;
 		struct FocusEvent focus_event;
 		struct MoveRequest move_request;
+		struct CursorRequest cursor_request;
 	} data;
 };
 
@@ -128,6 +148,12 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
 void* bgce_get_buffer(int conn, const struct BufferRequest req);
 
 int bgce_move(int fd, int x, int y);
+
+/**
+ * Set the cursor type displayed by the server.
+ * Returns 0 on success, -1 on failure.
+ */
+int bgce_set_cursor(int fd, enum BGCECursorType type);
 
 /**
  * Send a draw command to the server, telling it to blit the

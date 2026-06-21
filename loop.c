@@ -142,6 +142,14 @@ void* client_thread(void* arg) {
 
 			break;
 		}
+		case MSG_SET_CURSOR: {
+			int ctype = msg.data.cursor_request.cursor_type;
+			printf("[BGCE] Client requested cursor type %d\n", ctype);
+			/* Only the focused client may change the cursor */
+			if (server.focused_client == client)
+				set_cursor_type((enum BGCECursorType)ctype);
+			break;
+		}
 		default:
 			fprintf(stderr, "[BGCE] Unknown message type %d\n", msg.type);
 		}

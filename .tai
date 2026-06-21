@@ -1,0 +1,7 @@
+{
+	"provider": "openrouter",
+	"tai": {
+		"model": "xiaomi/mimo-v2-flash:free",
+		"tools": ["read_file", "shell", "patch"]
+	}
+}

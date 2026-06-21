@@ -1,5 +1,6 @@
 #include "server.h"
 #include <ctype.h>
+#include <limits.h>
 #include <linux/input.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -261,6 +262,174 @@ static void set_default_shortcuts(struct config* config) {
 	}
 }
 
+/* ---------------------------------------------------------------
+ * Xcursor file loader
+ *
+ * The Xcursor format (used by X11/Wayland themes) stores ARGB pixel
+ * data with hotspot information.  Files live under a theme directory,
+ * e.g. /usr/share/icons/Adwaita/cursors/left_ptr
+ *
+ * File layout (all little-endian):
+ *   Header:  magic(4) header_size(4) version(4) ntoc(4)
+ *   TOC[ntoc]: type(4) subtype(4) position(4)
+ *   Image chunk (type 0xfffd0002):
+ *     chunk_header(4) type(4) subtype(4) version(4)
+ *     width(4) height(4) xhot(4) yhot(4) delay(4)
+ *     pixels[width*height] (ARGB, 4 bytes each)
+ * --------------------------------------------------------------- */
+
+#define XCURSOR_MAGIC     0x72756358u  /* "Xcur" */
+#define XCURSOR_IMAGE_TYPE 0xfffd0002u
+
+static uint32_t read_le32(const uint8_t* p) {
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/*
+ * Load the best-fit image from an Xcursor file.
+ * Prefers an image whose nominal size (subtype) is closest to CURSOR_WIDTH.
+ * The image is nearest-neighbor scaled to exactly CURSOR_WIDTH x CURSOR_HEIGHT.
+ * Fills hotspot_x/hotspot_y (scaled) and returns a malloc'd ARGB buffer,
+ * or NULL on failure.
+ */
+static uint32_t* load_xcursor_file(const char* path, int* hotspot_x, int* hotspot_y) {
+	FILE* f = fopen(path, "rb");
+	if (!f) return NULL;
+
+	/* Read entire file */
+	fseek(f, 0, SEEK_END);
+	long file_size = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (file_size < 16) { fclose(f); return NULL; }
+
+	uint8_t* data = malloc((size_t)file_size);
+	if (!data) { fclose(f); return NULL; }
+	if (fread(data, 1, (size_t)file_size, f) != (size_t)file_size) {
+		free(data); fclose(f); return NULL;
+	}
+	fclose(f);
+
+	/* Validate header */
+	uint32_t magic = read_le32(data);
+	if (magic != XCURSOR_MAGIC) {
+		fprintf(stderr, "[BGCE] Not an Xcursor file: %s\n", path);
+		free(data); return NULL;
+	}
+	uint32_t ntoc = read_le32(data + 12);
+	if (16 + ntoc * 12 > (uint32_t)file_size) {
+		free(data); return NULL;
+	}
+
+	/* Scan TOC for image entries, pick best size match */
+	uint32_t best_pos = 0;
+	int best_diff = INT_MAX;
+	for (uint32_t i = 0; i < ntoc; i++) {
+		uint8_t* toc = data + 16 + i * 12;
+		uint32_t type    = read_le32(toc);
+		uint32_t subtype = read_le32(toc + 4);  /* nominal size */
+		uint32_t pos     = read_le32(toc + 8);
+		if (type != XCURSOR_IMAGE_TYPE) continue;
+
+		int diff = abs((int)subtype - (int)CURSOR_WIDTH);
+		if (diff < best_diff) {
+			best_diff = diff;
+			best_pos = pos;
+		}
+	}
+	if (best_diff == INT_MAX) {
+		fprintf(stderr, "[BGCE] No image chunks in Xcursor file: %s\n", path);
+		free(data); return NULL;
+	}
+
+	/* Parse image chunk at best_pos */
+	if (best_pos + 36 > (uint32_t)file_size) { free(data); return NULL; }
+	uint8_t* chunk = data + best_pos;
+	/* chunk layout: header_size(4) type(4) subtype(4) version(4)
+	 *               width(4) height(4) xhot(4) yhot(4) delay(4) pixels... */
+	uint32_t chunk_header_size = read_le32(chunk);
+	if (chunk_header_size < 36) chunk_header_size = 36;
+	uint32_t img_w = read_le32(chunk + 16);
+	uint32_t img_h = read_le32(chunk + 20);
+	uint32_t xhot  = read_le32(chunk + 24);
+	uint32_t yhot  = read_le32(chunk + 28);
+	/* pixels start after chunk header */
+	uint32_t pixel_offset = best_pos + chunk_header_size;
+	if (pixel_offset + img_w * img_h * 4 > (uint32_t)file_size) {
+		fprintf(stderr, "[BGCE] Truncated Xcursor image in: %s\n", path);
+		free(data); return NULL;
+	}
+
+	uint32_t* pixels = (uint32_t*)(data + pixel_offset);
+
+	/* Allocate output buffer at CURSOR_WIDTH x CURSOR_HEIGHT */
+	uint32_t* buf = malloc(CURSOR_WIDTH * CURSOR_HEIGHT * sizeof(uint32_t));
+	if (!buf) { free(data); return NULL; }
+
+	/* Nearest-neighbor scale; Xcursor pixels are already ARGB */
+	float x_ratio = (float)img_w / CURSOR_WIDTH;
+	float y_ratio = (float)img_h / CURSOR_HEIGHT;
+
+	for (int y = 0; y < CURSOR_HEIGHT; y++) {
+		for (int x = 0; x < CURSOR_WIDTH; x++) {
+			int sx = (int)(x * x_ratio);
+			int sy = (int)(y * y_ratio);
+			if (sx >= (int)img_w) sx = (int)img_w - 1;
+			if (sy >= (int)img_h) sy = (int)img_h - 1;
+			buf[y * CURSOR_WIDTH + x] = pixels[sy * (int)img_w + sx];
+		}
+	}
+
+	/* Scale hotspot */
+	if (hotspot_x) *hotspot_x = (img_w > 0) ? (int)(xhot * CURSOR_WIDTH / img_w) : 0;
+	if (hotspot_y) *hotspot_y = (img_h > 0) ? (int)(yhot * CURSOR_HEIGHT / img_h) : 0;
+
+	free(data);
+	printf("[BGCE] Loaded Xcursor: %s (%ux%u -> %dx%d, hotspot %u,%u)\n",
+	       path, img_w, img_h, CURSOR_WIDTH, CURSOR_HEIGHT, xhot, yhot);
+	return buf;
+}
+
+/*
+ * Standard Xcursor file names for each BGCECursorType.
+ * Themes use these names under their cursors/ directory.
+ */
+static const char* xcursor_names[][3] = {
+	[BGCE_CURSOR_DEFAULT]     = { "left_ptr",             "default",    "arrow" },
+	[BGCE_CURSOR_TEXT]        = { "xterm",                 "text",       "ibeam" },
+	[BGCE_CURSOR_HAND]        = { "hand2",                 "pointer",    "hand" },
+	[BGCE_CURSOR_RESIZE_NS]   = { "sb_v_double_arrow",     "ns-resize",  "size_ver" },
+	[BGCE_CURSOR_RESIZE_EW]   = { "sb_h_double_arrow",     "ew-resize",  "size_hor" },
+	[BGCE_CURSOR_RESIZE_NWSE] = { "top_left_corner",       "nwse-resize","size_fdiag" },
+	[BGCE_CURSOR_MOVE]        = { "fleur",                 "move",       "all-scroll" },
+};
+
+/*
+ * Load all cursor types from an Xcursor theme directory.
+ * Tries each standard name for a given type until one succeeds.
+ */
+static void load_cursor_theme(const char* theme_dir, struct cursor_theme* theme) {
+	for (int t = 0; t < BGCE_CURSOR_COUNT; t++) {
+		for (int n = 0; n < 3; n++) {
+			if (!xcursor_names[t][n]) continue;
+
+			char path[MAX_PATH_LEN];
+			snprintf(path, sizeof(path), "%s/%s", theme_dir, xcursor_names[t][n]);
+
+			int hx = 0, hy = 0;
+			uint32_t* img = load_xcursor_file(path, &hx, &hy);
+			if (img) {
+				theme->images[t] = img;
+				theme->hotspot_x[t] = hx;
+				theme->hotspot_y[t] = hy;
+				break; /* found one, skip alternatives */
+			}
+		}
+		if (!theme->images[t])
+			printf("[BGCE] No Xcursor file found for cursor type %d, using built-in\n", t);
+	}
+}
+
 // Parse config file
 int parse_config(struct config* config) {
 	const char* home = getenv("HOME");
@@ -279,6 +448,7 @@ int parse_config(struct config* config) {
 	config->type = BG_COLOR;
 	config->color = 0xAAAAAAAA; // Default gray
 	config->shortcut_count = 0;
+	memset(&config->cursors, 0, sizeof(config->cursors));
 
 	char line[1024];
 	char current_section[256] = "";
@@ -304,8 +474,8 @@ int parse_config(struct config* config) {
 			continue;
 
 		char key[32];
-		char value[128];
-		sscanf(trimmed, "%s = %[^\n]", key, value);
+		char value[MAX_PATH_LEN];
+		sscanf(trimmed, "%31s = %511[^\n]", key, value);
 
 		if (strcmp(current_section, "background") == 0) {
 			if (strcmp(key, "type") == 0) {
@@ -326,6 +496,13 @@ int parse_config(struct config* config) {
 				} else if (strcmp(value, "scaled") == 0) {
 					config->mode = IMAGE_SCALED;
 				}
+			}
+		} else if (strcmp(current_section, "cursors") == 0) {
+			if (strcmp(key, "theme") == 0) {
+				load_cursor_theme(value, &config->cursors);
+			} else {
+				fprintf(stderr, "[BGCE] Unknown cursor config key: %s "
+				        "(expected 'theme')\n", key);
 			}
 		} else if (strcmp(current_section, "shortcuts") == 0) {
 			if (config->shortcut_count < MAX_SHORTCUTS) {

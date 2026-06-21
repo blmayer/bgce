@@ -58,6 +58,7 @@
 #include <stb_image_write.h>
 
 extern struct ServerState server;
+extern struct config config;
 
 static int vt_fd = -1;
 
@@ -112,23 +113,280 @@ static int drm_destroy_dumb(int fd, uint32_t handle) {
 	return 0;
 }
 
-static void draw_cursor(uint8_t* buf, uint32_t stride, uint32_t w, uint32_t h) {
-	/* Cursor is ARGB8888 */
-	for (uint32_t y = 0; y < h; y++) {
-		uint32_t* line = (uint32_t*)(buf + y * stride);
-		for (uint32_t x = 0; x < w; x++) {
-			/* simple triangle with alpha */
-			if (x < y && x > y / 5 && x + y < 64) {
-				uint8_t alpha = 200;
-				uint8_t red = 255;
-				uint8_t green = (x * 255) / (w - 1);
-				uint8_t blue = (y * 255) / (h - 1);
-				line[x] = (alpha << 24) | (red << 16) | (green << 8) | blue;
-			} else {
-				line[x] = 0; /* transparent */
-			}
-		}
+static enum BGCECursorType current_cursor = BGCE_CURSOR_DEFAULT;
+
+/* Helper: set a single pixel (ARGB8888) with bounds check */
+static inline void cur_px(uint32_t* buf, uint32_t stride_px, uint32_t w, uint32_t h,
+                          int x, int y, uint32_t argb) {
+	if (x >= 0 && x < (int)w && y >= 0 && y < (int)h)
+		buf[y * stride_px + x] = argb;
+}
+
+/* Draw a filled line (horizontal) */
+static void cur_hline(uint32_t* buf, uint32_t stride_px, uint32_t w, uint32_t h,
+                      int x0, int x1, int y, uint32_t argb) {
+	for (int x = x0; x <= x1; x++)
+		cur_px(buf, stride_px, w, h, x, y, argb);
+}
+
+/* Draw a filled line (vertical) */
+static void cur_vline(uint32_t* buf, uint32_t stride_px, uint32_t w, uint32_t h,
+                      int x, int y0, int y1, uint32_t argb) {
+	for (int y = y0; y <= y1; y++)
+		cur_px(buf, stride_px, w, h, x, y, argb);
+}
+
+/* Outline color and fill color for all cursors */
+#define CUR_BLACK 0xFF000000u
+#define CUR_WHITE 0xFFFFFFFFu
+
+/* ---------- Individual cursor renderers ---------- */
+
+static void draw_cursor_default(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
+	/* Classic arrow pointer, ~20px tall */
+	/* Outline */
+	static const int arrow[][2] = {
+		{0,0},{0,1},{0,2},{0,3},{0,4},{0,5},{0,6},{0,7},{0,8},{0,9},{0,10},{0,11},{0,12},{0,13},{0,14},{0,15},{0,16},
+		{1,1},{1,2},{1,3},{1,4},{1,5},{1,6},{1,7},{1,8},{1,9},{1,10},{1,11},{1,12},{1,13},{1,14},{1,15},
+		{2,2},{2,3},{2,4},{2,5},{2,6},{2,7},{2,8},{2,9},{2,10},{2,11},{2,12},{2,13},{2,14},
+		{3,3},{3,4},{3,5},{3,6},{3,7},{3,8},{3,9},{3,10},{3,11},{3,12},{3,13},
+		{4,4},{4,5},{4,6},{4,7},{4,8},{4,9},{4,10},{4,11},{4,12},
+		{5,5},{5,6},{5,7},{5,8},{5,9},{5,10},{5,11},
+		{6,6},{6,7},{6,8},{6,9},{6,10},
+		{7,7},{7,8},{7,9},
+		{8,8},
+	};
+	/* White fill (interior) */
+	for (size_t i = 0; i < sizeof(arrow)/sizeof(arrow[0]); i++)
+		cur_px(buf, sp, w, h, arrow[i][0], arrow[i][1], CUR_WHITE);
+
+	/* Black outline around the arrow */
+	/* Left edge */
+	for (int y = 0; y <= 16; y++)
+		cur_px(buf, sp, w, h, 0, y, CUR_BLACK);
+	/* Diagonal right edge */
+	for (int i = 0; i <= 16; i++)
+		cur_px(buf, sp, w, h, (i+1)/2, i, CUR_BLACK);
+	/* Bottom horizontal at y=11 */
+	for (int x = 0; x <= 6; x++)
+		cur_px(buf, sp, w, h, x, 11, CUR_BLACK);
+	/* Bottom tip */
+	cur_px(buf, sp, w, h, 0, 16, CUR_BLACK);
+	cur_px(buf, sp, w, h, 0, 17, CUR_BLACK);
+	/* Diagonal from (6,11) -> (3,17) for the notch */
+	cur_px(buf, sp, w, h, 6, 11, CUR_BLACK);
+	cur_px(buf, sp, w, h, 5, 12, CUR_BLACK);
+	cur_px(buf, sp, w, h, 5, 13, CUR_BLACK);
+	cur_px(buf, sp, w, h, 4, 14, CUR_BLACK);
+	cur_px(buf, sp, w, h, 4, 15, CUR_BLACK);
+	cur_px(buf, sp, w, h, 3, 16, CUR_BLACK);
+	cur_px(buf, sp, w, h, 3, 17, CUR_BLACK);
+	/* Tail shaft from notch */
+	cur_px(buf, sp, w, h, 3, 12, CUR_BLACK);
+	cur_px(buf, sp, w, h, 3, 13, CUR_BLACK);
+	cur_px(buf, sp, w, h, 2, 14, CUR_BLACK);
+	cur_px(buf, sp, w, h, 2, 15, CUR_BLACK);
+	cur_px(buf, sp, w, h, 1, 16, CUR_BLACK);
+	cur_px(buf, sp, w, h, 1, 17, CUR_BLACK);
+	/* White fill for shaft */
+	cur_px(buf, sp, w, h, 4, 12, CUR_WHITE);
+	cur_px(buf, sp, w, h, 4, 13, CUR_WHITE);
+	cur_px(buf, sp, w, h, 3, 14, CUR_WHITE);
+	cur_px(buf, sp, w, h, 3, 15, CUR_WHITE);
+	cur_px(buf, sp, w, h, 2, 16, CUR_WHITE);
+	cur_px(buf, sp, w, h, 2, 17, CUR_WHITE);
+}
+
+static void draw_cursor_text(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
+	/* I-beam cursor, centered at x=7 */
+	int cx = 7;
+	/* Top serif */
+	cur_hline(buf, sp, w, h, cx - 4, cx + 4, 0, CUR_BLACK);
+	cur_hline(buf, sp, w, h, cx - 3, cx + 3, 1, CUR_BLACK);
+	/* Vertical bar */
+	cur_vline(buf, sp, w, h, cx, 2, 17, CUR_BLACK);
+	cur_vline(buf, sp, w, h, cx - 1, 2, 17, CUR_WHITE);
+	cur_vline(buf, sp, w, h, cx + 1, 2, 17, CUR_WHITE);
+	/* Bottom serif */
+	cur_hline(buf, sp, w, h, cx - 3, cx + 3, 18, CUR_BLACK);
+	cur_hline(buf, sp, w, h, cx - 4, cx + 4, 19, CUR_BLACK);
+}
+
+static void draw_cursor_hand(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
+	/* Pointing hand — finger up, simplified */
+	/* Index finger */
+	cur_vline(buf, sp, w, h, 6, 0, 7, CUR_BLACK);
+	cur_vline(buf, sp, w, h, 7, 0, 7, CUR_WHITE);
+	cur_vline(buf, sp, w, h, 8, 0, 7, CUR_WHITE);
+	cur_vline(buf, sp, w, h, 9, 0, 7, CUR_BLACK);
+	/* Other fingers opening at y=8 */
+	for (int f = 0; f < 4; f++) {
+		int bx = 3 + f * 3;
+		cur_vline(buf, sp, w, h, bx, 8, 12, CUR_BLACK);
+		cur_vline(buf, sp, w, h, bx + 1, 8, 12, CUR_WHITE);
+		cur_vline(buf, sp, w, h, bx + 2, 8, 12, CUR_BLACK);
 	}
+	/* Palm */
+	for (int y = 13; y <= 18; y++) {
+		cur_px(buf, sp, w, h, 3, y, CUR_BLACK);
+		cur_hline(buf, sp, w, h, 4, 13, y, CUR_WHITE);
+		cur_px(buf, sp, w, h, 14, y, CUR_BLACK);
+	}
+	/* Bottom */
+	cur_hline(buf, sp, w, h, 3, 14, 19, CUR_BLACK);
+}
+
+static void draw_cursor_resize_ns(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
+	/* Vertical double-headed arrow, centered at (7, 10) */
+	int cx = 7;
+	/* Up arrow head */
+	for (int i = 0; i < 5; i++) {
+		cur_hline(buf, sp, w, h, cx - i, cx + i, 4 + i, CUR_BLACK);
+		if (i > 0)
+			cur_hline(buf, sp, w, h, cx - i + 1, cx + i - 1, 4 + i, CUR_WHITE);
+	}
+	cur_hline(buf, sp, w, h, cx - 4, cx + 4, 8, CUR_BLACK);
+	/* Shaft */
+	cur_vline(buf, sp, w, h, cx - 1, 9, 12, CUR_BLACK);
+	cur_vline(buf, sp, w, h, cx, 9, 12, CUR_WHITE);
+	cur_vline(buf, sp, w, h, cx + 1, 9, 12, CUR_BLACK);
+	/* Down arrow head */
+	cur_hline(buf, sp, w, h, cx - 4, cx + 4, 13, CUR_BLACK);
+	for (int i = 0; i < 5; i++) {
+		cur_hline(buf, sp, w, h, cx - 4 + i, cx + 4 - i, 13 + i, CUR_BLACK);
+		if (i > 0 && 4 - i > 0)
+			cur_hline(buf, sp, w, h, cx - 4 + i + 1, cx + 4 - i - 1, 13 + i, CUR_WHITE);
+	}
+}
+
+static void draw_cursor_resize_ew(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
+	/* Horizontal double-headed arrow, centered at (9, 7) */
+	int cy = 7;
+	/* Left arrow head */
+	for (int i = 0; i < 5; i++) {
+		cur_vline(buf, sp, w, h, 2 + i, cy - i, cy + i, CUR_BLACK);
+		if (i > 0)
+			cur_vline(buf, sp, w, h, 2 + i, cy - i + 1, cy + i - 1, CUR_WHITE);
+	}
+	cur_vline(buf, sp, w, h, 6, cy - 4, cy + 4, CUR_BLACK);
+	/* Shaft */
+	cur_hline(buf, sp, w, h, 7, 11, cy - 1, CUR_BLACK);
+	cur_hline(buf, sp, w, h, 7, 11, cy, CUR_WHITE);
+	cur_hline(buf, sp, w, h, 7, 11, cy + 1, CUR_BLACK);
+	/* Right arrow head */
+	cur_vline(buf, sp, w, h, 12, cy - 4, cy + 4, CUR_BLACK);
+	for (int i = 0; i < 5; i++) {
+		cur_vline(buf, sp, w, h, 12 + i, cy - 4 + i, cy + 4 - i, CUR_BLACK);
+		if (i > 0 && 4 - i > 0)
+			cur_vline(buf, sp, w, h, 12 + i, cy - 4 + i + 1, cy + 4 - i - 1, CUR_WHITE);
+	}
+}
+
+static void draw_cursor_resize_nwse(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
+	/* Diagonal (NW-SE) double arrow */
+	/* NW arrow head */
+	for (int i = 0; i < 6; i++) {
+		cur_px(buf, sp, w, h, i, 0, CUR_BLACK);
+		cur_px(buf, sp, w, h, 0, i, CUR_BLACK);
+	}
+	for (int i = 1; i < 5; i++) {
+		cur_px(buf, sp, w, h, i, 1, CUR_WHITE);
+		cur_px(buf, sp, w, h, 1, i, CUR_WHITE);
+	}
+	/* Diagonal shaft */
+	for (int i = 3; i <= 14; i++) {
+		cur_px(buf, sp, w, h, i - 1, i, CUR_BLACK);
+		cur_px(buf, sp, w, h, i, i, CUR_WHITE);
+		cur_px(buf, sp, w, h, i + 1, i, CUR_BLACK);
+	}
+	/* SE arrow head */
+	for (int i = 0; i < 6; i++) {
+		cur_px(buf, sp, w, h, 17 - i, 17, CUR_BLACK);
+		cur_px(buf, sp, w, h, 17, 17 - i, CUR_BLACK);
+	}
+	for (int i = 1; i < 5; i++) {
+		cur_px(buf, sp, w, h, 17 - i, 16, CUR_WHITE);
+		cur_px(buf, sp, w, h, 16, 17 - i, CUR_WHITE);
+	}
+}
+
+static void draw_cursor_move(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
+	/* Four-way arrow, centered at (9, 9) */
+	int cx = 9, cy = 9;
+	/* Horizontal bar */
+	cur_hline(buf, sp, w, h, 2, 16, cy - 1, CUR_BLACK);
+	cur_hline(buf, sp, w, h, 2, 16, cy, CUR_WHITE);
+	cur_hline(buf, sp, w, h, 2, 16, cy + 1, CUR_BLACK);
+	/* Vertical bar */
+	cur_vline(buf, sp, w, h, cx - 1, 2, 16, CUR_BLACK);
+	cur_vline(buf, sp, w, h, cx, 2, 16, CUR_WHITE);
+	cur_vline(buf, sp, w, h, cx + 1, 2, 16, CUR_BLACK);
+	/* Up arrow */
+	for (int i = 0; i < 4; i++) {
+		cur_px(buf, sp, w, h, cx - i, 2 + i, CUR_BLACK);
+		cur_px(buf, sp, w, h, cx + i, 2 + i, CUR_BLACK);
+	}
+	/* Down arrow */
+	for (int i = 0; i < 4; i++) {
+		cur_px(buf, sp, w, h, cx - i, 16 - i, CUR_BLACK);
+		cur_px(buf, sp, w, h, cx + i, 16 - i, CUR_BLACK);
+	}
+	/* Left arrow */
+	for (int i = 0; i < 4; i++) {
+		cur_px(buf, sp, w, h, 2 + i, cy - i, CUR_BLACK);
+		cur_px(buf, sp, w, h, 2 + i, cy + i, CUR_BLACK);
+	}
+	/* Right arrow */
+	for (int i = 0; i < 4; i++) {
+		cur_px(buf, sp, w, h, 16 - i, cy - i, CUR_BLACK);
+		cur_px(buf, sp, w, h, 16 - i, cy + i, CUR_BLACK);
+	}
+}
+
+/* Render the currently selected cursor into the cursor buffer.
+ * If a cursor image was loaded from the config, blit it directly;
+ * otherwise fall back to the built-in procedural shape. */
+static void render_cursor(uint32_t* buf, uint32_t stride_px, uint32_t w, uint32_t h) {
+	memset(buf, 0, h * stride_px * 4); /* clear to fully transparent */
+
+	/* Try loaded image first */
+	if (current_cursor >= 0 && current_cursor < BGCE_CURSOR_COUNT &&
+	    config.cursors.images[current_cursor]) {
+		uint32_t* src = config.cursors.images[current_cursor];
+		for (uint32_t y = 0; y < h; y++)
+			memcpy(buf + y * stride_px, src + y * w, w * sizeof(uint32_t));
+		return;
+	}
+
+	/* Built-in fallback */
+	switch (current_cursor) {
+	case BGCE_CURSOR_TEXT:        draw_cursor_text(buf, stride_px, w, h); break;
+	case BGCE_CURSOR_HAND:        draw_cursor_hand(buf, stride_px, w, h); break;
+	case BGCE_CURSOR_RESIZE_NS:   draw_cursor_resize_ns(buf, stride_px, w, h); break;
+	case BGCE_CURSOR_RESIZE_EW:   draw_cursor_resize_ew(buf, stride_px, w, h); break;
+	case BGCE_CURSOR_RESIZE_NWSE: draw_cursor_resize_nwse(buf, stride_px, w, h); break;
+	case BGCE_CURSOR_MOVE:        draw_cursor_move(buf, stride_px, w, h); break;
+	default:                      draw_cursor_default(buf, stride_px, w, h); break;
+	}
+}
+
+void set_cursor_type(enum BGCECursorType type) {
+	if (type < 0 || type >= BGCE_CURSOR_COUNT)
+		type = BGCE_CURSOR_DEFAULT;
+	if (type == current_cursor)
+		return;
+
+	current_cursor = type;
+
+	/* cur_map is the mmap'd DRM dumb buffer for the cursor */
+	if (!cur_map || cur_map == MAP_FAILED)
+		return;
+
+	uint32_t stride_px = cur_w; /* pitch in pixels (32bpp, tightly packed) */
+	render_cursor((uint32_t*)cur_map, stride_px, cur_w, cur_h);
+
+	/* Re-upload cursor to hardware */
+	drmModeSetCursor(server.drm_fd, server.crtc_id, cur_handle, cur_w, cur_h);
 }
 
 int setup_vt_handling(void) {
@@ -350,7 +608,7 @@ int init_display() {
 	}
 	memset(cur_map, 0, cur_size);
 
-	draw_cursor((uint8_t*)cur_map, cur_pitch, CURSOR_WIDTH, CURSOR_HEIGHT);
+	render_cursor((uint32_t*)cur_map, cur_w, CURSOR_WIDTH, CURSOR_HEIGHT);
 
 #ifdef DRM_FORMAT_ARGB8888
 	{
