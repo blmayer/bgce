@@ -78,14 +78,19 @@ I also posted a video on my blog:
 
 ## Build Instructions
 
+On lin0 use `/bin/cc` and install into the flat root (`/bin`, `/lib`, `/include` — no `/usr`):
+
 ```bash
 git clone <repo-url>
-cd BGCE
-make all client
+cd bgce
+make CC=cc CFLAGS='-Wall -O1 -std=c99 -fPIC -I/include/libdrm -I.' all client
+make install
 ./bgce   # Start server
 # Go to a different tty
 ./client  # Start test client
 ```
+
+Needs userspace `libdrm` headers in `/include/libdrm` and `libdrm.so` in `/lib`.
 
 
 ## Configuration

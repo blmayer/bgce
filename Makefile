@@ -1,6 +1,6 @@
-CC = gcc
-CFLAGS = -Wall -O1 -std=c99 -fPIC -g -I/usr/include/libdrm -I.
-LDFLAGS = -lrt -ldrm -lm
+CC ?= cc
+CFLAGS ?= -Wall -O1 -std=c99 -fPIC -g -I/include/libdrm -I.
+LDFLAGS ?= -lrt -ldrm -lm
 
 SERVER_OBJS = server.o loop.o libbgce.so input.o display.o config.o
 LIB_OBJS = libbgce.o
@@ -22,9 +22,9 @@ client: client.c bgce.h
 clean:
 	rm -f *.o bgce libbgce.so client app
 
-INSTALL_BIN = /usr/bin
-INSTALL_LIB = /usr/lib
-INSTALL_INCLUDE = /usr/include
+INSTALL_BIN = /bin
+INSTALL_LIB = /lib
+INSTALL_INCLUDE = /include
 
 .PHONY: install
 install: bgce libbgce.so bgce.h
@@ -34,7 +34,7 @@ install: bgce libbgce.so bgce.h
 	install -m 755 libbgce.so $(INSTALL_LIB)
 	install -d $(INSTALL_INCLUDE)
 	install -m 644 bgce.h $(INSTALL_INCLUDE)
-	ldconfig
+	-ldconfig 2>/dev/null || true
 
 SERVER_LOG ?= server.log
 SERVER_PID ?= server.pid
