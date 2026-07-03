@@ -59,11 +59,15 @@ I also posted a video on my blog:
 ### Input
 - The server listens to keyboard and mouse events.
 - Focus determines which client receives input.
+- **Zoom / pan (virtual desktop):**
+  - `Alt` + scroll wheel — zoom in/out (50%–400%), centered on the cursor
+  - `Alt` + left-drag on empty desktop — pan the viewport
+  - The virtual desktop is **2×** the physical resolution in each axis (**4×** the screen area), so you can place work areas far apart and zoom into focus when needed
 
 
 ### Drawing
-- Each client owns its own off-screen buffer.
-- The server composites buffers into the display based on Z-order.
+- Each client owns its own off-screen buffer (sizes and positions are in virtual-desktop / world pixels).
+- The server composites buffers into the display based on Z-order, scaled by the current zoom and pan.
 
 
 ### Privileges

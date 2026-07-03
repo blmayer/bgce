@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <linux/kd.h>
+#include <math.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,9 +32,13 @@ struct {
 	struct Client* target;
 	int dx;
 	int dy;
+	/* Sub-pixel accumulators so fine zoom still moves windows smoothly */
+	float acc_x;
+	float acc_y;
 	enum {
 		DRAG_MOVE,
-		DRAG_RESIZE
+		DRAG_RESIZE,
+		DRAG_PAN
 	} type;
 } drag;
 
@@ -89,19 +94,57 @@ int resize_buffer(struct Client* c, int dx, int dy) {
 	return 1;
 }
 
+/* Pick topmost non-background client under screen-space (x, y). */
 struct Client* pick_client(int x, int y) {
-	// Iterate through clients to find the topmost client under the cursor
+	float wx, wy;
+	screen_to_world(&server, (float)x, (float)y, &wx, &wy);
+
 	struct Client* c = server.clients;
 	struct Client* picked = NULL;
 	while (c) {
-		if (x >= c->x && x <= (c->x + c->width) &&
-		    y >= c->y && y <= (c->y + c->height)) {
+		if (wx >= (float)c->x && wx < (float)(c->x + c->width) &&
+		    wy >= (float)c->y && wy < (float)(c->y + c->height)) {
 			picked = c;
 			break;
 		}
 		c = c->next;
 	}
-	return (picked && picked->z > 0) ? picked : NULL; // avoid getting the background
+	return (picked && picked->z > 0) ? picked : NULL; /* skip background */
+}
+
+/* Convert a screen-pixel delta to an integer world-pixel delta, with
+ * fractional accumulation so slow drags still move at high zoom. */
+static void screen_delta_to_world(float sdx, float sdy, float* acc_x, float* acc_y,
+                                  int* wdx, int* wdy) {
+	float z = server.zoom > 0.0f ? server.zoom : 1.0f;
+	*acc_x += sdx / z;
+	*acc_y += sdy / z;
+	*wdx = (int)truncf(*acc_x);
+	*wdy = (int)truncf(*acc_y);
+	*acc_x -= (float)*wdx;
+	*acc_y -= (float)*wdy;
+}
+
+static void apply_zoom_at_cursor(float factor) {
+	float old_zoom = server.zoom;
+	float new_zoom = old_zoom * factor;
+	if (new_zoom < BGCE_ZOOM_MIN)
+		new_zoom = BGCE_ZOOM_MIN;
+	if (new_zoom > BGCE_ZOOM_MAX)
+		new_zoom = BGCE_ZOOM_MAX;
+	if (fabsf(new_zoom - old_zoom) < 1e-6f)
+		return;
+
+	/* Keep the world point under the cursor fixed on screen. */
+	float wx, wy;
+	screen_to_world(&server, (float)mouse_x, (float)mouse_y, &wx, &wy);
+	server.zoom = new_zoom;
+	server.pan_x = wx - (float)mouse_x / new_zoom;
+	server.pan_y = wy - (float)mouse_y / new_zoom;
+	clamp_viewport(&server);
+	redraw_all(&server);
+	printf("[BGCE] Zoom: %.2f  pan=(%.1f, %.1f)\n",
+	       server.zoom, server.pan_x, server.pan_y);
 }
 
 int init_input(void) {
@@ -342,8 +385,10 @@ static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t ke
 /*
  * Keyboard shortcuts are configured via the config file ([shortcuts] section).
  * Built-in behavior for mouse modifiers:
- *  ALT + LEFT_CLICK + DRAG: move
- *  ALT + RIGHT_CLICK + DRAG: resize
+ *  ALT + LEFT_CLICK + DRAG on a client: move window
+ *  ALT + RIGHT_CLICK + DRAG on a client: resize window
+ *  ALT + LEFT_CLICK + DRAG on empty space: pan the desktop
+ *  ALT + SCROLL: zoom in/out (centered on cursor)
  *
  *  Returns if shortcut was handled
  */
@@ -398,25 +443,25 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			alt_down = 0;
 		}
 
-		// Stop drag/move on button release
-		if ((ev.code == BTN_LEFT || ev.code == BTN_RIGHT) && drag.active) { // Only stop if it was an active drag of that type
+		// Stop drag/move/pan on button release
+		if ((ev.code == BTN_LEFT || ev.code == BTN_RIGHT) && drag.active) {
 			printf("[BGCE] End of drag event.\n");
 			set_cursor_type(BGCE_CURSOR_DEFAULT);
-			if (drag.type == DRAG_MOVE) {
+
+			if (drag.type == DRAG_MOVE || drag.type == DRAG_PAN) {
 				drag.active = 0;
 				drag.target = NULL;
+				drag.acc_x = 0;
+				drag.acc_y = 0;
 				return 1;
 			}
 
+			/* DRAG_RESIZE */
 			struct Client* c = drag.target;
-			if (resize_buffer(c, drag.dx, drag.dy)) {
+			if (c && resize_buffer(c, drag.dx, drag.dy)) {
 				printf("[BGCE] Redrawing dx=%d dy=%d.\n", drag.dx, drag.dy);
 				if (drag.dx < 0 || drag.dy < 0) {
-					redraw_from_resize(
-					        &server,
-					        *c,
-					        drag.dx,
-					        drag.dy);
+					redraw_from_resize(&server, *c, drag.dx, drag.dy);
 				}
 				draw(&server, *c);
 
@@ -431,7 +476,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			}
 			drag.active = 0;
 			drag.target = NULL;
-
+			drag.acc_x = 0;
+			drag.acc_y = 0;
 			return 1;
 		}
 	}
@@ -439,9 +485,30 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 	if (ev.type == EV_KEY && (ev.code == BTN_LEFT || ev.code == BTN_RIGHT) && ev.value == 1) {
 		printf("[BGCE] Click detected at (%d, %d).\n", mouse_x, mouse_y);
 
-		/* switch focus */
 		struct Client* c = pick_client(mouse_x, mouse_y);
 		struct Client* old_focus = server.focused_client;
+
+		/* Alt + left click on empty space → pan the desktop */
+		if (!c && alt_down && ev.code == BTN_LEFT) {
+			if (old_focus) {
+				struct BGCEMessage lost = {0};
+				lost.type = MSG_FOCUS_CHANGE;
+				lost.data.focus_event.state = 0;
+				bgce_send_msg(old_focus->fd, &lost);
+			}
+			server.focused_client = NULL;
+			drag.active = 1;
+			drag.target = NULL;
+			drag.type = DRAG_PAN;
+			drag.dx = 0;
+			drag.dy = 0;
+			drag.acc_x = 0;
+			drag.acc_y = 0;
+			set_cursor_type(BGCE_CURSOR_MOVE);
+			printf("[BGCE] Pan desktop started.\n");
+			return 1;
+		}
+
 		if (!c) {
 			if (old_focus) {
 				struct BGCEMessage lost = {0};
@@ -499,6 +566,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		drag.target = c;
 		drag.dx = 0;
 		drag.dy = 0;
+		drag.acc_x = 0;
+		drag.acc_y = 0;
 
 		if (ev.code == BTN_RIGHT) {
 			drag.type = DRAG_RESIZE;
@@ -513,6 +582,18 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		return 1;
 	}
 
+	/* Alt + scroll wheel → zoom toward cursor */
+	if (ev.type == EV_REL && ev.code == REL_WHEEL && alt_down) {
+		/* Positive value = scroll up = zoom in */
+		float factor = (ev.value > 0) ? BGCE_ZOOM_STEP : (1.0f / BGCE_ZOOM_STEP);
+		int steps = ev.value >= 0 ? ev.value : -ev.value;
+		if (steps < 1)
+			steps = 1;
+		for (int i = 0; i < steps; i++)
+			apply_zoom_at_cursor(factor);
+		return 1;
+	}
+
 	if (ev.type == EV_REL) {
 		int dx = 0;
 		int dy = 0;
@@ -522,6 +603,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			break;
 		case REL_Y:
 			dy += ev.value;
+			break;
+		default:
+			/* Wheel without alt, etc. — not a pointer move */
+			return 0;
 		}
 		mouse_x += dx;
 		mouse_y += dy;
@@ -531,10 +616,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			mouse_x = 0;
 		if (mouse_y < 0)
 			mouse_y = 0;
-		if (mouse_x > server.display_w)
-			mouse_x = server.display_w;
-		if (mouse_y > server.display_h)
-			mouse_y = server.display_h;
+		if (mouse_x > (int)server.display_w)
+			mouse_x = (int)server.display_w;
+		if (mouse_y > (int)server.display_h)
+			mouse_y = (int)server.display_h;
 
 		drmModeMoveCursor(
 		        server.drm_fd,
@@ -543,29 +628,39 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		        mouse_y);
 
 		if (drag.active) {
-			struct Client* c = drag.target;
-			if (!c) {
-				printf("[BGCE] No client to drag\n");
-				return 1; // Should not happen
-			}
-
 			switch (drag.type) {
-			case DRAG_MOVE:
-				// if moving, redraw old region.
-				if (drag.type == DRAG_MOVE) {
-					redraw_region(&server, *c, dx, dy);
-				}
-
-				// Update client's position
-				c->x = c->x + dx;
-				c->y = c->y + dy;
-				draw(&server, *c);
+			case DRAG_PAN: {
+				/* Dragging the desktop: pan opposite to pointer motion */
+				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
+				server.pan_x -= (float)dx / z;
+				server.pan_y -= (float)dy / z;
+				clamp_viewport(&server);
+				redraw_all(&server);
 				break;
-
-			case DRAG_RESIZE:
-				// Accumulate new width and height
-				drag.dx += dx;
-				drag.dy += dy;
+			}
+			case DRAG_MOVE: {
+				struct Client* c = drag.target;
+				if (!c)
+					return 1;
+				int wdx, wdy;
+				screen_delta_to_world((float)dx, (float)dy,
+				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
+				if (wdx || wdy) {
+					redraw_region(&server, *c, wdx, wdy);
+					c->x = (uint32_t)((int)c->x + wdx);
+					c->y = (uint32_t)((int)c->y + wdy);
+					draw(&server, *c);
+				}
+				break;
+			}
+			case DRAG_RESIZE: {
+				int wdx, wdy;
+				screen_delta_to_world((float)dx, (float)dy,
+				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
+				drag.dx += wdx;
+				drag.dy += wdy;
+				break;
+			}
 			}
 			return 1;
 		}
@@ -599,8 +694,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		/* Clamp */
 		if (mouse_x < 0) mouse_x = 0;
 		if (mouse_y < 0) mouse_y = 0;
-		if (mouse_x > (int)server.display_w) mouse_x = server.display_w;
-		if (mouse_y > (int)server.display_h) mouse_y = server.display_h;
+		if (mouse_x > (int)server.display_w) mouse_x = (int)server.display_w;
+		if (mouse_y > (int)server.display_h) mouse_y = (int)server.display_h;
 
 		drmModeMoveCursor(
 		        server.drm_fd,
@@ -609,22 +704,41 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		        mouse_y);
 
 		if (drag.active) {
-			struct Client* c = drag.target;
-			if (!c) return 1;
-
 			int dx = mouse_x - old_x;
 			int dy = mouse_y - old_y;
 
 			switch (drag.type) {
-			case DRAG_MOVE:
-				redraw_region(&server, *c, dx, dy);
-				c->x = c->x + dx;
-				c->y = c->y + dy;
-				draw(&server, *c);
+			case DRAG_PAN: {
+				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
+				server.pan_x -= (float)dx / z;
+				server.pan_y -= (float)dy / z;
+				clamp_viewport(&server);
+				redraw_all(&server);
 				break;
-			case DRAG_RESIZE:
-				drag.dx += dx;
-				drag.dy += dy;
+			}
+			case DRAG_MOVE: {
+				struct Client* c = drag.target;
+				if (!c)
+					return 1;
+				int wdx, wdy;
+				screen_delta_to_world((float)dx, (float)dy,
+				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
+				if (wdx || wdy) {
+					redraw_region(&server, *c, wdx, wdy);
+					c->x = (uint32_t)((int)c->x + wdx);
+					c->y = (uint32_t)((int)c->y + wdy);
+					draw(&server, *c);
+				}
+				break;
+			}
+			case DRAG_RESIZE: {
+				int wdx, wdy;
+				screen_delta_to_world((float)dx, (float)dy,
+				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
+				drag.dx += wdx;
+				drag.dy += wdy;
+				break;
+			}
 			}
 			return 1;
 		}
@@ -700,15 +814,19 @@ void* input_loop(void* arg) {
 				/* fall through — mouse buttons carry position */
 			case EV_REL:
 			case EV_ABS: {
-				int in = mouse_x >= (int)c.x &&
-				         mouse_x <= (int)(c.x + c.width) &&
-				         mouse_y >= (int)c.y &&
-				         mouse_y <= (int)(c.y + c.height);
+				float wx, wy;
+				screen_to_world(&server, (float)mouse_x, (float)mouse_y,
+				                &wx, &wy);
+				int in = wx >= (float)c.x &&
+				         wx < (float)(c.x + c.width) &&
+				         wy >= (float)c.y &&
+				         wy < (float)(c.y + c.height);
 				if (!in)
 					continue;
 
-				e.x = mouse_x - c.x;
-				e.y = mouse_y - c.y;
+				/* Client-local coordinates in buffer/world pixels */
+				e.x = (int32_t)(wx - (float)c.x);
+				e.y = (int32_t)(wy - (float)c.y);
 				break;
 			}
 			default:

@@ -22,6 +22,15 @@
 
 #define MAX_PATH_LEN 512
 
+/* Virtual desktop is WORLD_SCALE × display in each axis (4× area).
+ * Zoom 1.0 = 100% (1 world pixel = 1 screen pixel).
+ * Zoom range [ZOOM_MIN, ZOOM_MAX]: fully zoomed-out fits the whole
+ * virtual desktop; fully zoomed-in is 4× magnification. */
+#define BGCE_WORLD_SCALE 2
+#define BGCE_ZOOM_MIN 0.5f
+#define BGCE_ZOOM_MAX 4.0f
+#define BGCE_ZOOM_STEP 1.15f
+
 /* ----------------------------
  * Client Representation
  * ---------------------------- */
@@ -33,6 +42,7 @@ struct Client {
 	void* buffer;
 	uint32_t width;
 	uint32_t height;
+	/* Position and size are in virtual-desktop (world) pixels */
 	uint32_t x;
 	uint32_t y;
 	uint32_t z;
@@ -58,6 +68,13 @@ struct ServerState {
 	uint32_t display_h;
 	uint32_t display_bpp;
 	void* framebuffer;
+
+	/* Virtual desktop / viewport (see BGCE_WORLD_SCALE) */
+	uint32_t virtual_w;
+	uint32_t virtual_h;
+	float zoom;   /* screen_pixels = world_pixels * zoom */
+	float pan_x;  /* world coords of top-left of the screen */
+	float pan_y;
 
 	struct InputState input;
 
@@ -163,6 +180,20 @@ void draw(struct ServerState* srv, struct Client cli);
 void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);
+
+/** Full-scene recomposite (used after pan/zoom changes). */
+void redraw_all(struct ServerState* srv);
+
+/** Clamp pan so the viewport stays over the virtual desktop. */
+void clamp_viewport(struct ServerState* srv);
+
+/** Map a screen pixel to virtual-desktop (world) coordinates. */
+void screen_to_world(const struct ServerState* srv, float sx, float sy,
+                     float* wx, float* wy);
+
+/** Map a world point to screen coordinates. */
+void world_to_screen(const struct ServerState* srv, float wx, float wy,
+                     float* sx, float* sy);
 
 /**
  * Capture the current framebuffer and save it as a screenshot.

@@ -80,8 +80,9 @@ void* client_thread(void* arg) {
 			snprintf(client->shm_name, sizeof(client->shm_name),
 			         "bgce_buf_%d_%ld", getpid(), time(NULL));
 
-			// Unmap and unlink the existing buffer: for resize
-			if (client->buffer) {
+			/* Unmap and unlink the existing buffer (resize path). */
+			int had_buffer = client->buffer != NULL;
+			if (had_buffer) {
 				printf("[BGCE] Client already has a buffer, unmapping.\n");
 				munmap(client->buffer, client->width * client->height * 4);
 				shm_unlink(client->shm_name);
@@ -103,8 +104,22 @@ void* client_thread(void* arg) {
 			client->buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 			client->width = req.width;
 			client->height = req.height;
-			client->x = 0;
-			client->y = 0;
+			/* First buffer only: place at the current viewport so the window
+			 * appears on-screen even when the user has panned/zoomed. */
+			if (!had_buffer) {
+				float wx, wy;
+				screen_to_world(&server, 0.0f, 0.0f, &wx, &wy);
+				if (wx < 0.0f)
+					wx = 0.0f;
+				if (wy < 0.0f)
+					wy = 0.0f;
+				if (wx > (float)server.virtual_w)
+					wx = (float)server.virtual_w;
+				if (wy > (float)server.virtual_h)
+					wy = (float)server.virtual_h;
+				client->x = (uint32_t)wx;
+				client->y = (uint32_t)wy;
+			}
 			close(shm_fd);
 			printf("[BGCE] Client buffer: %p size=%zu (%dx%d) name=%s\n",
 			       client->buffer,

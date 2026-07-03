@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <linux/kd.h>
 #include <linux/vt.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -651,74 +652,101 @@ int init_display() {
 	return 0;
 }
 
-void draw(struct ServerState* srv, struct Client cli) {
-	if (!srv || !srv->framebuffer || !cli.buffer) {
-		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
+/* ------------------------------------------------------------------
+ * Viewport / coordinate transforms
+ * ------------------------------------------------------------------ */
+
+void screen_to_world(const struct ServerState* srv, float sx, float sy,
+                     float* wx, float* wy) {
+	float z = srv->zoom > 0.0f ? srv->zoom : 1.0f;
+	if (wx)
+		*wx = sx / z + srv->pan_x;
+	if (wy)
+		*wy = sy / z + srv->pan_y;
+}
+
+void world_to_screen(const struct ServerState* srv, float wx, float wy,
+                     float* sx, float* sy) {
+	if (sx)
+		*sx = (wx - srv->pan_x) * srv->zoom;
+	if (sy)
+		*sy = (wy - srv->pan_y) * srv->zoom;
+}
+
+void clamp_viewport(struct ServerState* srv) {
+	if (!srv)
 		return;
+	if (srv->zoom < BGCE_ZOOM_MIN)
+		srv->zoom = BGCE_ZOOM_MIN;
+	if (srv->zoom > BGCE_ZOOM_MAX)
+		srv->zoom = BGCE_ZOOM_MAX;
+
+	float vis_w = (float)srv->display_w / srv->zoom;
+	float vis_h = (float)srv->display_h / srv->zoom;
+	float max_x = (float)srv->virtual_w - vis_w;
+	float max_y = (float)srv->virtual_h - vis_h;
+
+	if (max_x < 0.0f) {
+		/* View larger than world — center the desktop */
+		srv->pan_x = max_x * 0.5f;
+	} else {
+		if (srv->pan_x < 0.0f)
+			srv->pan_x = 0.0f;
+		if (srv->pan_x > max_x)
+			srv->pan_x = max_x;
 	}
 
-	uint32_t screen_w = srv->display_w;
-	uint32_t screen_h = srv->display_h;
-
-	uint32_t client_w = cli.width;
-	uint32_t client_h = cli.height;
-
-	int cx = cli.x;
-	int cy = cli.y;
-
-	uint32_t* dst = (uint32_t*)srv->framebuffer;
-	uint32_t* src = (uint32_t*)cli.buffer;
-
-	/* ---------------- Clip Region ---------------- */
-
-	int start_x = cx < 0 ? 0 : cx;
-	int start_y = cy < 0 ? 0 : cy;
-
-	int end_x = cx + client_w;
-	int end_y = cy + client_h;
-
-	if (end_x > (int)screen_w)
-		end_x = screen_w;
-	if (end_y > (int)screen_h)
-		end_y = screen_h;
-
-	/* Entire window is outside screen */
-	if (start_x >= end_x || start_y >= end_y) {
-		fprintf(stderr, "[BGCE] Draw: Client entirely outside screen\n");
-		return;
-	}
-
-	int src_start_x = start_x - cx;
-	int src_start_y = start_y - cy;
-
-	int copy_w = end_x - start_x;
-	int copy_h = end_y - start_y;
-
-	uint32_t screen_stride_pixels = screen_w; /* No stride stored → compute */
-
-	/* ------------- Copy to DRM FB --------------- */
-
-	for (int y = 0; y < copy_h; y++) {
-		uint32_t* drow = dst + (start_y + y) * screen_stride_pixels + start_x;
-		uint32_t* srow = src + (src_start_y + y) * client_w + src_start_x;
-		memcpy(drow, srow, copy_w * 4);
+	if (max_y < 0.0f) {
+		srv->pan_y = max_y * 0.5f;
+	} else {
+		if (srv->pan_y < 0.0f)
+			srv->pan_y = 0.0f;
+		if (srv->pan_y > max_y)
+			srv->pan_y = max_y;
 	}
 }
 
+/* Screen-space axis-aligned bounds of a client (exclusive end). */
+static void client_screen_bounds(const struct ServerState* srv, const struct Client* cli,
+                                 int* sx0, int* sy0, int* sx1, int* sy1) {
+	float fsx0, fsy0, fsx1, fsy1;
+	world_to_screen(srv, (float)cli->x, (float)cli->y, &fsx0, &fsy0);
+	world_to_screen(srv, (float)(cli->x + cli->width), (float)(cli->y + cli->height),
+	                &fsx1, &fsy1);
+	*sx0 = (int)floorf(fsx0);
+	*sy0 = (int)floorf(fsy0);
+	*sx1 = (int)ceilf(fsx1);
+	*sy1 = (int)ceilf(fsy1);
+}
+
+/*
+ * Nearest-neighbour blit of a client into a screen-space damage rect.
+ * Client geometry is in world coordinates; the viewport (pan/zoom) maps
+ * world → screen.
+ */
 static void blit_client_overlap(struct ServerState* srv, const struct Client* cli,
                                 int rx0, int ry0, int rx1, int ry1) {
 	if (!srv || !srv->framebuffer || !cli || !cli->buffer)
 		return;
+	if (cli->width == 0 || cli->height == 0)
+		return;
 
-	int cx0 = (int)cli->x;
-	int cy0 = (int)cli->y;
-	int cx1 = (int)cli->x + (int)cli->width;
-	int cy1 = (int)cli->y + (int)cli->height;
+	int csx0, csy0, csx1, csy1;
+	client_screen_bounds(srv, cli, &csx0, &csy0, &csx1, &csy1);
 
-	int ox0 = rx0 > cx0 ? rx0 : cx0;
-	int oy0 = ry0 > cy0 ? ry0 : cy0;
-	int ox1 = rx1 < cx1 ? rx1 : cx1;
-	int oy1 = ry1 < cy1 ? ry1 : cy1;
+	int ox0 = rx0 > csx0 ? rx0 : csx0;
+	int oy0 = ry0 > csy0 ? ry0 : csy0;
+	int ox1 = rx1 < csx1 ? rx1 : csx1;
+	int oy1 = ry1 < csy1 ? ry1 : csy1;
+
+	if (ox0 < 0)
+		ox0 = 0;
+	if (oy0 < 0)
+		oy0 = 0;
+	if (ox1 > (int)srv->display_w)
+		ox1 = (int)srv->display_w;
+	if (oy1 > (int)srv->display_h)
+		oy1 = (int)srv->display_h;
 
 	if (ox0 >= ox1 || oy0 >= oy1)
 		return;
@@ -726,11 +754,59 @@ static void blit_client_overlap(struct ServerState* srv, const struct Client* cl
 	uint32_t screen_w = srv->display_w;
 	uint32_t* dst = (uint32_t*)srv->framebuffer;
 	uint32_t* src = (uint32_t*)cli->buffer;
+	const int cw = (int)cli->width;
+	const int ch = (int)cli->height;
+	const float inv_z = 1.0f / srv->zoom;
+	const float pan_x = srv->pan_x;
+	const float pan_y = srv->pan_y;
+	const float cli_x = (float)cli->x;
+	const float cli_y = (float)cli->y;
 
-	for (int y = oy0; y < oy1; y++) {
-		uint32_t* drow = dst + y * (int)screen_w + ox0;
-		uint32_t* srow = src + (y - cy0) * (int)cli->width + (ox0 - cx0);
-		memcpy(drow, srow, (size_t)(ox1 - ox0) * 4);
+	/* Fast path: identity transform (zoom≈1, pan integer, aligned). */
+	if (fabsf(srv->zoom - 1.0f) < 1e-6f &&
+	    fabsf(pan_x - roundf(pan_x)) < 1e-6f &&
+	    fabsf(pan_y - roundf(pan_y)) < 1e-6f) {
+		int ipx = (int)roundf(pan_x);
+		int ipy = (int)roundf(pan_y);
+		int wox0 = ox0 + ipx;
+		int woy0 = oy0 + ipy;
+		int wox1 = ox1 + ipx;
+		int woy1 = oy1 + ipy;
+
+		int cx0 = (int)cli->x;
+		int cy0 = (int)cli->y;
+		int cx1 = cx0 + cw;
+		int cy1 = cy0 + ch;
+
+		int ix0 = wox0 > cx0 ? wox0 : cx0;
+		int iy0 = woy0 > cy0 ? woy0 : cy0;
+		int ix1 = wox1 < cx1 ? wox1 : cx1;
+		int iy1 = woy1 < cy1 ? woy1 : cy1;
+		if (ix0 >= ix1 || iy0 >= iy1)
+			return;
+
+		for (int wy = iy0; wy < iy1; wy++) {
+			int sy = wy - ipy;
+			uint32_t* drow = dst + sy * (int)screen_w + (ix0 - ipx);
+			uint32_t* srow = src + (wy - cy0) * cw + (ix0 - cx0);
+			memcpy(drow, srow, (size_t)(ix1 - ix0) * 4);
+		}
+		return;
+	}
+
+	for (int sy = oy0; sy < oy1; sy++) {
+		float wy = (float)sy * inv_z + pan_y;
+		int icy = (int)floorf(wy - cli_y);
+		if (icy < 0 || icy >= ch)
+			continue;
+		uint32_t* drow = dst + sy * (int)screen_w;
+		uint32_t* srow = src + icy * cw;
+		for (int sx = ox0; sx < ox1; sx++) {
+			float wx = (float)sx * inv_z + pan_x;
+			int icx = (int)floorf(wx - cli_x);
+			if (icx >= 0 && icx < cw)
+				drow[sx] = srow[icx];
+		}
 	}
 }
 
@@ -766,110 +842,78 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
 	free(stack);
 }
 
+void redraw_all(struct ServerState* srv) {
+	if (!srv || !srv->framebuffer)
+		return;
+	composite_chain_to_rect(srv, srv->clients, 0, 0,
+	                        (int)srv->display_w, (int)srv->display_h);
+}
+
+void draw(struct ServerState* srv, struct Client cli) {
+	if (!srv || !srv->framebuffer || !cli.buffer) {
+		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
+		return;
+	}
+
+	int sx0, sy0, sx1, sy1;
+	client_screen_bounds(srv, &cli, &sx0, &sy0, &sx1, &sy1);
+
+	if (sx0 < 0)
+		sx0 = 0;
+	if (sy0 < 0)
+		sy0 = 0;
+	if (sx1 > (int)srv->display_w)
+		sx1 = (int)srv->display_w;
+	if (sy1 > (int)srv->display_h)
+		sy1 = (int)srv->display_h;
+
+	if (sx0 >= sx1 || sy0 >= sy1)
+		return;
+
+	blit_client_overlap(srv, &cli, sx0, sy0, sx1, sy1);
+}
+
 /*
- * The situation:
- *
- * dx<0:                             dx>0:  . (x,y)
- * dy<0:  +----------------+         dy>0:  +----------------+
- *        |     (x,y)      | dx             |     rect A     | dy
- *        |    .           +----+           +----+-----------+----+
- *        |                |    |           |    |                |
- *        |                |    |           |    |                |
- *        |                |    |           |    |                |
- *        |                | B  |           |  B |                |
- *        +----+-----------+----+           +----+                |
- *          dy |     rect A     |             dx |                |
- *             +----------------+                +----------------+
- *
- * So we redraw the rectangles:
- * A: (x, y) (x+width, y+dy) and
- * B: (x, y+dy) (x+dx, y+height)
+ * Redraw screen regions exposed when a client moves by (wdx, wdy) in
+ * world space.  `c` is still at the old position when this is called.
+ * dx/dy here are world-space deltas (not screen pixels).
  */
-void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy) {
+void redraw_region(struct ServerState* srv, struct Client c, int wdx, int wdy) {
 	if (!srv || !srv->framebuffer) {
 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
 		return;
 	}
 
-	uint32_t width = c.width;
-	uint32_t height = c.height;
-	uint32_t screen_w = srv->display_w;
-	uint32_t screen_h = srv->display_h;
+	/* Screen bounds of the old position */
+	int ox0, oy0, ox1, oy1;
+	client_screen_bounds(srv, &c, &ox0, &oy0, &ox1, &oy1);
 
-	/* Rectangle A: exposed area in y-direction (top or bottom strip of the old location) */
-	int rect_a_start_x = (int)c.x;
-	int rect_a_end_x = (int)c.x + (int)width;
-	int rect_a_start_y;
-	int rect_a_end_y;
-	if (dy > 0) {
-		rect_a_start_y = (int)c.y;
-		rect_a_end_y = (int)c.y + dy;
-	} else {
-		rect_a_start_y = (int)c.y + (int)height + dy;
-		rect_a_end_y = (int)c.y + (int)height;
-	}
+	/* Screen bounds of the new position */
+	struct Client moved = c;
+	moved.x = (uint32_t)((int)c.x + wdx);
+	moved.y = (uint32_t)((int)c.y + wdy);
+	int nx0, ny0, nx1, ny1;
+	client_screen_bounds(srv, &moved, &nx0, &ny0, &nx1, &ny1);
 
-	/* Rectangle B: exposed area in x-direction (left or right strip of the old location) */
-	int rect_b_start_x;
-	int rect_b_end_x;
-	if (dx > 0) {
-		rect_b_start_x = (int)c.x;
-		rect_b_end_x = (int)c.x + dx;
-	} else {
-		rect_b_start_x = (int)c.x + (int)width + dx;
-		rect_b_end_x = (int)c.x + (int)width;
-	}
+	/* Union of old and new (the moved window will be redrawn by draw()) */
+	int ux0 = ox0 < nx0 ? ox0 : nx0;
+	int uy0 = oy0 < ny0 ? oy0 : ny0;
+	int ux1 = ox1 > nx1 ? ox1 : nx1;
+	int uy1 = oy1 > ny1 ? oy1 : ny1;
 
-	int rect_b_start_y = (int)c.y;
-	int rect_b_end_y = (int)c.y + (int)height;
-	/* Avoid overdrawing the corner already covered by rect A (optional) */
-	if (dy > 0)
-		rect_b_start_y += dy;
-	if (dy < 0)
-		rect_b_end_y += dy;
+	if (ux0 < 0)
+		ux0 = 0;
+	if (uy0 < 0)
+		uy0 = 0;
+	if (ux1 > (int)srv->display_w)
+		ux1 = (int)srv->display_w;
+	if (uy1 > (int)srv->display_h)
+		uy1 = (int)srv->display_h;
 
-	/* Clip to screen boundaries */
-	if (rect_a_start_x < 0)
-		rect_a_start_x = 0;
-	if (rect_a_start_y < 0)
-		rect_a_start_y = 0;
-	if (rect_a_end_x > (int)screen_w)
-		rect_a_end_x = (int)screen_w;
-	if (rect_a_end_y > (int)screen_h)
-		rect_a_end_y = (int)screen_h;
-
-	if (rect_b_start_x < 0)
-		rect_b_start_x = 0;
-	if (rect_b_start_y < 0)
-		rect_b_start_y = 0;
-	if (rect_b_end_x > (int)screen_w)
-		rect_b_end_x = (int)screen_w;
-	if (rect_b_end_y > (int)screen_h)
-		rect_b_end_y = (int)screen_h;
-
-	/* Composite underlying clients (background -> ... -> topmost behind 'c') */
-	if (dy && rect_a_start_x < rect_a_end_x && rect_a_start_y < rect_a_end_y) {
-		composite_chain_to_rect(srv, c.next, rect_a_start_x, rect_a_start_y, rect_a_end_x, rect_a_end_y);
-	}
-	if (dx && rect_b_start_x < rect_b_end_x && rect_b_start_y < rect_b_end_y) {
-		composite_chain_to_rect(srv, c.next, rect_b_start_x, rect_b_start_y, rect_b_end_x, rect_b_end_y);
-	}
-}
-static void redraw_exposed_rect(struct ServerState* srv, const struct Client* resized_client,
-                                 int exposed_x, int exposed_y, int exposed_width, int exposed_height) {
-	if (exposed_width <= 0 || exposed_height <= 0) {
-		return; // Nothing to draw
-	}
-
-	/* Composite everything behind the resized client into the exposed rectangle.
-	 * Must be composed bottom->top to preserve correct stacking.
-	 */
-	composite_chain_to_rect(srv,
-	                        resized_client ? resized_client->next : NULL,
-	                        exposed_x,
-	                        exposed_y,
-	                        exposed_x + exposed_width,
-	                        exposed_y + exposed_height);
+	/* Fill the union with everything behind the moving client; caller
+	 * then draw()s the client on top at its new position. */
+	if (ux0 < ux1 && uy0 < uy1)
+		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
 }
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
@@ -878,29 +922,37 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
 		return;
 	}
 
-	// Calculate the client's old dimensions
-	int old_width = c.width - dx;
-	int old_height = c.height - dy;
+	/*
+	 * With an arbitrary zoom/pan transform it is simplest and correct to
+	 * recompose the screen bounds of the old (larger) and new sizes.
+	 * `c` already has the new size; old size = new - (dx,dy).
+	 */
+	struct Client old = c;
+	old.width = (uint32_t)((int)c.width - dx);
+	old.height = (uint32_t)((int)c.height - dy);
 
-	// Handle horizontal shrinkage (area on the right)
-	if (dx < 0) {
-		int exposed_x = c.x + c.width; // Start of the exposed area
-		int exposed_y = c.y;
-		int exposed_width = -dx;       // The amount it shrunk
-		int exposed_height = old_height; // This should be the old height
+	int ox0, oy0, ox1, oy1;
+	int nx0, ny0, nx1, ny1;
+	client_screen_bounds(srv, &old, &ox0, &oy0, &ox1, &oy1);
+	client_screen_bounds(srv, &c, &nx0, &ny0, &nx1, &ny1);
 
-		redraw_exposed_rect(srv, &c, exposed_x, exposed_y, exposed_width, exposed_height);
-	}
+	int ux0 = ox0 < nx0 ? ox0 : nx0;
+	int uy0 = oy0 < ny0 ? oy0 : ny0;
+	int ux1 = ox1 > nx1 ? ox1 : nx1;
+	int uy1 = oy1 > ny1 ? oy1 : ny1;
 
-	// Handle vertical shrinkage (area at the bottom)
-	if (dy < 0) {
-		int exposed_x = c.x;
-		int exposed_y = c.y + c.height; // Start of the exposed area
-		int exposed_width = old_width;   // This should be the old width
-		int exposed_height = -dy;       // The amount it shrunk
+	if (ux0 < 0)
+		ux0 = 0;
+	if (uy0 < 0)
+		uy0 = 0;
+	if (ux1 > (int)srv->display_w)
+		ux1 = (int)srv->display_w;
+	if (uy1 > (int)srv->display_h)
+		uy1 = (int)srv->display_h;
 
-		redraw_exposed_rect(srv, &c, exposed_x, exposed_y, exposed_width, exposed_height);
-	}
+	/* Everything behind the resized client into the union; draw() later. */
+	if (ux0 < ux1 && uy0 < uy1)
+		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
 }
 
 void release_display(void) {

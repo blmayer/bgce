@@ -31,6 +31,7 @@ Implement a minimal Linux graphical environment that runs without root, manages 
 ### High-evel features
 [X] Implement config file
 [X] Implement taking screenshots
+[X] Implement zoomable/pannable virtual desktop (4× area, zoom 50%–400%)
 [ ] Implement a cache file to memorize the last location of clients, in order to reopen them on the same place
 
 ### Protocol features
@@ -40,6 +41,15 @@ Implement a minimal Linux graphical environment that runs without root, manages 
 ### Internal stuff
 [ ] Create more tests
   - [ ] test if events go to the correct client and only the one
+
+### Zoom / pan controls
+- **Alt + scroll**: zoom in/out toward the cursor (range 0.5×–4.0×)
+- **Alt + left-drag on empty space**: pan the viewport over the virtual desktop
+- **Alt + left-drag on a client**: move window (existing)
+- **Alt + right-drag on a client**: resize window (existing)
+- Virtual desktop is 2× the physical resolution in each axis (4× area). Client
+  positions and buffer sizes are in world pixels; the compositor scales to the
+  screen using the current zoom and pan.
 
 
 ---

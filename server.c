@@ -126,19 +126,37 @@ int main(void) {
 	}
 	printf("[BGCE] Display initialised\n");
 
-	/* Add a background client */
+	/* Virtual desktop: WORLD_SCALE × physical display in each axis (4× area).
+	 * Zoom 1.0 = 100%; range [0.5, 4.0] so the full canvas fits when zoomed out. */
+	server.virtual_w = server.display_w * BGCE_WORLD_SCALE;
+	server.virtual_h = server.display_h * BGCE_WORLD_SCALE;
+	server.zoom = 1.0f;
+	server.pan_x = 0.0f;
+	server.pan_y = 0.0f;
+	printf("[BGCE] Virtual desktop %ux%u (%.0fx physical area), zoom=%.2f\n",
+	       server.virtual_w, server.virtual_h,
+	       (double)(BGCE_WORLD_SCALE * BGCE_WORLD_SCALE), server.zoom);
+
+	/* Background covers the entire virtual desktop */
 	struct Client background_client;
+	memset(&background_client, 0, sizeof(background_client));
 	background_client.x = 0;
 	background_client.y = 0;
-	background_client.z = 0; // Special case
-	background_client.width = server.display_w;
-	background_client.height = server.display_h;
-	background_client.buffer = malloc(server.display_w * server.display_h * 4);
+	background_client.z = 0; /* special: never focusable */
+	background_client.width = server.virtual_w;
+	background_client.height = server.virtual_h;
+	background_client.buffer = malloc((size_t)server.virtual_w * server.virtual_h * 4);
+	if (!background_client.buffer) {
+		perror("[BGCE] malloc background");
+		release_display();
+		return 1;
+	}
 	background_client.next = NULL;
+	background_client.fd = -1;
 	server.clients = &background_client;
 
-	// Apply background based on config
-	apply_background(&config, background_client.buffer, server.display_w, server.display_h);
+	apply_background(&config, background_client.buffer,
+	                 server.virtual_w, server.virtual_h);
 
 	puts("[BGCE] Drawing background");
 	draw(&server, background_client);
