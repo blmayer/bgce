@@ -2,7 +2,7 @@ CC ?= cc
 BACKEND ?= fbdev
 
 CFLAGS ?= -Wall -O1 -std=c99 -fPIC -g -I.
-LDFLAGS ?= -lrt -lm -lpthread
+LDFLAGS ?= -lm -lpthread
 
 ifeq ($(BACKEND),drm)
 CFLAGS += -DBGCE_USE_DRM -I/include/libdrm
@@ -21,10 +21,10 @@ bgce: $(SERVER_OBJS)
 	$(CC) $(CFLAGS) -o $@ server.o loop.o input.o display.o $(DISPLAY_OBJ) config.o -L. -lbgce $(LDFLAGS)
 
 libbgce.so: $(LIB_OBJS)
-	$(CC) -shared -o $@ $(LIB_OBJS) -lrt
+	$(CC) -shared -o $@ $(LIB_OBJS)
 
 client: client.c bgce.h
-	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce -lrt
+	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

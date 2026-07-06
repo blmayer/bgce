@@ -386,8 +386,10 @@ int display_cursor_init(void)
 	cursor_x = (int)server.display_w / 2;
 	cursor_y = (int)server.display_h / 2;
 	clamp_cursor_pos(&cursor_x, &cursor_y);
+	/* Not visible yet: first scene draw restores (no-op) then paints.
+	 * Painting here would capture a black/empty underlay and leave a
+	 * permanent black square on the first mouse move. */
 	cursor_visible = 0;
-	cursor_paint();
 	return 0;
 }
 
@@ -684,9 +686,11 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
 void redraw_all(struct ServerState* srv) {
 	if (!srv || !srv->framebuffer)
 		return;
+	/* Restore underlay before overwriting framebuffer pixels. */
+	cursor_restore();
 	composite_chain_to_rect(srv, srv->clients, 0, 0,
 	                        (int)srv->display_w, (int)srv->display_h);
-	display_cursor_refresh();
+	cursor_paint();
 }
 
 void draw(struct ServerState* srv, struct Client cli) {
@@ -710,8 +714,11 @@ void draw(struct ServerState* srv, struct Client cli) {
 	if (sx0 >= sx1 || sy0 >= sy1)
 		return;
 
+	/* Must restore before blit: otherwise underlay is stale and the next
+	 * cursor move leaves a black rectangle at the old position. */
+	cursor_restore();
 	blit_client_overlap(srv, &cli, sx0, sy0, sx1, sy1);
-	display_cursor_refresh();
+	cursor_paint();
 }
 
 /*
@@ -753,9 +760,10 @@ void redraw_region(struct ServerState* srv, struct Client c, int wdx, int wdy) {
 
 	/* Fill the union with everything behind the moving client; caller
 	 * then draw()s the client on top at its new position. */
+	cursor_restore();
 	if (ux0 < ux1 && uy0 < uy1)
 		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
-	display_cursor_refresh();
+	cursor_paint();
 }
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
@@ -793,9 +801,10 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
 		uy1 = (int)srv->display_h;
 
 	/* Everything behind the resized client into the union; draw() later. */
+	cursor_restore();
 	if (ux0 < ux1 && uy0 < uy1)
 		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
-	display_cursor_refresh();
+	cursor_paint();
 }
 
 int take_screenshot(const char* filename) {

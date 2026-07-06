@@ -139,8 +139,10 @@ struct config {
 	struct cursor_theme cursors;
 };
 
-// Parse config file
-int parse_config(struct config* config);
+// Load config file (~/.config/bgce.conf) and apply defaults
+int load_config(struct config* config);
+/** Log the full effective configuration (background, shortcuts, cursors). */
+void print_config(const struct config* config);
 int apply_background(struct config* config, uint32_t* buffer, uint32_t width, uint32_t height);
 
 /* ----------------------------

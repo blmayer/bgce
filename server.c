@@ -97,12 +97,12 @@ int main(void) {
 
 	char* home = getenv("HOME");
 	if (home) {
-		char user_config[512];
-		snprintf(user_config, sizeof(user_config), "%s/.config/bgce.conf", home);
-		parse_config(&config);
+		if (load_config(&config) != 0)
+			fprintf(stderr, "[BGCE] No config at ~/.config/bgce.conf; using defaults\n");
+	} else {
+		fprintf(stderr, "[BGCE] HOME unset; using default config\n");
 	}
-	printf("[BGCE] Loaded config type=%u, path=%s, mode=%u, shortcuts=%d\n",
-	       config.type, config.path, config.mode, config.shortcut_count);
+	print_config(&config);
 
 	if (!bgce_socket_path(listen_sock_path, sizeof(listen_sock_path))) {
 		fprintf(stderr, "[BGCE] socket path too long\n");

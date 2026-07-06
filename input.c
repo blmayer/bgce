@@ -58,39 +58,54 @@ extern struct ServerState server;
 extern struct config config;
 
 int resize_buffer(struct Client* c, int dx, int dy) {
-	// for resize we must reallocate the buffer
-	// Unmap and unlink old buffer
+	char old_name[64];
+	size_t buf_size;
+	int shm_fd;
+	void *map;
+	uint32_t new_w, new_h;
+
+	if (!c)
+		return 0;
+
+	new_w = (uint32_t)((int)c->width + dx);
+	new_h = (uint32_t)((int)c->height + dy);
+	if (new_w == 0 || new_h == 0)
+		return 0;
+
+	old_name[0] = '\0';
 	if (c->buffer) {
 		munmap(c->buffer, c->width * c->height * BGCE_BYTES_PER_PIXEL);
-		shm_unlink(c->shm_name);
+		c->buffer = NULL;
+		strncpy(old_name, c->shm_name, sizeof(old_name) - 1);
+		old_name[sizeof(old_name) - 1] = '\0';
 	}
 
-	// Create new shared memory name and object
-	snprintf(c->shm_name, sizeof(c->shm_name),
-	         "bgce_buf_%d_%ld", getpid(), time(NULL));
-	int shm_fd = shm_open(c->shm_name, O_CREAT | O_RDWR, 0600);
+	buf_size = (size_t)new_w * new_h * BGCE_BYTES_PER_PIXEL;
+	shm_fd = bgce_buf_create(c->shm_name, sizeof(c->shm_name), buf_size);
 	if (shm_fd < 0) {
-		perror("[BGCE] shm_open for resize");
+		perror("[BGCE] create buffer for resize");
+		if (old_name[0])
+			bgce_buf_unlink(old_name);
 		return 0;
 	}
 
-	size_t buf_size = (c->width + dx) * (c->height + dy) * BGCE_BYTES_PER_PIXEL;
-	if (ftruncate(shm_fd, buf_size) < 0) {
-		perror("[BGCE] ftruncate for resize");
-		close(shm_fd);
-		return 0;
-	}
-
-	c->buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-	if (c->buffer == MAP_FAILED) {
-		perror("[BGCE] mmap for resize");
-		close(shm_fd);
-		return 0;
-	}
-
-	c->width += dx;
-	c->height += dy;
+	map = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 	close(shm_fd);
+	if (map == MAP_FAILED) {
+		perror("[BGCE] mmap for resize");
+		bgce_buf_unlink(c->shm_name);
+		c->shm_name[0] = '\0';
+		if (old_name[0])
+			bgce_buf_unlink(old_name);
+		return 0;
+	}
+
+	if (old_name[0])
+		bgce_buf_unlink(old_name);
+
+	c->buffer = map;
+	c->width = new_w;
+	c->height = new_h;
 	printf("[BGCE] Client resized: %p size=%zu (%dx%d) name=%s\n",
 	       c->buffer,
 	       c->width * c->height * 4UL,

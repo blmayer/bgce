@@ -430,25 +430,31 @@ static void load_cursor_theme(const char* theme_dir, struct cursor_theme* theme)
 	}
 }
 
-// Parse config file
-int parse_config(struct config* config) {
+// Load config file
+int load_config(struct config* config) {
 	const char* home = getenv("HOME");
 	char user_config[512];
+	FILE* file = NULL;
+
+	// Initialize with defaults even if the file is missing
+	config->type = BG_COLOR;
+	config->color = 0xAAAAAAAA; // Default gray
+	config->mode = IMAGE_SCALED;
+	config->path[0] = '\0';
+	config->shortcut_count = 0;
+	memset(&config->cursors, 0, sizeof(config->cursors));
+
 	if (!home) {
+		set_default_shortcuts(config);
 		return -1;
 	}
 	snprintf(user_config, sizeof(user_config), "%s/.config/bgce.conf", home);
-	FILE* file = fopen(user_config, "r");
+	file = fopen(user_config, "r");
 	if (!file) {
 		perror("[BGCE] Open config file");
+		set_default_shortcuts(config);
 		return -1;
 	}
-
-	// Initialize with defaults
-	config->type = BG_COLOR;
-	config->color = 0xAAAAAAAA; // Default gray
-	config->shortcut_count = 0;
-	memset(&config->cursors, 0, sizeof(config->cursors));
 
 	char line[1024];
 	char current_section[256] = "";
@@ -535,6 +541,112 @@ int parse_config(struct config* config) {
 
 	fclose(file);
 	return 0;
+}
+
+static const char* key_code_name(uint16_t code)
+{
+	static char fallback[16];
+
+	if (code >= KEY_1 && code <= KEY_9) {
+		fallback[0] = (char)('1' + (code - KEY_1));
+		fallback[1] = '\0';
+		return fallback;
+	}
+	if (code == KEY_0)
+		return "0";
+
+	switch (code) {
+	case KEY_A: return "a"; case KEY_B: return "b"; case KEY_C: return "c";
+	case KEY_D: return "d"; case KEY_E: return "e"; case KEY_F: return "f";
+	case KEY_G: return "g"; case KEY_H: return "h"; case KEY_I: return "i";
+	case KEY_J: return "j"; case KEY_K: return "k"; case KEY_L: return "l";
+	case KEY_M: return "m"; case KEY_N: return "n"; case KEY_O: return "o";
+	case KEY_P: return "p"; case KEY_Q: return "q"; case KEY_R: return "r";
+	case KEY_S: return "s"; case KEY_T: return "t"; case KEY_U: return "u";
+	case KEY_V: return "v"; case KEY_W: return "w"; case KEY_X: return "x";
+	case KEY_Y: return "y"; case KEY_Z: return "z";
+	case KEY_F1: return "f1"; case KEY_F2: return "f2"; case KEY_F3: return "f3";
+	case KEY_F4: return "f4"; case KEY_F5: return "f5"; case KEY_F6: return "f6";
+	case KEY_F7: return "f7"; case KEY_F8: return "f8"; case KEY_F9: return "f9";
+	case KEY_F10: return "f10"; case KEY_F11: return "f11"; case KEY_F12: return "f12";
+	case KEY_ESC: return "esc";
+	case KEY_ENTER: return "enter";
+	case KEY_SPACE: return "space";
+	case KEY_TAB: return "tab";
+	case KEY_BACKSPACE: return "backspace";
+	case KEY_DELETE: return "delete";
+	case KEY_INSERT: return "insert";
+	case KEY_HOME: return "home";
+	case KEY_END: return "end";
+	case KEY_PAGEUP: return "pgup";
+	case KEY_PAGEDOWN: return "pgdn";
+	case KEY_UP: return "up";
+	case KEY_DOWN: return "down";
+	case KEY_LEFT: return "left";
+	case KEY_RIGHT: return "right";
+	case KEY_SYSRQ: return "sysrq";
+	default:
+		snprintf(fallback, sizeof(fallback), "key_%u", (unsigned)code);
+		return fallback;
+	}
+}
+
+void print_config(const struct config* config)
+{
+	int i;
+	int cursor_loaded = 0;
+
+	if (!config)
+		return;
+
+	printf("[BGCE] === loaded config ===\n");
+
+	if (config->type == BG_COLOR) {
+		printf("[BGCE] background: type=color color=#%08X\n", config->color);
+	} else {
+		printf("[BGCE] background: type=image path=%s mode=%s\n",
+		       config->path[0] ? config->path : "(none)",
+		       config->mode == IMAGE_TILED ? "tiled" : "scaled");
+	}
+
+	printf("[BGCE] shortcuts: %d\n", config->shortcut_count);
+	for (i = 0; i < config->shortcut_count; i++) {
+		const struct shortcut* sc = &config->shortcuts[i];
+		char combo[64];
+		int n = 0;
+
+		combo[0] = '\0';
+		if (sc->combo.ctrl)
+			n += snprintf(combo + n, sizeof(combo) - (size_t)n, "%sctrl",
+			              n ? "+" : "");
+		if (sc->combo.alt)
+			n += snprintf(combo + n, sizeof(combo) - (size_t)n, "%salt",
+			              n ? "+" : "");
+		if (sc->combo.shift)
+			n += snprintf(combo + n, sizeof(combo) - (size_t)n, "%sshift",
+			              n ? "+" : "");
+		if (sc->combo.key) {
+			n += snprintf(combo + n, sizeof(combo) - (size_t)n, "%s%s",
+			              n ? "+" : "", key_code_name(sc->combo.key));
+		}
+		if (!combo[0])
+			snprintf(combo, sizeof(combo), "(none)");
+
+		if (sc->type == SHORTCUT_BUILTIN)
+			printf("[BGCE]   %s = builtin:%s\n", combo, sc->value);
+		else if (sc->type == SHORTCUT_COMMAND)
+			printf("[BGCE]   %s = command:%s\n", combo, sc->value);
+		else
+			printf("[BGCE]   %s = (unknown type %d)\n", combo, (int)sc->type);
+	}
+
+	for (i = 0; i < BGCE_CURSOR_COUNT; i++) {
+		if (config->cursors.images[i])
+			cursor_loaded++;
+	}
+	printf("[BGCE] cursors: %d theme image(s) loaded (of %d types)\n",
+	       cursor_loaded, BGCE_CURSOR_COUNT);
+	printf("[BGCE] === end config ===\n");
 }
 
 // Apply background to a buffer

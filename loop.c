@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
 
 /* Externs from server.c */
@@ -72,36 +71,70 @@ void* client_thread(void* arg) {
 
 		case MSG_GET_BUFFER: {
 			struct BufferRequest req = msg.data.buffer_request;
+			struct BufferReply reply = {0};
+			size_t buf_size;
+			int shm_fd;
+			void *map;
+			char old_name[64];
+			int had_buffer;
+
 			printf(
 			        "[BGCE] Client requested buffer of size %dx%d\n",
 			        req.width,
 			        req.height);
 
-			snprintf(client->shm_name, sizeof(client->shm_name),
-			         "bgce_buf_%d_%ld", getpid(), time(NULL));
+			reply.status = -1;
+			msg.type = MSG_GET_BUFFER;
 
-			/* Unmap and unlink the existing buffer (resize path). */
-			int had_buffer = client->buffer != NULL;
+			if (req.width == 0 || req.height == 0) {
+				fprintf(stderr, "[BGCE] invalid buffer size %ux%u\n",
+				        req.width, req.height);
+				msg.data.buffer_reply = reply;
+				bgce_send_msg(client_fd, &msg);
+				break;
+			}
+
+			/* Unmap and remember old token before creating a new one. */
+			had_buffer = client->buffer != NULL;
+			old_name[0] = '\0';
 			if (had_buffer) {
 				printf("[BGCE] Client already has a buffer, unmapping.\n");
 				munmap(client->buffer, client->width * client->height * 4);
-				shm_unlink(client->shm_name);
+				client->buffer = NULL;
+				strncpy(old_name, client->shm_name, sizeof(old_name) - 1);
+				old_name[sizeof(old_name) - 1] = '\0';
 			}
 
-			int shm_fd = shm_open(client->shm_name, O_CREAT | O_RDWR, 0600);
+			buf_size = (size_t)req.width * req.height * 4;
+			shm_fd = bgce_buf_create(client->shm_name,
+			                         sizeof(client->shm_name), buf_size);
 			if (shm_fd < 0) {
-				perror("[BGCE] shm_open");
+				perror("[BGCE] create buffer");
+				if (old_name[0])
+					bgce_buf_unlink(old_name);
+				msg.data.buffer_reply = reply;
+				bgce_send_msg(client_fd, &msg);
 				break;
 			}
 
-			size_t buf_size = req.width * req.height * 4;
-			if (ftruncate(shm_fd, buf_size) < 0) {
-				perror("[BGCE] ftruncate");
-				close(shm_fd);
+			map = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			           shm_fd, 0);
+			close(shm_fd);
+			if (map == MAP_FAILED) {
+				perror("[BGCE] mmap buffer");
+				bgce_buf_unlink(client->shm_name);
+				client->shm_name[0] = '\0';
+				if (old_name[0])
+					bgce_buf_unlink(old_name);
+				msg.data.buffer_reply = reply;
+				bgce_send_msg(client_fd, &msg);
 				break;
 			}
 
-			client->buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+			if (old_name[0])
+				bgce_buf_unlink(old_name);
+
+			client->buffer = map;
 			client->width = req.width;
 			client->height = req.height;
 			/* First buffer only: place at the current viewport so the window
@@ -120,15 +153,15 @@ void* client_thread(void* arg) {
 				client->x = (uint32_t)wx;
 				client->y = (uint32_t)wy;
 			}
-			close(shm_fd);
 			printf("[BGCE] Client buffer: %p size=%zu (%dx%d) name=%s\n",
 			       client->buffer,
 			       client->width * client->height * 4UL,
 			       client->width, client->height,
 			       client->shm_name);
 
-			struct BufferReply reply = {0};
-			strncpy(reply.shm_name, client->shm_name, sizeof(reply.shm_name));
+			reply.status = 0;
+			strncpy(reply.shm_name, client->shm_name, sizeof(reply.shm_name) - 1);
+			reply.shm_name[sizeof(reply.shm_name) - 1] = '\0';
 			reply.width = req.width;
 			reply.height = req.height;
 			msg.data.buffer_reply = reply;
@@ -172,7 +205,9 @@ void* client_thread(void* arg) {
 
 	if (client->buffer) {
 		munmap(client->buffer, client->width * client->height * 4);
-		shm_unlink(client->shm_name);
+		client->buffer = NULL;
+		bgce_buf_unlink(client->shm_name);
+		client->shm_name[0] = '\0';
 	}
 
 	// Remove client from the linked list

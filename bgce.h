@@ -150,10 +150,18 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
 
 /**
  * Request a shared memory buffer from the server.
- * Fills in the reply structure with shm name and dimensions.
- * Returns 0 on success, -1 on failure.
+ * Returns a mapped buffer pointer on success, or NULL on failure.
  */
 void* bgce_get_buffer(int conn, const struct BufferRequest req);
+
+/**
+ * Shared pixel buffers (server creates, client maps by token in BufferReply.shm_name).
+ * File-backed under the user cache directory (mmap MAP_SHARED), never /dev/shm:
+ *   $XDG_CACHE_HOME/bgce/buf/<token>  or  $HOME/.cache/bgce/buf/<token>
+ */
+int bgce_buf_create(char *name, size_t namelen, size_t size);
+int bgce_buf_open(const char *name);
+void bgce_buf_unlink(const char *name);
 
 int bgce_move(int fd, int x, int y);
 
