@@ -15,9 +15,17 @@
  * and send draw commands.
  * ------------------------------------------------------------------ */
 
-#define SOCKET_PATH "/tmp/bgce.sock"
 #define BGCE_BYTES_PER_PIXEL 4
 #define MAX_INPUT_DEVICES 4
+/* sun_path capacity used by bgce_socket_path() */
+#define BGCE_SOCKPATH_MAX 108
+
+/**
+ * Fill buf with this user's server socket path:
+ *   $XDG_RUNTIME_DIR/bgce.sock  or  /tmp/bgce-<uid>.sock
+ * Returns buf, or NULL if buf is too small.
+ */
+char *bgce_socket_path(char *buf, size_t buflen);
 
 /* ----------------------------
  * Protocol Message Types
@@ -129,8 +137,8 @@ ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg);
 ssize_t bgce_recv_msg(int conn, struct BGCEMessage* msg);
 
 /**
- * Connect to a BGCE server socket.
- * Returns a file descriptor, or -1 on error.
+ * Connect to a BGCE server socket (see bgce_socket_path).
+ * Returns a file descriptor, or negative on error.
  */
 int bgce_connect(void);
 

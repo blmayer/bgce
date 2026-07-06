@@ -4,21 +4,9 @@
 #define _XOPEN_SOURCE 700
 #include "bgce.h"
 
-#if defined(__has_include)
-#  if __has_include(<libdrm/drm_mode.h>)
-#    include <libdrm/drm_mode.h>
-#  elif __has_include(<drm/drm_mode.h>)
-#    include <drm/drm_mode.h>
-#  else
-#    include <drm/drm_mode.h>
-#  endif
-#else
-#  include <drm/drm_mode.h>
-#endif
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/types.h>
-#include <xf86drmMode.h>
 
 #define MAX_PATH_LEN 512
 
@@ -62,12 +50,16 @@ struct InputState {
 
 struct ServerState {
 	int server_fd;
-	int drm_fd;
-	uint32_t crtc_id;
+	int display_fd;          /* /dev/fb* or /dev/dri/card* */
 	uint32_t display_w;
 	uint32_t display_h;
 	uint32_t display_bpp;
+	uint32_t display_pitch;  /* bytes per row */
+	size_t fb_size;
 	void* framebuffer;
+#ifdef BGCE_USE_DRM
+	uint32_t crtc_id;
+#endif
 
 	/* Virtual desktop / viewport (see BGCE_WORLD_SCALE) */
 	uint32_t virtual_w;
@@ -155,8 +147,8 @@ int apply_background(struct config* config, uint32_t* buffer, uint32_t width, ui
  * Cursor
  * ---------------------------- */
 
-#define CURSOR_WIDTH 64
-#define CURSOR_HEIGHT 64
+#define CURSOR_WIDTH 32
+#define CURSOR_HEIGHT 32
 #define CURSOR_HOTSPOT_X 0
 #define CURSOR_HOTSPOT_Y 0
 
@@ -171,7 +163,13 @@ int init_display();
 
 void release_display(void);
 
-void set_drm_cursor(struct ServerState* srv, int x, int y);
+void set_cursor_pos(struct ServerState* srv, int x, int y);
+
+int setup_vt_handling(void);
+void release_vt(void);
+int display_cursor_init(void);
+void display_cursor_fini(void);
+void display_cursor_refresh(void);
 
 void set_cursor_type(enum BGCECursorType type);
 

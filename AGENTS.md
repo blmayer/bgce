@@ -8,7 +8,7 @@ Implement a minimal Linux graphical environment that runs without root, manages 
 
 - **Language:** C
 - **Privilege Model:** Runs as user in `video` group; no `setuid` or `sudo` required.
-- **Display Backend:** Uses `/dev/fb0` (Linux framebuffer device) directly.
+- **Display Backend:** Uses `/dev/fb0` (Linux framebuffer device) directly. Optional `BACKEND=drm` uses libdrm/KMS.
 - **Architecture:**
   - `bgced`: server that manages framebuffers, input, and client communication.
   - `libbgce.so`: client library that handles IPC and buffer management.

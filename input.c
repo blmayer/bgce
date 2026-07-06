@@ -24,6 +24,11 @@ int alt_down = 0;
 int mouse_x;
 int mouse_y;
 
+/* Accumulate REL/ABS until EV_SYN so the software cursor is painted once
+ * per hardware report, not once per axis. */
+static int pointer_dirty;
+static int skip_cursor_paint; /* set when a redraw will repaint the cursor */
+
 size_t count;
 struct pollfd fds[MAX_INPUT_DEVICES];
 
@@ -150,8 +155,14 @@ static void apply_zoom_at_cursor(float factor) {
 int init_input(void) {
 	count = 0;
 	drag.active = 0;
-	mouse_x = server.display_w / 2;
-	mouse_y = server.display_h / 2;
+	mouse_x = (int)server.display_w / 2;
+	mouse_y = (int)server.display_h / 2;
+	if (mouse_x > (int)server.display_w - CURSOR_WIDTH)
+		mouse_x = (int)server.display_w - CURSOR_WIDTH;
+	if (mouse_y > (int)server.display_h - CURSOR_HEIGHT)
+		mouse_y = (int)server.display_h - CURSOR_HEIGHT;
+	if (mouse_x < 0) mouse_x = 0;
+	if (mouse_y < 0) mouse_y = 0;
 	memset(dev_info, 0, sizeof(dev_info));
 
 	printf("[BGCE] Input: scanning %s for devices (max %d slots)\n",
@@ -172,7 +183,7 @@ int init_input(void) {
 		char path[256 + 12];
 		snprintf(path, sizeof(path), "%s/%s", INPUT_DIR, ent->d_name);
 
-		int fd = open(path, O_RDONLY | O_NONBLOCK);
+		int fd = open(path, O_RDONLY | O_CLOEXEC);
 		if (fd < 0) {
 			fprintf(stderr, "[BGCE] Input: cannot open %s: %s%s\n",
 			        path, strerror(errno),
@@ -612,29 +623,27 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		mouse_y += dy;
 
 		// Clamp mouse coordinates to screen boundaries
-		if (mouse_x < 0)
-			mouse_x = 0;
-		if (mouse_y < 0)
-			mouse_y = 0;
-		if (mouse_x > (int)server.display_w)
-			mouse_x = (int)server.display_w;
-		if (mouse_y > (int)server.display_h)
-			mouse_y = (int)server.display_h;
+		{
+			int max_x = (int)server.display_w - CURSOR_WIDTH;
+			int max_y = (int)server.display_h - CURSOR_HEIGHT;
+			if (max_x < 0) max_x = 0;
+			if (max_y < 0) max_y = 0;
+			if (mouse_x < 0) mouse_x = 0;
+			if (mouse_y < 0) mouse_y = 0;
+			if (mouse_x > max_x) mouse_x = max_x;
+			if (mouse_y > max_y) mouse_y = max_y;
+		}
 
-		drmModeMoveCursor(
-		        server.drm_fd,
-		        server.crtc_id,
-		        mouse_x,
-		        mouse_y);
+		pointer_dirty = 1;
 
 		if (drag.active) {
 			switch (drag.type) {
 			case DRAG_PAN: {
-				/* Dragging the desktop: pan opposite to pointer motion */
 				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
 				server.pan_x -= (float)dx / z;
 				server.pan_y -= (float)dy / z;
 				clamp_viewport(&server);
+				skip_cursor_paint = 1;
 				redraw_all(&server);
 				break;
 			}
@@ -646,6 +655,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				screen_delta_to_world((float)dx, (float)dy,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
+					skip_cursor_paint = 1;
 					redraw_region(&server, *c, wdx, wdy);
 					c->x = (uint32_t)((int)c->x + wdx);
 					c->y = (uint32_t)((int)c->y + wdy);
@@ -664,6 +674,17 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			}
 			return 1;
 		}
+		return 0;
+	}
+
+	if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+		if (pointer_dirty) {
+			if (!skip_cursor_paint)
+				set_cursor_pos(&server, mouse_x, mouse_y);
+			pointer_dirty = 0;
+			skip_cursor_paint = 0;
+		}
+		return 0;
 	}
 
 	/* Absolute pointer events (touchpads, touchscreens, tablets) */
@@ -692,16 +713,18 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		}
 
 		/* Clamp */
-		if (mouse_x < 0) mouse_x = 0;
-		if (mouse_y < 0) mouse_y = 0;
-		if (mouse_x > (int)server.display_w) mouse_x = (int)server.display_w;
-		if (mouse_y > (int)server.display_h) mouse_y = (int)server.display_h;
+		{
+			int max_x = (int)server.display_w - CURSOR_WIDTH;
+			int max_y = (int)server.display_h - CURSOR_HEIGHT;
+			if (max_x < 0) max_x = 0;
+			if (max_y < 0) max_y = 0;
+			if (mouse_x < 0) mouse_x = 0;
+			if (mouse_y < 0) mouse_y = 0;
+			if (mouse_x > max_x) mouse_x = max_x;
+			if (mouse_y > max_y) mouse_y = max_y;
+		}
 
-		drmModeMoveCursor(
-		        server.drm_fd,
-		        server.crtc_id,
-		        mouse_x,
-		        mouse_y);
+		pointer_dirty = 1;
 
 		if (drag.active) {
 			int dx = mouse_x - old_x;
@@ -713,6 +736,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				server.pan_x -= (float)dx / z;
 				server.pan_y -= (float)dy / z;
 				clamp_viewport(&server);
+				skip_cursor_paint = 1;
 				redraw_all(&server);
 				break;
 			}
@@ -724,6 +748,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				screen_delta_to_world((float)dx, (float)dy,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
+					skip_cursor_paint = 1;
 					redraw_region(&server, *c, wdx, wdy);
 					c->x = (uint32_t)((int)c->x + wdx);
 					c->y = (uint32_t)((int)c->y + wdy);
@@ -793,14 +818,15 @@ void* input_loop(void* arg) {
 			if (n != sizeof(ev))
 				continue;
 
-			if (handle_input_event(ev, i))
+			if (handle_input_event(ev, (int)i))
 				continue;
 
 			if (!server.focused_client)
 				continue;
+			if (ev.type == EV_SYN)
+				continue;
 
 			struct Client c = *server.focused_client;
-
 			struct InputEvent e = {0};
 			e.type = ev.type;
 			e.device = server.input.devs[i];
@@ -823,8 +849,6 @@ void* input_loop(void* arg) {
 				         wy < (float)(c.y + c.height);
 				if (!in)
 					continue;
-
-				/* Client-local coordinates in buffer/world pixels */
 				e.x = (int32_t)(wx - (float)c.x);
 				e.y = (int32_t)(wy - (float)c.y);
 				break;
@@ -833,7 +857,6 @@ void* input_loop(void* arg) {
 				continue;
 			}
 
-			/* Send to focused client */
 			struct BGCEMessage msg;
 			msg.type = MSG_INPUT_EVENT;
 			msg.data.input_event = e;

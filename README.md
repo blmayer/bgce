@@ -52,7 +52,7 @@ I also posted a video on my blog:
 ### Goals
 
 - Minimal, understandable graphics stack in C
-- No external dependencies (no OpenGL, no X11, no Wayland)
+- No external dependencies by default (no OpenGL, X11, Wayland, or libdrm)
 - Educational reference for framebuffer-based compositing and IPC
 
 
@@ -72,7 +72,7 @@ I also posted a video on my blog:
 
 ### Privileges
 - BGCE must **run as a normal user** (no root, no setuid).
-- The user should be in the **video** group to access `/dev/dri/card1` (framebuffer device).
+- The user should be in the **video** group to access `/dev/fb0` (framebuffer device).
 
 
 ### Event Loop
@@ -87,14 +87,16 @@ On lin0 use `/bin/cc` and install into the flat root (`/bin`, `/lib`, `/include`
 ```bash
 git clone <repo-url>
 cd bgce
-make CC=cc CFLAGS='-Wall -O1 -std=c99 -fPIC -I/include/libdrm -I.' all client
+make CC=cc all client          # default: /dev/fb0, no libdrm
+# make CC=cc BACKEND=drm all   # optional DRM/KMS + libdrm
 make install
 ./bgce   # Start server
 # Go to a different tty
 ./client  # Start test client
 ```
 
-Needs userspace `libdrm` headers in `/include/libdrm` and `libdrm.so` in `/lib`.
+Default build needs only kernel headers (`linux/fb.h`) and `/dev/fb0`
+(DRM fbdev emulation is fine). `BACKEND=drm` needs libdrm.
 
 
 ## Configuration

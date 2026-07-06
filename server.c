@@ -24,8 +24,16 @@ static void ensure_dir(const char *path) {
 	mkdir(path, 0755);
 }
 
+static char listen_sock_path[BGCE_SOCKPATH_MAX];
+
 static void cleanup_and_exit(int sig) {
 	(void)sig;
+	if (listen_sock_path[0])
+		unlink(listen_sock_path);
+	if (server.server_fd >= 0) {
+		close(server.server_fd);
+		server.server_fd = -1;
+	}
 	release_display();
 	_exit(0);
 }
@@ -79,10 +87,13 @@ int main(void) {
 	signal(SIGTERM, cleanup_and_exit);
 
 	memset(&server, 0, sizeof(struct ServerState));
-	server.drm_fd = -1;
+	server.display_fd = -1;
+	server.server_fd = -1;
 	server.framebuffer = NULL;
-	server.crtc_id = 0;
+	server.display_pitch = 0;
+	server.fb_size = 0;
 	server.client_count = 0;
+	listen_sock_path[0] = '\0';
 
 	char* home = getenv("HOME");
 	if (home) {
@@ -93,6 +104,11 @@ int main(void) {
 	printf("[BGCE] Loaded config type=%u, path=%s, mode=%u, shortcuts=%d\n",
 	       config.type, config.path, config.mode, config.shortcut_count);
 
+	if (!bgce_socket_path(listen_sock_path, sizeof(listen_sock_path))) {
+		fprintf(stderr, "[BGCE] socket path too long\n");
+		return 1;
+	}
+
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
 		perror("[BGCE] socket");
@@ -102,17 +118,29 @@ int main(void) {
 	struct sockaddr_un addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
-	unlink(SOCKET_PATH);
+	memcpy(addr.sun_path, listen_sock_path, strlen(listen_sock_path) + 1);
 
-	if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-		perror("[BGCE] bind");
+	if (unlink(listen_sock_path) < 0 && errno != ENOENT) {
+		fprintf(stderr, "[BGCE] unlink %s: %s\n"
+		        "  (stale socket from another user? remove it as that user/root)\n",
+		        listen_sock_path, strerror(errno));
 		close(fd);
 		return 1;
 	}
 
+	if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+		fprintf(stderr, "[BGCE] bind %s: %s\n", listen_sock_path, strerror(errno));
+		if (errno == EADDRINUSE)
+			fprintf(stderr, "  another bgce is already running for this user "
+			        "(killall bgce && rm -f %s)\n", listen_sock_path);
+		close(fd);
+		return 1;
+	}
+	chmod(listen_sock_path, 0600);
+
 	if (listen(fd, 8) < 0) {
 		perror("[BGCE] listen");
+		unlink(listen_sock_path);
 		close(fd);
 		return 1;
 	}
@@ -175,7 +203,7 @@ int main(void) {
 	}
 	pthread_detach(input_thread);
 
-	printf("[BGCE] Server listening on %s\n", SOCKET_PATH);
+	printf("[BGCE] Server listening on %s\n", listen_sock_path);
 
 	while (1) {
 		int client_fd = accept(fd, NULL, NULL);
@@ -206,7 +234,5 @@ int main(void) {
 	}
 
 	release_display();
-	free(server.framebuffer);
-
 	return 0;
 }

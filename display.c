@@ -1,19 +1,6 @@
 /*
- * drm_dumb_cursor.c
- *
- * Minimal example showing how to:
- *  - initialize DRM
- *  - create dumb buffers (scanout + cursor)
- *  - use drmModeSetCrtc and drmModeSetCursor
- *
- * Build:
- *   gcc drm_dumb_cursor.c -o drm_dumb_cursor -ldrm
- *
- * Run (needs permissions to /dev/dri/cardX):
- *   sudo ./drm_dumb_cursor
- *
- * NOTE: This is example/demo code. Error handling tries to be good, but
- * real production code should be more thorough and handle more corner cases.
+ * display.c — compositing, software cursor, VT handling.
+ * Scanout setup lives in display_fbdev.c (default) or display_drm.c (BGCE_USE_DRM).
  */
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -22,7 +9,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kd.h>
-#include <linux/vt.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -32,30 +18,6 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#if defined(__has_include)
-#  if __has_include(<libdrm/drm.h>)
-#    include <libdrm/drm.h>
-#  elif __has_include(<drm/drm.h>)
-#    include <drm/drm.h>
-#  else
-#    include <drm/drm.h>
-#  endif
-#else
-#  include <drm/drm.h>
-#endif
-#if defined(__has_include)
-#  if __has_include(<libdrm/drm_mode.h>)
-#    include <libdrm/drm_mode.h>
-#  elif __has_include(<drm/drm_mode.h>)
-#    include <drm/drm_mode.h>
-#  else
-#    include <drm/drm_mode.h>
-#  endif
-#else
-#  include <drm/drm_mode.h>
-#endif
-#include <xf86drm.h>
-#include <xf86drmMode.h>
 #include <stb_image_write.h>
 
 extern struct ServerState server;
@@ -63,56 +25,16 @@ extern struct config config;
 
 static int vt_fd = -1;
 
-int drm_fd = -1;
-uint32_t conn_id = 0;
-uint32_t cur_fb = 0;
-uint32_t cur_handle;
-uint64_t cur_size;
-uint32_t cur_w = CURSOR_WIDTH;
-uint32_t cur_h = CURSOR_HEIGHT;
-void* cur_map;
-uint32_t scanout_handle;
-uint64_t scanout_size;
-drmModeConnector* connector = NULL;
-uint32_t fb_id = 0;
-drmModeRes* resources = NULL;
-drmModeEncoder* encoder = NULL;
-drmModeCrtc* saved_crtc = NULL;
+#if CURSOR_WIDTH != 32 || CURSOR_HEIGHT != 32
+#error "software cursor blit assumes CURSOR_WIDTH/HEIGHT == 32"
+#endif
 
-/* wrappers for ioctl structures (from drm_mode.h) */
-static int drm_create_dumb(int fd, uint32_t width, uint32_t height, uint32_t bpp,
-                           struct drm_mode_create_dumb* create) {
-	memset(create, 0, sizeof(*create));
-	create->width = width;
-	create->height = height;
-	create->bpp = bpp;
-	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, create) < 0) {
-		perror("[BGCE] DRM_IOCTL_MODE_CREATE_DUMB");
-		return -1;
-	}
-	return 0;
-}
-
-static int drm_map_dumb(int fd, uint32_t handle, uint64_t* offset) {
-	struct drm_mode_map_dumb map = {0};
-	map.handle = handle;
-	if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &map) < 0) {
-		perror("[BGCE] DRM_IOCTL_MODE_MAP_DUMB");
-		return -1;
-	}
-	*offset = map.offset;
-	return 0;
-}
-
-static int drm_destroy_dumb(int fd, uint32_t handle) {
-	struct drm_mode_destroy_dumb dest = {0};
-	dest.handle = handle;
-	if (ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dest) < 0) {
-		perror("[BGCE] DRM_IOCTL_MODE_DESTROY_DUMB");
-		return -1;
-	}
-	return 0;
-}
+/* Software cursor: fixed 32×32 glyph + underlay, row memcpy onto fbdev. */
+static uint32_t cur_img[32 * 32];
+static uint32_t cur_underlay[32 * 32];
+static int cursor_x;
+static int cursor_y;
+static int cursor_visible;
 
 static enum BGCECursorType current_cursor = BGCE_CURSOR_DEFAULT;
 
@@ -371,24 +293,166 @@ static void render_cursor(uint32_t* buf, uint32_t stride_px, uint32_t w, uint32_
 	}
 }
 
-void set_cursor_type(enum BGCECursorType type) {
+static void cursor_restore(void);
+static void cursor_paint(void);
+
+static uint32_t display_stride_px(const struct ServerState *srv)
+{
+	if (srv->display_pitch >= srv->display_w * 4)
+		return srv->display_pitch / 4;
+	return srv->display_w;
+}
+
+/* Branchless src-over; a==0 keeps dst, a==255 keeps src. */
+static inline uint32_t blend32(uint32_t s, uint32_t d)
+{
+	uint32_t a = s >> 24;
+	uint32_t na = 255u - a;
+	uint32_t sr = (s >> 16) & 255u, sg = (s >> 8) & 255u, sb = s & 255u;
+	uint32_t dr = (d >> 16) & 255u, dg = (d >> 8) & 255u, db = d & 255u;
+	return (255u << 24)
+		| (((sr * a + dr * na) / 255u) << 16)
+		| (((sg * a + dg * na) / 255u) << 8)
+		| ((sb * a + db * na) / 255u);
+}
+
+/*
+ * Blend a contiguous 32×32 block in place (1024 px). Unrolled — no row loop.
+ * sq holds underlay on entry, composited result on exit; src is the glyph.
+ */
+static void blend_sq32(uint32_t sq[32 * 32], const uint32_t src[32 * 32])
+{
+#define B(i) sq[i] = blend32(src[i], sq[i])
+#define BROW(o) \
+	B((o)+0);  B((o)+1);  B((o)+2);  B((o)+3);  \
+	B((o)+4);  B((o)+5);  B((o)+6);  B((o)+7);  \
+	B((o)+8);  B((o)+9);  B((o)+10); B((o)+11); \
+	B((o)+12); B((o)+13); B((o)+14); B((o)+15); \
+	B((o)+16); B((o)+17); B((o)+18); B((o)+19); \
+	B((o)+20); B((o)+21); B((o)+22); B((o)+23); \
+	B((o)+24); B((o)+25); B((o)+26); B((o)+27); \
+	B((o)+28); B((o)+29); B((o)+30); B((o)+31)
+	BROW(0);    BROW(32);   BROW(64);   BROW(96);
+	BROW(128);  BROW(160);  BROW(192);  BROW(224);
+	BROW(256);  BROW(288);  BROW(320);  BROW(352);
+	BROW(384);  BROW(416);  BROW(448);  BROW(480);
+	BROW(512);  BROW(544);  BROW(576);  BROW(608);
+	BROW(640);  BROW(672);  BROW(704);  BROW(736);
+	BROW(768);  BROW(800);  BROW(832);  BROW(864);
+	BROW(896);  BROW(928);  BROW(960);  BROW(992);
+#undef BROW
+#undef B
+}
+
+/* fb rows are pitch-separated; gather/scatter one 32×32 tile (unrolled memcpy). */
+static void fb_gather32(uint32_t sq[32 * 32], uint32_t *fb, uint32_t sp, int x, int y)
+{
+	size_t n = 32 * sizeof(uint32_t);
+#define G(r) memcpy(sq + (r) * 32, fb + (y + (r)) * (int)sp + x, n)
+	G(0);  G(1);  G(2);  G(3);  G(4);  G(5);  G(6);  G(7);
+	G(8);  G(9);  G(10); G(11); G(12); G(13); G(14); G(15);
+	G(16); G(17); G(18); G(19); G(20); G(21); G(22); G(23);
+	G(24); G(25); G(26); G(27); G(28); G(29); G(30); G(31);
+#undef G
+}
+
+static void fb_scatter32(uint32_t *fb, uint32_t sp, int x, int y,
+                         const uint32_t sq[32 * 32])
+{
+	size_t n = 32 * sizeof(uint32_t);
+#define S(r) memcpy(fb + (y + (r)) * (int)sp + x, sq + (r) * 32, n)
+	S(0);  S(1);  S(2);  S(3);  S(4);  S(5);  S(6);  S(7);
+	S(8);  S(9);  S(10); S(11); S(12); S(13); S(14); S(15);
+	S(16); S(17); S(18); S(19); S(20); S(21); S(22); S(23);
+	S(24); S(25); S(26); S(27); S(28); S(29); S(30); S(31);
+#undef S
+}
+
+static void clamp_cursor_pos(int *x, int *y)
+{
+	int max_x = (int)server.display_w - 32;
+	int max_y = (int)server.display_h - 32;
+	if (max_x < 0) max_x = 0;
+	if (max_y < 0) max_y = 0;
+	if (*x < 0) *x = 0;
+	if (*y < 0) *y = 0;
+	if (*x > max_x) *x = max_x;
+	if (*y > max_y) *y = max_y;
+}
+
+int display_cursor_init(void)
+{
+	render_cursor(cur_img, 32, 32, 32);
+	cursor_x = (int)server.display_w / 2;
+	cursor_y = (int)server.display_h / 2;
+	clamp_cursor_pos(&cursor_x, &cursor_y);
+	cursor_visible = 0;
+	cursor_paint();
+	return 0;
+}
+
+void display_cursor_fini(void)
+{
+	cursor_restore();
+	cursor_visible = 0;
+}
+
+static void cursor_restore(void)
+{
+	uint32_t sp;
+
+	if (!cursor_visible || !server.framebuffer)
+		return;
+	sp = display_stride_px(&server);
+	fb_scatter32(server.framebuffer, sp, cursor_x, cursor_y, cur_underlay);
+	cursor_visible = 0;
+}
+
+static void cursor_paint(void)
+{
+	uint32_t sp;
+	uint32_t block[32 * 32];
+
+	if (!server.framebuffer)
+		return;
+	sp = display_stride_px(&server);
+	fb_gather32(block, server.framebuffer, sp, cursor_x, cursor_y);
+	memcpy(cur_underlay, block, sizeof(block));
+	blend_sq32(block, cur_img);
+	fb_scatter32(server.framebuffer, sp, cursor_x, cursor_y, block);
+	cursor_visible = 1;
+}
+
+void display_cursor_refresh(void)
+{
+	cursor_restore();
+	cursor_paint();
+}
+
+void set_cursor_pos(struct ServerState *srv, int x, int y)
+{
+	(void)srv;
+	clamp_cursor_pos(&x, &y);
+	if (x == cursor_x && y == cursor_y && cursor_visible)
+		return;
+	cursor_restore();
+	cursor_x = x;
+	cursor_y = y;
+	cursor_paint();
+}
+
+void set_cursor_type(enum BGCECursorType type)
+{
 	if (type < 0 || type >= BGCE_CURSOR_COUNT)
 		type = BGCE_CURSOR_DEFAULT;
 	if (type == current_cursor)
 		return;
-
 	current_cursor = type;
-
-	/* cur_map is the mmap'd DRM dumb buffer for the cursor */
-	if (!cur_map || cur_map == MAP_FAILED)
-		return;
-
-	uint32_t stride_px = cur_w; /* pitch in pixels (32bpp, tightly packed) */
-	render_cursor((uint32_t*)cur_map, stride_px, cur_w, cur_h);
-
-	/* Re-upload cursor to hardware */
-	drmModeSetCursor(server.drm_fd, server.crtc_id, cur_handle, cur_w, cur_h);
+	cursor_restore();
+	render_cursor(cur_img, 32, 32, 32);
+	cursor_paint();
 }
+
 
 int setup_vt_handling(void) {
 	/* Try the current tty first, then fall back to /dev/tty0 */
@@ -415,7 +479,7 @@ int setup_vt_handling(void) {
 	return 0;
 }
 
-static void release_vt(void) {
+void release_vt(void) {
 	if (vt_fd < 0)
 		return;
 	if (ioctl(vt_fd, KDSETMODE, KD_TEXT) < 0)
@@ -425,231 +489,6 @@ static void release_vt(void) {
 		printf("[BGCE] VT: restored KD_TEXT mode\n");
 	close(vt_fd);
 	vt_fd = -1;
-}
-
-int init_display() {
-	uint32_t crtc_id = 0;
-	drmModeModeInfo chosen_mode;
-	bool found = false;
-
-	drm_fd = -1;
-	for (int card = 0; card < 10; card++) {
-		char path[64];
-		snprintf(path, sizeof(path), "/dev/dri/card%d", card);
-		drm_fd = open(path, O_RDWR | O_CLOEXEC);
-		if (drm_fd >= 0) {
-			break;
-		}
-	}
-	if (drm_fd < 0) {
-		perror("[BGCE] open drm device (tried /dev/dri/card0..9)");
-		return 1;
-	}
-	server.drm_fd = drm_fd;
-
-	setup_vt_handling();
-
-	resources = drmModeGetResources(drm_fd);
-	if (!resources) {
-		fprintf(stderr, "[BGCE] drmModeGetResources failed\n");
-		close(drm_fd);
-		return 1;
-	}
-
-	/* Find first connected connector with at least one mode */
-	for (int i = 0; i < resources->count_connectors; i++) {
-		connector = drmModeGetConnector(drm_fd, resources->connectors[i]);
-		if (!connector)
-			continue;
-		if (connector->connection == DRM_MODE_CONNECTED && connector->count_modes > 0) {
-			/* choose first mode */
-			chosen_mode = connector->modes[0];
-			conn_id = connector->connector_id;
-			found = true;
-			break;
-		}
-		drmModeFreeConnector(connector);
-		connector = NULL;
-	}
-
-	if (!found) {
-		fprintf(stderr, "[BGCE] No connected connector with modes found\n");
-		drmModeFreeResources(resources);
-		close(drm_fd);
-		return 1;
-	}
-
-	/* Try to find an encoder and CRTC */
-	if (connector->encoder_id)
-		encoder = drmModeGetEncoder(drm_fd, connector->encoder_id);
-
-	if (encoder && encoder->crtc_id) {
-		crtc_id = encoder->crtc_id;
-	} else {
-		/* fallback: choose any possible CRTC from resources */
-		for (int i = 0; i < resources->count_encoders; i++) {
-			drmModeEncoder* enc = drmModeGetEncoder(drm_fd, resources->encoders[i]);
-			if (!enc)
-				continue;
-			/* pick first crtc that exists */
-			for (int c = 0; c < resources->count_crtcs; c++) {
-				uint32_t possible = enc->possible_crtcs;
-				if (possible & (1 << c)) {
-					crtc_id = resources->crtcs[c];
-					break;
-				}
-			}
-			drmModeFreeEncoder(enc);
-			if (crtc_id)
-				break;
-		}
-	}
-
-	if (!crtc_id) {
-		fprintf(stderr, "[BGCE] Failed to find a suitable CRTC\n");
-		drmModeFreeConnector(connector);
-		drmModeFreeResources(resources);
-		close(drm_fd);
-		return 1;
-	}
-
-	/* Save current CRTC to restore later */
-	saved_crtc = drmModeGetCrtc(drm_fd, crtc_id);
-	if (!saved_crtc) {
-		fprintf(stderr, "[BGCE] drmModeGetCrtc failed\n");
-		/* continue anyway, but we'll try to restore nothing */
-	}
-
-	uint32_t width = chosen_mode.hdisplay;
-	uint32_t height = chosen_mode.vdisplay;
-	uint32_t bpp = 32; /* use 32bpp for scanout */
-	server.crtc_id = crtc_id;
-	server.display_w = chosen_mode.hdisplay;
-	server.display_h = chosen_mode.vdisplay;
-	server.display_bpp = bpp;
-
-	printf("[BGCE] Setting up connector %u, CRTC %u, mode %ux%u@%u\n",
-	       conn_id, crtc_id, width, height, chosen_mode.vrefresh);
-
-	/* ---------- Create dumb scanout buffer ---------- */
-	struct drm_mode_create_dumb create = {0};
-	if (drm_create_dumb(drm_fd, width, height, bpp, &create) < 0) {
-		fprintf(stderr, "[BGCE] Failed to create dumb buffer for scanout\n");
-		return -1;
-	}
-	scanout_handle = create.handle;
-	scanout_size = create.size;
-	uint32_t scanout_pitch = create.pitch;
-
-	/* allocate map */
-	uint64_t scanout_offset;
-	if (drm_map_dumb(drm_fd, scanout_handle, &scanout_offset) < 0) {
-		fprintf(stderr, "[BGCE] Failed to map dumb buffer for scanout\n");
-		return -1;
-	}
-
-	server.framebuffer = mmap(NULL, scanout_size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, scanout_offset);
-	if (server.framebuffer == MAP_FAILED) {
-		perror("[BGCE] mmap scanout");
-		return -1;
-	}
-
-	/* Clear/draw content */
-	memset(server.framebuffer, 0x00, scanout_size);
-
-	/* Create framebuffer object for scanout.
-	 * Prefer drmModeAddFB2 (for specifying pixel-format), fallback to drmModeAddFB.
-	 */
-	bool fb2_ok = false;
-#ifdef DRM_FORMAT_ARGB8888
-	/* try adb2 path */
-	{
-		uint32_t handles[4] = {scanout_handle, 0, 0, 0};
-		uint32_t pitches[4] = {scanout_pitch, 0, 0, 0};
-		uint32_t offsets[4] = {0, 0, 0, 0};
-		uint32_t format = DRM_FORMAT_XRGB8888; /* scanout content uses XRGB (no alpha) */
-		if (drmModeAddFB2(drm_fd, width, height, format, handles, pitches, offsets, &fb_id, 0) == 0) {
-			fb2_ok = true;
-		} else {
-			/* drmModeAddFB2 may fail on older drivers; we'll fallback */
-			fb2_ok = false;
-		}
-	}
-#endif
-
-	if (!fb2_ok) {
-		/* compute depth and bpp for legacy call */
-		uint32_t depth = 24;
-		if (drmModeAddFB(drm_fd, width, height, depth, bpp, scanout_pitch, scanout_handle, &fb_id) != 0) {
-			fprintf(stderr, "[BGCE] drmModeAddFB failed\n");
-			return -1;
-		}
-	}
-
-	/* ---------- Create dumb cursor buffer (small ARGB) ---------- */
-
-	struct drm_mode_create_dumb cur_create = {0};
-	if (drm_create_dumb(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, 32, &cur_create) < 0) {
-		fprintf(stderr, "[BGCE] Failed to create dumb buffer for cursor\n");
-		return -1;
-	}
-	cur_handle = cur_create.handle;
-	cur_size = cur_create.size;
-
-	uint64_t cur_offset;
-	uint32_t cur_pitch = cur_create.pitch;
-	if (drm_map_dumb(drm_fd, cur_handle, &cur_offset) < 0) {
-		fprintf(stderr, "[BGCE] Failed to map dumb cursor\n");
-		return -1;
-	}
-	cur_map = mmap(NULL, cur_size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, cur_offset);
-	if (cur_map == MAP_FAILED) {
-		perror("[BGCE] mmap cursor");
-		return -1;
-	}
-	memset(cur_map, 0, cur_size);
-
-	render_cursor((uint32_t*)cur_map, cur_w, CURSOR_WIDTH, CURSOR_HEIGHT);
-
-#ifdef DRM_FORMAT_ARGB8888
-	{
-		uint32_t handles[4] = {cur_handle, 0, 0, 0};
-		uint32_t pitches[4] = {cur_pitch, 0, 0, 0};
-		uint32_t offsets[4] = {0, 0, 0, 0};
-		uint32_t format = DRM_FORMAT_ARGB8888;
-		if (drmModeAddFB2(drm_fd, cur_w, cur_h, format, handles, pitches, offsets, &cur_fb, 0) != 0) {
-			fprintf(stderr, "[BGCE] drmModeAddFB2 for cursor failed, trying legacy\n");
-			cur_fb = 0;
-		}
-	}
-#endif
-	if (!cur_fb) {
-		/* Legacy fb creation for cursor might not support alpha; still try */
-		uint32_t depth = 24;
-		if (drmModeAddFB(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, depth, 32, cur_pitch, cur_handle, &cur_fb) != 0) {
-			fprintf(stderr, "[BGCE] drmModeAddFB for cursor failed\n");
-			return -1;
-		}
-	}
-
-	/* ---------- Set CRTC (scanout) ---------- */
-	if (drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &conn_id, 1, &chosen_mode) != 0) {
-		fprintf(stderr, "[BGCE] drmModeSetCrtc failed: %s\n", strerror(errno));
-		return -1;
-	}
-
-	/* ---------- Set cursor ---------- */
-	if (drmModeSetCursor(drm_fd, crtc_id, cur_handle, CURSOR_WIDTH, CURSOR_HEIGHT) != 0) {
-		fprintf(stderr, "[BGCE] drmModeSetCursor failed: %s\n", strerror(errno));
-		/* keep going — maybe hardware doesn't support cursor */
-	} else {
-		/* move cursor to near center */
-		if (drmModeMoveCursor(drm_fd, crtc_id, width / 2, height / 2) != 0) {
-			fprintf(stderr, "[BGCE] drmModeMoveCursor failed\n");
-		}
-	}
-
-	return 0;
 }
 
 /* ------------------------------------------------------------------
@@ -751,7 +590,7 @@ static void blit_client_overlap(struct ServerState* srv, const struct Client* cl
 	if (ox0 >= ox1 || oy0 >= oy1)
 		return;
 
-	uint32_t screen_w = srv->display_w;
+	uint32_t screen_w = display_stride_px(srv);
 	uint32_t* dst = (uint32_t*)srv->framebuffer;
 	uint32_t* src = (uint32_t*)cli->buffer;
 	const int cw = (int)cli->width;
@@ -847,6 +686,7 @@ void redraw_all(struct ServerState* srv) {
 		return;
 	composite_chain_to_rect(srv, srv->clients, 0, 0,
 	                        (int)srv->display_w, (int)srv->display_h);
+	display_cursor_refresh();
 }
 
 void draw(struct ServerState* srv, struct Client cli) {
@@ -871,6 +711,7 @@ void draw(struct ServerState* srv, struct Client cli) {
 		return;
 
 	blit_client_overlap(srv, &cli, sx0, sy0, sx1, sy1);
+	display_cursor_refresh();
 }
 
 /*
@@ -914,6 +755,7 @@ void redraw_region(struct ServerState* srv, struct Client c, int wdx, int wdy) {
 	 * then draw()s the client on top at its new position. */
 	if (ux0 < ux1 && uy0 < uy1)
 		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
+	display_cursor_refresh();
 }
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
@@ -953,50 +795,7 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
 	/* Everything behind the resized client into the union; draw() later. */
 	if (ux0 < ux1 && uy0 < uy1)
 		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
-}
-
-void release_display(void) {
-	/* Restore text mode first so the terminal is usable even if
-	 * the DRM teardown below hangs or crashes. */
-	release_vt();
-
-	if (cur_fb)
-		drmModeRmFB(drm_fd, cur_fb);
-
-	if (cur_map && cur_map != MAP_FAILED)
-		munmap(cur_map, cur_size);
-
-	if (cur_handle)
-		drm_destroy_dumb(drm_fd, cur_handle);
-
-	if (fb_id)
-		drmModeRmFB(drm_fd, fb_id);
-
-	if (server.framebuffer && server.framebuffer != MAP_FAILED)
-		munmap(server.framebuffer, scanout_size);
-
-	if (scanout_handle)
-		drm_destroy_dumb(drm_fd, scanout_handle);
-
-	/* restore saved CRTC if we have it */
-	if (saved_crtc) {
-		drmModeSetCrtc(drm_fd, saved_crtc->crtc_id,
-		               saved_crtc->buffer_id,
-		               saved_crtc->x, saved_crtc->y,
-		               &conn_id, 1,
-		               &saved_crtc->mode);
-		drmModeFreeCrtc(saved_crtc);
-	}
-
-	if (connector)
-		drmModeFreeConnector(connector);
-	if (resources)
-		drmModeFreeResources(resources);
-	if (encoder)
-		drmModeFreeEncoder(encoder);
-
-	close(drm_fd);
-	printf("[BGCE] Display released.\n");
+	display_cursor_refresh();
 }
 
 int take_screenshot(const char* filename) {
@@ -1007,16 +806,16 @@ int take_screenshot(const char* filename) {
 
 	uint32_t width = server.display_w;
 	uint32_t height = server.display_h;
-	uint32_t stride = width * BGCE_BYTES_PER_PIXEL;
+	uint32_t stride = server.display_pitch ? server.display_pitch
+	                                       : width * BGCE_BYTES_PER_PIXEL;
 
-	// Write the framebuffer to a PNG file
 	int result = stbi_write_png(
 		filename,
 		width,
 		height,
 		BGCE_BYTES_PER_PIXEL,
 		server.framebuffer,
-		stride
+		(int)stride
 	);
 
 	if (!result) {

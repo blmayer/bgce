@@ -10,6 +10,25 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+char *bgce_socket_path(char *buf, size_t buflen)
+{
+	const char *runtime;
+	int n;
+
+	if (!buf || buflen < 16)
+		return NULL;
+
+	runtime = getenv("XDG_RUNTIME_DIR");
+	if (runtime && runtime[0] == '/')
+		n = snprintf(buf, buflen, "%s/bgce.sock", runtime);
+	else
+		n = snprintf(buf, buflen, "/tmp/bgce-%ld.sock", (long)getuid());
+
+	if (n < 0 || (size_t)n >= buflen || (size_t)n >= BGCE_SOCKPATH_MAX)
+		return NULL;
+	return buf;
+}
+
 /* Write exactly 'size' bytes */
 ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg) {
 	size_t size = sizeof(struct BGCEMessage);
@@ -35,21 +54,28 @@ ssize_t bgce_recv_msg(int conn, struct BGCEMessage* msg) {
 
 /* Connect to the BGCE server */
 int bgce_connect(void) {
-	int bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	char path[BGCE_SOCKPATH_MAX];
+	int bgce_fd;
+	struct sockaddr_un addr;
+
+	if (!bgce_socket_path(path, sizeof(path))) {
+		fprintf(stderr, "[BGCE] socket path too long\n");
+		return -1;
+	}
+
+	bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (bgce_fd < 0) {
 		perror("[BGCE] socket");
 		return -1;
 	}
 
-	struct sockaddr_un addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+	memcpy(addr.sun_path, path, strlen(path) + 1);
 
 	if (connect(bgce_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-		perror("[BGCE] connect");
+		fprintf(stderr, "[BGCE] connect %s: %s\n", path, strerror(errno));
 		close(bgce_fd);
-		bgce_fd = -1;
 		return -2;
 	}
 	return bgce_fd;
