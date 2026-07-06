@@ -42,6 +42,22 @@ on the <a href=feed.xml>feed</a>.
 
 Here's a <a href=screenshot.png>screenshot</a>.
 
+
+<b>Download</b>
+
+Source snapshot (no git history):
+
+	<a href=bgce.tar.gz>bgce.tar.gz</a>
+
+	curl -fsSL -o bgce.tar.gz https://terminal.pink/bgce/bgce.tar.gz
+	tar xzf bgce.tar.gz
+	cd bgce
+
+Or clone the repository:
+
+	git clone https://terminal.pink/bgce
+	cd bgce
+
  
 <i>Goals</i>
 
@@ -53,8 +69,6 @@ Here's a <a href=screenshot.png>screenshot</a>.
 
 <b>Build Instructions</b>
 
-	git clone https://terminal.pink/bgce
-	cd bgce
 	make all client
 	./bgce   # run server
 	./client # run test client (in another TTY)

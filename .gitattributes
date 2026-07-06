@@ -1,0 +1,4 @@
+# Keep source snapshots out of themselves / reduce download size
+www/bgce.tar.gz export-ignore
+www/screenshot.png export-ignore
+.tai export-ignore

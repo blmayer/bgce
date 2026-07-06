@@ -80,13 +80,30 @@ I also posted a video on my blog:
 - Future versions will include multiple clients and input focus management.
 
 
+## Download
+
+A source snapshot is published with the project site:
+
+- **[bgce.tar.gz](https://terminal.pink/bgce/bgce.tar.gz)** — current tree (no git history)
+
+```bash
+curl -fsSL -o bgce.tar.gz https://terminal.pink/bgce/bgce.tar.gz
+tar xzf bgce.tar.gz
+cd bgce
+```
+
+Or clone the repository if you prefer full history:
+
+```bash
+git clone https://terminal.pink/bgce
+cd bgce
+```
+
 ## Build Instructions
 
 On lin0 use `/bin/cc` and install into the flat root (`/bin`, `/lib`, `/include` — no `/usr`):
 
 ```bash
-git clone <repo-url>
-cd bgce
 make CC=cc all client          # default: /dev/fb0, no libdrm
 # make CC=cc BACKEND=drm all   # optional DRM/KMS + libdrm
 make install
@@ -97,6 +114,14 @@ make install
 
 Default build needs only kernel headers (`linux/fb.h`) and `/dev/fb0`
 (DRM fbdev emulation is fine). `BACKEND=drm` needs libdrm.
+
+Regenerate the site snapshot after tagging a release (or anytime):
+
+```bash
+git archive --worktree-attributes --format=tar.gz --prefix=bgce/ -o www/bgce.tar.gz HEAD
+```
+
+(`www/bgce.tar.gz` and `www/screenshot.png` are omitted from the archive via `.gitattributes`.)
 
 
 ## Configuration
