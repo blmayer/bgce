@@ -5,6 +5,7 @@
 #include "bgce.h"
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -159,9 +160,22 @@ int apply_background(struct config* config, uint32_t* buffer, uint32_t width, ui
  * ---------------------------- */
 
 /**
+ * After setup_log_file(), stdout/stderr go to the log file only.
+ * Use this for fatal/startup errors that must also appear on the
+ * original terminal (e.g. cannot open /dev/fb0).
+ */
+void bgce_announce(const char *fmt, ...);
+
+/** Set by SIGINT handler; input thread delivers as Ctrl+C to focus. */
+extern volatile sig_atomic_t bgce_sigint_pending;
+
+/** Forward a synthetic Ctrl+C (KEY_LEFTCTRL + KEY_C) to the focused client. */
+void deliver_interrupt_to_focus(void);
+
+/**
  * Display
  */
-int init_display();
+int init_display(void);
 
 void release_display(void);
 

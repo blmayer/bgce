@@ -90,7 +90,13 @@ int init_display(void)
 			break;
 	}
 	if (drm_fd < 0) {
-		perror("[BGCE] open drm device (tried /dev/dri/card0..9)");
+		bgce_announce("[BGCE] open /dev/dri/card*: %s\n", strerror(errno));
+		if (errno == EACCES || errno == EPERM) {
+			bgce_announce(
+			        "[BGCE] no permission for the DRM device.\n"
+			        "[BGCE] add your user to the 'video' (and often 'render') group:\n"
+			        "[BGCE]   sudo usermod -aG video,render \"$USER\"\n");
+		}
 		return 1;
 	}
 	server.display_fd = drm_fd;

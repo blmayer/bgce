@@ -26,25 +26,55 @@ int init_display(void)
 	const char *used = NULL;
 	int i;
 
-	for (i = 0; paths[i]; i++) {
-		fd = open(paths[i], O_RDWR | O_CLOEXEC);
-		if (fd >= 0) {
-			used = paths[i];
-			break;
+	{
+		int saw_perm = 0;
+		int saw_missing = 0;
+
+		for (i = 0; paths[i]; i++) {
+			fd = open(paths[i], O_RDWR | O_CLOEXEC);
+			if (fd >= 0) {
+				used = paths[i];
+				break;
+			}
+			/* Must not fail silently: after setup_log_file, only the log
+			 * would see perror unless we also write the real console. */
+			bgce_announce("[BGCE] open %s: %s\n", paths[i], strerror(errno));
+			if (errno == EACCES || errno == EPERM)
+				saw_perm = 1;
+			else if (errno == ENOENT)
+				saw_missing = 1;
 		}
-	}
-	if (fd < 0) {
-		perror("[BGCE] open /dev/fb*");
-		return 1;
+		if (fd < 0) {
+			bgce_announce(
+			        "[BGCE] failed to open any of /dev/fb0, /dev/fb1, /dev/fb2\n");
+			if (saw_perm) {
+				bgce_announce(
+				        "[BGCE] no permission for the framebuffer device.\n"
+				        "[BGCE] add your user to the 'video' group, then re-login:\n"
+				        "[BGCE]   sudo usermod -aG video \"$USER\"\n"
+				        "[BGCE] and check: ls -l /dev/fb0\n");
+			} else if (saw_missing) {
+				bgce_announce(
+				        "[BGCE] no framebuffer device node found "
+				        "(is fbdev available on this system?)\n");
+			}
+			return 1;
+		}
 	}
 
 	struct fb_var_screeninfo vinfo;
 	struct fb_fix_screeninfo finfo;
 	memset(&vinfo, 0, sizeof(vinfo));
 	memset(&finfo, 0, sizeof(finfo));
-	if (ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) < 0 ||
-	    ioctl(fd, FBIOGET_FSCREENINFO, &finfo) < 0) {
-		perror("[BGCE] FBIOGET_*SCREENINFO");
+	if (ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) < 0) {
+		bgce_announce("[BGCE] FBIOGET_VSCREENINFO on %s: %s\n", used,
+		              strerror(errno));
+		close(fd);
+		return 1;
+	}
+	if (ioctl(fd, FBIOGET_FSCREENINFO, &finfo) < 0) {
+		bgce_announce("[BGCE] FBIOGET_FSCREENINFO on %s: %s\n", used,
+		              strerror(errno));
 		close(fd);
 		return 1;
 	}
@@ -56,7 +86,7 @@ int init_display(void)
 		vinfo.xoffset = 0;
 		vinfo.yoffset = 0;
 		if (ioctl(fd, FBIOPUT_VSCREENINFO, &vinfo) < 0) {
-			fprintf(stderr,
+			bgce_announce(
 			        "[BGCE] need 32bpp framebuffer (have %u): %s\n",
 			        saved_vinfo.bits_per_pixel, strerror(errno));
 			close(fd);
@@ -71,8 +101,8 @@ int init_display(void)
 	}
 
 	if (vinfo.bits_per_pixel != 32) {
-		fprintf(stderr, "[BGCE] unsupported bpp %u (want 32)\n",
-		        (unsigned)vinfo.bits_per_pixel);
+		bgce_announce("[BGCE] unsupported bpp %u (want 32)\n",
+		              (unsigned)vinfo.bits_per_pixel);
 		close(fd);
 		return 1;
 	}
@@ -84,7 +114,7 @@ int init_display(void)
 
 	void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (map == MAP_FAILED) {
-		perror("[BGCE] mmap /dev/fb");
+		bgce_announce("[BGCE] mmap %s: %s\n", used, strerror(errno));
 		close(fd);
 		return 1;
 	}
@@ -105,7 +135,7 @@ int init_display(void)
 	       server.display_pitch, server.display_bpp);
 
 	if (display_cursor_init() != 0) {
-		fprintf(stderr, "[BGCE] software cursor init failed\n");
+		bgce_announce("[BGCE] software cursor init failed\n");
 		release_display();
 		return 1;
 	}

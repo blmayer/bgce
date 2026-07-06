@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,16 @@
 struct ServerState server = {}; /* Global server state */
 struct config config = {};            /* Global config (background + shortcuts) */
 
+/* SIGINT (Ctrl+C on the controlling tty) — do not kill the server; the input
+ * thread turns this into key events for the focused client. */
+volatile sig_atomic_t bgce_sigint_pending = 0;
+
+static void on_sigint(int sig)
+{
+	(void)sig;
+	bgce_sigint_pending = 1;
+}
+
 static void ensure_dir(const char *path) {
 	struct stat st;
 	if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
@@ -28,6 +39,34 @@ static void ensure_dir(const char *path) {
 
 static char listen_sock_path[BGCE_SOCKPATH_MAX];
 static char log_file_path[512];
+/* Original stderr before log redirect — so permission errors are not silent. */
+static int console_fd = -1;
+
+void bgce_announce(const char *fmt, ...)
+{
+	va_list ap;
+	char buf[1024];
+	int n;
+
+	if (!fmt)
+		return;
+
+	va_start(ap, fmt);
+	n = vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return;
+	if (n >= (int)sizeof(buf))
+		n = (int)sizeof(buf) - 1;
+
+	/* Log file (stdout/stderr may already be redirected). */
+	fwrite(buf, 1, (size_t)n, stderr);
+	fflush(stderr);
+
+	/* Original terminal, if we still have it. */
+	if (console_fd >= 0)
+		(void)write(console_fd, buf, (size_t)n);
+}
 
 /* Read lines from a pipe and append them to the log with timestamps. */
 static void *log_timestamp_thread(void *arg)
@@ -108,8 +147,15 @@ static void setup_log_file(void) {
 
 	snprintf(log_file_path, sizeof(log_file_path), "%s/bgce.log", dir);
 
+	/* Keep the real terminal for fatal messages after redirect. */
+	if (console_fd < 0)
+		console_fd = dup(STDERR_FILENO);
+
 	/* Tell the user (on their original terminal) where logs are going */
-	dprintf(STDERR_FILENO, "[BGCE] Logging to %s\n", log_file_path);
+	if (console_fd >= 0)
+		dprintf(console_fd, "[BGCE] Logging to %s\n", log_file_path);
+	else
+		dprintf(STDERR_FILENO, "[BGCE] Logging to %s\n", log_file_path);
 
 	if (pipe(pipefd) < 0) {
 		/* Fall back to untimestamped direct log */
@@ -159,8 +205,9 @@ int main(void) {
 	/* A crashed client must not take down the server on the next write(). */
 	signal(SIGPIPE, SIG_IGN);
 
-	/* Ensure VT is restored on termination signals */
-	signal(SIGINT, cleanup_and_exit);
+	/* Ctrl+C on the tty must not kill the compositor — forward to focus. */
+	signal(SIGINT, on_sigint);
+	/* Real shutdown: kill/SIGTERM or configured exit shortcut (e.g. ctrl+alt+q) */
 	signal(SIGTERM, cleanup_and_exit);
 
 	memset(&server, 0, sizeof(struct ServerState));
@@ -225,7 +272,9 @@ int main(void) {
 	server.server_fd = fd;
 
 	if (init_display() != 0) {
-		fprintf(stderr, "[BGCE] display init failed\n");
+		bgce_announce("[BGCE] display init failed — cannot continue\n");
+		if (log_file_path[0])
+			bgce_announce("[BGCE] details are also in %s\n", log_file_path);
 		release_display();
 		return 1;
 	}
