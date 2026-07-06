@@ -167,6 +167,22 @@ static void apply_zoom_at_cursor(float factor) {
 	       server.zoom, server.pan_x, server.pan_y);
 }
 
+void client_disconnected(struct Client* c)
+{
+	if (!c)
+		return;
+	if (drag.active && drag.target == c) {
+		drag.active = 0;
+		drag.target = NULL;
+		drag.dx = 0;
+		drag.dy = 0;
+		drag.acc_x = 0;
+		drag.acc_y = 0;
+		set_cursor_type(BGCE_CURSOR_DEFAULT);
+		printf("[BGCE] Drag cancelled (client disconnected).\n");
+	}
+}
+
 int init_input(void) {
 	count = 0;
 	drag.active = 0;

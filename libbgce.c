@@ -194,7 +194,9 @@ ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg) {
 
 	ssize_t n = write(conn, msg, size);
 	if (n < 0) {
-		if (errno == EINTR)
+		/* EPIPE/ECONNRESET: peer gone — caller should drop the client.
+		 * With SIGPIPE ignored on the server, this is a normal path. */
+		if (errno != EPIPE && errno != ECONNRESET && errno != EINTR)
 			perror("[BGCE] write");
 		return -1;
 	}

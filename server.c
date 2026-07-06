@@ -5,12 +5,14 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 struct ServerState server = {}; /* Global server state */
@@ -25,6 +27,50 @@ static void ensure_dir(const char *path) {
 }
 
 static char listen_sock_path[BGCE_SOCKPATH_MAX];
+static char log_file_path[512];
+
+/* Read lines from a pipe and append them to the log with timestamps. */
+static void *log_timestamp_thread(void *arg)
+{
+	int rfd = (int)(intptr_t)arg;
+	int out_fd;
+	FILE *in;
+	char line[8192];
+
+	out_fd = open(log_file_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+	if (out_fd < 0) {
+		close(rfd);
+		return NULL;
+	}
+
+	in = fdopen(rfd, "r");
+	if (!in) {
+		close(rfd);
+		close(out_fd);
+		return NULL;
+	}
+
+	/* Line-buffered so multi-thread printf interleaving is less chaotic */
+	while (fgets(line, sizeof(line), in)) {
+		struct timespec ts;
+		struct tm tm;
+		char stamp[40];
+
+		if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+			ts.tv_sec = time(NULL), ts.tv_nsec = 0;
+		if (!localtime_r(&ts.tv_sec, &tm)) {
+			dprintf(out_fd, "%s", line);
+			continue;
+		}
+		/* ISO-like local time with milliseconds */
+		strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
+		dprintf(out_fd, "%s.%03ld %s", stamp, ts.tv_nsec / 1000000L, line);
+	}
+
+	fclose(in); /* closes rfd */
+	close(out_fd);
+	return NULL;
+}
 
 static void cleanup_and_exit(int sig) {
 	(void)sig;
@@ -42,6 +88,9 @@ static void setup_log_file(void) {
 	const char *xdg = getenv("XDG_CACHE_HOME");
 	const char *home = getenv("HOME");
 	char dir[512];
+	int pipefd[2];
+	pthread_t tid;
+	pthread_attr_t attr;
 
 	if (xdg && xdg[0]) {
 		snprintf(dir, sizeof(dir), "%s/bgce", xdg);
@@ -57,30 +106,58 @@ static void setup_log_file(void) {
 		return;
 	}
 
-	char log_path[512];
-	snprintf(log_path, sizeof(log_path), "%s/bgce.log", dir);
-
-	int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
-	if (fd < 0)
-		return;
+	snprintf(log_file_path, sizeof(log_file_path), "%s/bgce.log", dir);
 
 	/* Tell the user (on their original terminal) where logs are going */
-	dprintf(STDERR_FILENO, "[BGCE] Logging to %s\n", log_path);
+	dprintf(STDERR_FILENO, "[BGCE] Logging to %s\n", log_file_path);
 
-	/* Redirect all future stdout/stderr output into the log file */
-	dup2(fd, STDOUT_FILENO);
-	dup2(fd, STDERR_FILENO);
-	close(fd);
+	if (pipe(pipefd) < 0) {
+		/* Fall back to untimestamped direct log */
+		int fd = open(log_file_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+		if (fd >= 0) {
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+			close(fd);
+		}
+		return;
+	}
+
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	if (pthread_create(&tid, &attr, log_timestamp_thread,
+	                   (void *)(intptr_t)pipefd[0]) != 0) {
+		pthread_attr_destroy(&attr);
+		close(pipefd[0]);
+		close(pipefd[1]);
+		int fd = open(log_file_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+		if (fd >= 0) {
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+			close(fd);
+		}
+		return;
+	}
+	pthread_attr_destroy(&attr);
+
+	/* All server printf/fprintf go through the pipe → timestamped log */
+	dup2(pipefd[1], STDOUT_FILENO);
+	dup2(pipefd[1], STDERR_FILENO);
+	close(pipefd[1]);
+	/* pipefd[0] is owned by the log thread */
 }
 
 int main(void) {
 	setup_log_file();
 
-	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
-	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
+	/* Line-buffered so each log line is timestamped as a unit */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	setvbuf(stderr, NULL, _IOLBF, 0);
 
 	/* Auto-reap child processes so command shortcuts don't leave zombies */
 	signal(SIGCHLD, SIG_IGN);
+
+	/* A crashed client must not take down the server on the next write(). */
+	signal(SIGPIPE, SIG_IGN);
 
 	/* Ensure VT is restored on termination signals */
 	signal(SIGINT, cleanup_and_exit);

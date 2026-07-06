@@ -209,6 +209,9 @@ int init_input(void);
 
 void* input_loop(void* arg);
 
+/** Drop any drag targeting this client (call before freeing it). */
+void client_disconnected(struct Client* c);
+
 /*
  * Client related stuff
  * from loop.c mainly

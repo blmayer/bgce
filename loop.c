@@ -27,6 +27,14 @@ void* client_thread(void* arg) {
 
 	client->fd = client_fd;
 
+	/* Background client is always first; keep the list non-empty. */
+	if (!server.clients) {
+		fprintf(stderr, "[BGCE] no client list (missing background); dropping connection\n");
+		close(client_fd);
+		free(client);
+		return NULL;
+	}
+
 	// Add client to the linked list
 	client->next = server.clients;
 	client->z = server.clients->z + 1;
@@ -48,6 +56,7 @@ void* client_thread(void* arg) {
 		struct BGCEMessage msg;
 		ssize_t rc = bgce_recv_msg(client_fd, &msg);
 		if (rc <= 0) {
+			/* Crash, exit, or clean close — never tear down the server. */
 			printf("[BGCE] Client disconnected (fd=%d)\n", client_fd);
 			break;
 		}
@@ -203,6 +212,9 @@ void* client_thread(void* arg) {
 		}
 	}
 
+	/* Stop any in-progress drag that targets this client (UAF otherwise). */
+	client_disconnected(client);
+
 	if (client->buffer) {
 		munmap(client->buffer, client->width * client->height * 4);
 		client->buffer = NULL;
@@ -210,7 +222,7 @@ void* client_thread(void* arg) {
 		client->shm_name[0] = '\0';
 	}
 
-	// Remove client from the linked list
+	// Remove client from the linked list (never drop the background client)
 	struct Client* prev = NULL;
 	struct Client* curr = server.clients;
 	while (curr) {
@@ -218,6 +230,7 @@ void* client_thread(void* arg) {
 			if (prev) {
 				prev->next = curr->next;
 			} else {
+				/* Head is a real client; next should be background or another. */
 				server.clients = curr->next;
 			}
 			break;
@@ -227,16 +240,17 @@ void* client_thread(void* arg) {
 	}
 
 	if (server.focused_client == client) {
-		/* notify focused client it lost focus before we clear */
-		struct BGCEMessage lost = {0};
-		lost.type = MSG_FOCUS_CHANGE;
-		lost.data.focus_event.state = 0;
-		bgce_send_msg(client->fd, &lost);
+		/* Socket is already dead — do not write a focus-lost message. */
 		server.focused_client = NULL;
 	}
-	close(client->fd);
 
-	printf("[BGCE] Thread exiting for client fd=%d\n", client->fd);
+	close(client_fd);
+	client->fd = -1;
+
+	/* Erase the window from the display; safe with only the background left. */
+	redraw_all(&server);
+
+	printf("[BGCE] Client thread finished (fd=%d); server still running\n", client_fd);
 	free(client);
 	return NULL;
 }
