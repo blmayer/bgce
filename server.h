@@ -172,6 +172,9 @@ extern volatile sig_atomic_t bgce_sigint_pending;
 /** Forward a synthetic Ctrl+C (KEY_LEFTCTRL + KEY_C) to the focused client. */
 void deliver_interrupt_to_focus(void);
 
+/** Clean shutdown (restore VT, unlink socket). Safe from the input thread. */
+void bgce_request_shutdown(void);
+
 /**
  * Display
  */

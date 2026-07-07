@@ -1,7 +1,10 @@
 CC ?= cc
 BACKEND ?= fbdev
 
-CFLAGS ?= -Wall -O1 -std=c99 -fPIC -g -I.
+# No default -g: some small linkers reject STABS (.rela.stab) and fail with
+# "Invalid relocation entry ... .rela.stab". For local debugging:
+#   make CFLAGS='-Wall -O1 -std=c99 -fPIC -gdwarf-4 -I.'
+CFLAGS ?= -Wall -O1 -std=c99 -fPIC -I.
 LDFLAGS ?= -lm -lpthread
 
 ifeq ($(BACKEND),drm)

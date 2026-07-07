@@ -123,6 +123,14 @@ static void cleanup_and_exit(int sig) {
 	_exit(0);
 }
 
+void bgce_request_shutdown(void)
+{
+	/* Prefer the real console — avoid printf/stderr (log pipe can block). */
+	if (console_fd >= 0)
+		dprintf(console_fd, "[BGCE] shutting down\n");
+	cleanup_and_exit(SIGTERM);
+}
+
 static void setup_log_file(void) {
 	const char *xdg = getenv("XDG_CACHE_HOME");
 	const char *home = getenv("HOME");

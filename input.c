@@ -21,6 +21,7 @@
 
 int ctrl_down = 0;
 int alt_down = 0;
+int shift_down = 0;
 int mouse_x;
 int mouse_y;
 
@@ -409,17 +410,26 @@ int init_input(void) {
 
 /*
  * Check if current modifier+key state matches a configured shortcut.
- * Returns pointer to the matching shortcut, or NULL.
+ * Required modifiers on the binding must be held; bare keys (no mods in the
+ * binding) only match when no mods are held.
  */
 static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t key) {
 	for (int i = 0; i < config.shortcut_count; i++) {
 		struct shortcut* sc = &config.shortcuts[i];
-		if (sc->combo.ctrl == ctrl &&
-		    sc->combo.alt == alt &&
-		    sc->combo.shift == shift &&
-		    sc->combo.key == key) {
-			return sc;
-		}
+		int bare;
+
+		if (sc->combo.key != key)
+			continue;
+		if (sc->combo.ctrl && !ctrl)
+			continue;
+		if (sc->combo.alt && !alt)
+			continue;
+		if (sc->combo.shift && !shift)
+			continue;
+		bare = !sc->combo.ctrl && !sc->combo.alt && !sc->combo.shift;
+		if (bare && (ctrl || alt || shift))
+			continue;
+		return sc;
 	}
 	return NULL;
 }
@@ -435,36 +445,45 @@ static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t ke
  *  Returns if shortcut was handled
  */
 static int handle_input_event(struct input_event ev, size_t dev_idx) {
-	if (ev.type == EV_KEY && ev.value == 1) { // Key press
-		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
-			printf("[BGCE] Ctrl pressed.\n");
-			ctrl_down = 1;
-		}
-		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
-			printf("[BGCE] Alt pressed.\n");
-			alt_down = 1;
-		}
+	(void)dev_idx;
 
-		// Check configured keyboard shortcuts (key press)
-		struct shortcut *sc = match_shortcut(ctrl_down, alt_down, 0, ev.code);
+	if (ev.type == EV_KEY && (ev.value == 1 || ev.value == 2)) {
+		/* value 1 = press, 2 = autorepeat — update mod state on both */
+		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL)
+			ctrl_down = 1;
+		else if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT)
+			alt_down = 1;
+		else if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT)
+			shift_down = 1;
+
+		/* Only fire shortcuts on the non-modifier key of the chord. */
+		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL ||
+		    ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT ||
+		    ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT)
+			return 0;
+
+		/* Press only (not autorepeat) for actions */
+		if (ev.value != 1)
+			return 0;
+
+		struct shortcut *sc =
+		        match_shortcut(ctrl_down, alt_down, shift_down, ev.code);
 		if (sc) {
 			if (sc->type == SHORTCUT_BUILTIN) {
 				if (strcmp(sc->value, "exit") == 0) {
-					printf("[BGCE] Exit shortcut triggered, exiting.\n");
-					exit(1);
+					/* Do not printf here: a full log pipe can block
+					 * forever so exit() never runs. */
+					bgce_request_shutdown();
+					return 1; /* not reached */
 				} else if (strcmp(sc->value, "screenshot") == 0) {
-					printf("[BGCE] Screenshot shortcut triggered.\n");
-					if (server.focused_client) {
+					if (server.focused_client)
 						return 0;
-					}
 					take_screenshot("screenshot.png");
 					return 1;
 				}
 			} else if (sc->type == SHORTCUT_COMMAND) {
-				printf("[BGCE] Command shortcut triggered: %s\n", sc->value);
 				pid_t pid = fork();
 				if (pid == 0) {
-					/* child: run command via shell, do not block server */
 					execl("/bin/sh", "sh", "-c", sc->value, (char *)NULL);
 					_exit(127);
 				} else if (pid < 0) {
@@ -476,14 +495,12 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 	}
 
 	if (ev.type == EV_KEY && ev.value == 0) { // Key release
-		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
-			printf("[BGCE] Ctrl released.\n");
+		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL)
 			ctrl_down = 0;
-		}
-		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
-			printf("[BGCE] Alt released.\n");
+		else if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT)
 			alt_down = 0;
-		}
+		else if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT)
+			shift_down = 0;
 
 		// Stop drag/move/pan on button release
 		if ((ev.code == BTN_LEFT || ev.code == BTN_RIGHT) && drag.active) {
