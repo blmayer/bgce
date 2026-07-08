@@ -209,6 +209,10 @@ void display_cursor_refresh(void);
 
 void set_cursor_type(enum BGCECursorType type);
 
+/**
+ * Client content changed (MSG_DRAW): recompose the stacking order into
+ * this client's screen rect only.  Does not raise the client.
+ */
 void draw(struct ServerState* srv, struct Client cli);
 
 /**
@@ -222,6 +226,13 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
 
 /** Full-scene recomposite (used after zoom and other full invalidations). */
 void redraw_all(struct ServerState* srv);
+
+/**
+ * After a client is removed from the list: repaint only its former screen
+ * footprint from the remaining stack (background + windows that were under
+ * or overlapped that rect).  Does not touch the rest of the desktop.
+ */
+void erase_client(struct ServerState* srv, const struct Client* gone);
 
 /**
  * Pan: shift pixels already on the framebuffer and only composite the

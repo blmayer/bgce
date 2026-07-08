@@ -1024,6 +1024,22 @@ void redraw_all(struct ServerState* srv) {
 	cursor_paint();
 }
 
+void erase_client(struct ServerState* srv, const struct Client* gone) {
+	int sx0, sy0, sx1, sy1;
+
+	if (!srv || !srv->framebuffer || !gone)
+		return;
+
+	client_screen_bounds(srv, gone, &sx0, &sy0, &sx1, &sy1);
+	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1))
+		return;
+
+	cursor_restore();
+	/* Remaining clients only (caller already unlinked `gone`). */
+	composite_chain_to_rect(srv, srv->clients, sx0, sy0, sx1, sy1);
+	cursor_paint();
+}
+
 /*
  * Shift framebuffer pixels by (sdx, sdy) screen pixels.
  * Positive sdx/sdy move content right/down.
@@ -1125,30 +1141,25 @@ void redraw_pan(struct ServerState *srv, float old_pan_x, float old_pan_y)
 }
 
 void draw(struct ServerState* srv, struct Client cli) {
+	int sx0, sy0, sx1, sy1;
+
 	if (!srv || !srv->framebuffer || !cli.buffer) {
 		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
 		return;
 	}
 
-	int sx0, sy0, sx1, sy1;
+	/*
+	 * Recompose the stack into this client's screen footprint only.
+	 * Blitting only `cli` would paint it on top of everyone (raise on
+	 * every MSG_DRAW).  Windows above it stay above; others outside
+	 * the rect are untouched.
+	 */
 	client_screen_bounds(srv, &cli, &sx0, &sy0, &sx1, &sy1);
-
-	if (sx0 < 0)
-		sx0 = 0;
-	if (sy0 < 0)
-		sy0 = 0;
-	if (sx1 > (int)srv->display_w)
-		sx1 = (int)srv->display_w;
-	if (sy1 > (int)srv->display_h)
-		sy1 = (int)srv->display_h;
-
-	if (sx0 >= sx1 || sy0 >= sy1)
+	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1))
 		return;
 
-	/* Must restore before blit: otherwise underlay is stale and the next
-	 * cursor move leaves a black rectangle at the old position. */
 	cursor_restore();
-	blit_client_overlap(srv, &cli, sx0, sy0, sx1, sy1);
+	composite_chain_to_rect(srv, srv->clients, sx0, sy0, sx1, sy1);
 	cursor_paint();
 }
 

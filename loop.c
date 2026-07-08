@@ -274,8 +274,12 @@ void* client_thread(void* arg) {
 	close(client_fd);
 	client->fd = -1;
 
-	/* Erase the window from the display; safe with only the background left. */
-	redraw_all(&server);
+	/*
+	 * Only repaint the closed window's screen rect from whatever is still
+	 * in the stack (background + windows that sat under / overlapped it).
+	 * Other on-screen clients outside that rect are left alone.
+	 */
+	erase_client(&server, client);
 
 	printf("[BGCE] Client thread finished (fd=%d); server still running\n", client_fd);
 	free(client);
