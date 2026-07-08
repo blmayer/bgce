@@ -52,14 +52,11 @@ int main(void) {
 	}
 
 	struct BufferRequest req = {.width = (uint32_t)w, .height = (uint32_t)h};
-	buf = bgce_get_buffer(conn, &req);
+	buf = bgce_get_buffer(conn, req);
 	if (!buf) {
 		fprintf(stderr, "[BGCE] Failed to get buffer\n");
 		return 3;
 	}
-	/* Server may scale logical size by current zoom → use actual dims. */
-	w = (int)req.width;
-	h = (int)req.height;
 	printf("Client got buffer at: %p (%dx%d)\n", buf, w, h);
 
 	printf("[BGCE] Drawing gradient...\n");
