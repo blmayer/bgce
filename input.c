@@ -148,13 +148,19 @@ struct Client* pick_client(int x, int y) {
 	return (picked && picked->z > 0) ? picked : NULL; /* skip background */
 }
 
-/* Convert a screen-pixel delta to an integer world-pixel delta, with
- * fractional accumulation so slow drags still move at high zoom. */
-static void screen_delta_to_world(float sdx, float sdy, float* acc_x, float* acc_y,
+/*
+ * Screen-pixel mouse delta → integer world delta.
+ *   world += mouse * speed / zoom
+ * so on-screen motion ≈ mouse * speed at any zoom (relative speed constant).
+ * Fractional remainder is accumulated for smooth slow drags.
+ */
+static void screen_delta_to_world(float sdx, float sdy, float speed,
+                                  float* acc_x, float* acc_y,
                                   int* wdx, int* wdy) {
 	float z = server.zoom > 0.0f ? server.zoom : 1.0f;
-	*acc_x += sdx / z;
-	*acc_y += sdy / z;
+	float s = speed > 0.0f ? speed : 1.0f;
+	*acc_x += sdx * s / z;
+	*acc_y += sdy * s / z;
 	*wdx = (int)truncf(*acc_x);
 	*wdy = (int)truncf(*acc_y);
 	*acc_x -= (float)*wdx;
@@ -775,12 +781,13 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			switch (drag.type) {
 			case DRAG_PAN: {
 				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
+				float s = config.pan_speed > 0.0f ? config.pan_speed : 1.0f;
 				float old_px = server.pan_x;
 				float old_py = server.pan_y;
-				server.pan_x -= (float)dx / z;
-				server.pan_y -= (float)dy / z;
+				/* Same relative on-screen speed as window move. */
+				server.pan_x -= (float)dx * s / z;
+				server.pan_y -= (float)dy * s / z;
 				clamp_viewport(&server);
-				/* Scroll scene (cursor lifted); re-paint at mouse. */
 				redraw_pan(&server, old_px, old_py);
 				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
@@ -791,9 +798,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 					return 1;
 				int wdx, wdy;
 				screen_delta_to_world((float)dx, (float)dy,
+				                     config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
-					redraw_region(&server, *c, wdx, wdy);
+					redraw_region(&server, c, wdx, wdy);
 					c->x = (uint32_t)((int)c->x + wdx);
 					c->y = (uint32_t)((int)c->y + wdy);
 				}
@@ -803,10 +811,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			case DRAG_RESIZE: {
 				int wdx, wdy;
 				screen_delta_to_world((float)dx, (float)dy,
+				                     config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				drag.dx += wdx;
 				drag.dy += wdy;
-				/* Keep cursor on top of the live drag. */
 				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
@@ -866,10 +874,11 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			switch (drag.type) {
 			case DRAG_PAN: {
 				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
+				float s = config.pan_speed > 0.0f ? config.pan_speed : 1.0f;
 				float old_px = server.pan_x;
 				float old_py = server.pan_y;
-				server.pan_x -= (float)dx / z;
-				server.pan_y -= (float)dy / z;
+				server.pan_x -= (float)dx * s / z;
+				server.pan_y -= (float)dy * s / z;
 				clamp_viewport(&server);
 				redraw_pan(&server, old_px, old_py);
 				set_cursor_pos(&server, mouse_x, mouse_y);
@@ -881,9 +890,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 					return 1;
 				int wdx, wdy;
 				screen_delta_to_world((float)dx, (float)dy,
+				                     config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
-					redraw_region(&server, *c, wdx, wdy);
+					redraw_region(&server, c, wdx, wdy);
 					c->x = (uint32_t)((int)c->x + wdx);
 					c->y = (uint32_t)((int)c->y + wdy);
 				}
@@ -893,6 +903,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			case DRAG_RESIZE: {
 				int wdx, wdy;
 				screen_delta_to_world((float)dx, (float)dy,
+				                     config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				drag.dx += wdx;
 				drag.dy += wdy;

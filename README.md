@@ -215,6 +215,15 @@ super+r = command:rofi -show drun
 f12 = command:import -window root /tmp/screenshot.png
 ```
 
+Pointer feel (optional `[input]` section):
+
+```ini
+[input]
+# On-screen drag speed ≈ mouse × speed / zoom (same relative feel at any zoom)
+move_speed = 1.0
+pan_speed = 1.0
+```
+
 
 ### Notes
 

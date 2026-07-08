@@ -148,6 +148,14 @@ struct config {
 	int shortcut_count;
 
 	struct cursor_theme cursors;
+
+	/*
+	 * Pointer drag feel: screen-pixel mouse delta is scaled by these, then
+	 * by 1/zoom so on-screen pan/move speed stays consistent at any zoom.
+	 * 1.0 = one screen pixel of motion per mouse pixel at zoom 1.
+	 */
+	float move_speed;
+	float pan_speed;
 };
 
 // Load config file (~/.config/bgce.conf) and apply defaults
@@ -217,10 +225,10 @@ void draw(struct ServerState* srv, struct Client cli);
 
 /**
  * Move client on screen by world delta (dx, dy).  `c` is still at the old
- * position.  Scrolls existing window pixels, composites only the revealed
- * strips from clients behind c.next, and blits the window at the new place.
+ * position.  Repaints the union of old and new screen rects in stack order
+ * (no FB scroll — avoids 1px edge trails).
  */
-void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
+void redraw_region(struct ServerState* srv, struct Client* c, int dx, int dy);
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);
 

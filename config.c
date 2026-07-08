@@ -443,6 +443,8 @@ int load_config(struct config* config) {
 	config->path[0] = '\0';
 	config->shortcut_count = 0;
 	memset(&config->cursors, 0, sizeof(config->cursors));
+	config->move_speed = 1.0f;
+	config->pan_speed = 1.0f;
 
 	if (!home) {
 		set_default_shortcuts(config);
@@ -517,6 +519,19 @@ int load_config(struct config* config) {
 				} else if (strcmp(valp, "scaled") == 0) {
 					config->mode = IMAGE_SCALED;
 				}
+			}
+		} else if (strcmp(current_section, "input") == 0) {
+			if (strcmp(key, "move_speed") == 0) {
+				config->move_speed = strtof(valp, NULL);
+				if (config->move_speed <= 0.0f)
+					config->move_speed = 1.0f;
+			} else if (strcmp(key, "pan_speed") == 0) {
+				config->pan_speed = strtof(valp, NULL);
+				if (config->pan_speed <= 0.0f)
+					config->pan_speed = 1.0f;
+			} else {
+				fprintf(stderr, "[BGCE] Unknown input config key: %s "
+				        "(expected move_speed or pan_speed)\n", key);
 			}
 		} else if (strcmp(current_section, "cursors") == 0) {
 			if (strcmp(key, "theme") == 0) {
@@ -667,6 +682,9 @@ void print_config(const struct config* config)
 	}
 	printf("[BGCE] cursors: %d theme image(s) loaded (of %d types)\n",
 	       cursor_loaded, BGCE_CURSOR_COUNT);
+	printf("[BGCE] input: move_speed=%.2f pan_speed=%.2f "
+	       "(on-screen speed ≈ mouse × speed / zoom)\n",
+	       (double)config->move_speed, (double)config->pan_speed);
 	printf("[BGCE] === end config ===\n");
 }
 
