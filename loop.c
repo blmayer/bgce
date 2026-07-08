@@ -86,11 +86,8 @@ void* client_thread(void* arg) {
 			void *map;
 			char old_name[64];
 			int had_buffer;
-
-			printf(
-			        "[BGCE] Client requested buffer of size %dx%d\n",
-			        req.width,
-			        req.height);
+			uint32_t world_w, world_h;
+			float z;
 
 			reply.status = -1;
 			msg.type = MSG_GET_BUFFER;
@@ -103,6 +100,25 @@ void* client_thread(void* arg) {
 				break;
 			}
 
+			/*
+			 * Client sizes are logical (screen-normal) pixels: the current
+			 * zoom is treated as 100%, so a window that "should look like
+			 * 800×600" occupies ~800×600 screen pixels at any zoom.
+			 * Convert to world pixels: world = logical / zoom.
+			 */
+			z = server.zoom > 0.0f ? server.zoom : 1.0f;
+			world_w = (uint32_t)((float)req.width / z + 0.5f);
+			world_h = (uint32_t)((float)req.height / z + 0.5f);
+			if (world_w < 1)
+				world_w = 1;
+			if (world_h < 1)
+				world_h = 1;
+
+			printf(
+			        "[BGCE] Client requested buffer %ux%u logical → "
+			        "%ux%u world (zoom=%.2f)\n",
+			        req.width, req.height, world_w, world_h, (double)z);
+
 			/* Unmap and remember old token before creating a new one. */
 			had_buffer = client->buffer != NULL;
 			old_name[0] = '\0';
@@ -114,7 +130,7 @@ void* client_thread(void* arg) {
 				old_name[sizeof(old_name) - 1] = '\0';
 			}
 
-			buf_size = (size_t)req.width * req.height * 4;
+			buf_size = (size_t)world_w * world_h * 4;
 			shm_fd = bgce_buf_create(client->shm_name,
 			                         sizeof(client->shm_name), buf_size);
 			if (shm_fd < 0) {
@@ -144,8 +160,8 @@ void* client_thread(void* arg) {
 				bgce_buf_unlink(old_name);
 
 			client->buffer = map;
-			client->width = req.width;
-			client->height = req.height;
+			client->width = world_w;
+			client->height = world_h;
 			/* First buffer only: place at the current viewport so the window
 			 * appears on-screen even when the user has panned/zoomed. */
 			if (!had_buffer) {
@@ -171,8 +187,9 @@ void* client_thread(void* arg) {
 			reply.status = 0;
 			strncpy(reply.shm_name, client->shm_name, sizeof(reply.shm_name) - 1);
 			reply.shm_name[sizeof(reply.shm_name) - 1] = '\0';
-			reply.width = req.width;
-			reply.height = req.height;
+			/* Reply carries the actual buffer (world) size for drawing/mmap. */
+			reply.width = world_w;
+			reply.height = world_h;
 			msg.data.buffer_reply = reply;
 			bgce_send_msg(client_fd, &msg);
 			break;

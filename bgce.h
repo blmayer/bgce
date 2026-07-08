@@ -150,9 +150,13 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
 
 /**
  * Request a shared memory buffer from the server.
+ * req->width/height are logical (screen-normal) pixels: the server treats the
+ * current zoom as 100% and may return a different world-pixel size in *req
+ * (and in the internal reply) so the window appears at the requested on-screen
+ * size. On success, *req is updated to the actual buffer dimensions.
  * Returns a mapped buffer pointer on success, or NULL on failure.
  */
-void* bgce_get_buffer(int conn, const struct BufferRequest req);
+void* bgce_get_buffer(int conn, struct BufferRequest *req);
 
 /**
  * Shared pixel buffers (server creates, client maps by token in BufferReply.shm_name).

@@ -261,14 +261,16 @@ int bgce_get_server_info(int conn, struct ServerInfo* info) {
 	return 0;
 }
 
-/* Public API: Get shared buffer */
-void* bgce_get_buffer(int conn, struct BufferRequest req) {
-	if (conn < 0)
+/* Public API: Get shared buffer.
+ * req->width/height are logical sizes; on success they become the actual
+ * buffer (world) dimensions the client must use for drawing. */
+void* bgce_get_buffer(int conn, struct BufferRequest *req) {
+	if (conn < 0 || !req)
 		return NULL;
 
 	struct BGCEMessage msg = {0};
 	msg.type = MSG_GET_BUFFER;
-	msg.data.buffer_request = req;
+	msg.data.buffer_request = *req;
 
 	int code = bgce_send_msg(conn, &msg);
 	if (code <= 0)
@@ -299,6 +301,8 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
 		return NULL;
 	}
 
+	req->width = reply.width;
+	req->height = reply.height;
 	return buf;
 }
 

@@ -561,9 +561,157 @@ static void client_screen_bounds(const struct ServerState* srv, const struct Cli
 }
 
 /*
+ * Fill a horizontal run of identical pixels (unrolled like blend_sq32).
+ */
+static inline void fill_u32(uint32_t *p, int n, uint32_t v)
+{
+	int i = 0;
+	for (; i + 8 <= n; i += 8) {
+		p[i + 0] = v; p[i + 1] = v; p[i + 2] = v; p[i + 3] = v;
+		p[i + 4] = v; p[i + 5] = v; p[i + 6] = v; p[i + 7] = v;
+	}
+	for (; i < n; i++)
+		p[i] = v;
+}
+
+/*
+ * 1:1 blit when zoom ≈ 1.  Nearest-neighbour is an integer offset only:
+ *   world = screen + floor(pan)
+ * so we row-memcpy (same spirit as the cursor gather/scatter path).
+ * Fractional pan is fine — no need for pan to be exactly integer.
+ */
+static void blit_client_1to1(uint32_t *dst, uint32_t screen_w,
+                             const uint32_t *src, int cw, int ch,
+                             int cli_x, int cli_y,
+                             int ox0, int oy0, int ox1, int oy1,
+                             float pan_x, float pan_y)
+{
+	int ipx = (int)floorf(pan_x);
+	int ipy = (int)floorf(pan_y);
+	int cx0 = cli_x, cy0 = cli_y;
+	int cx1 = cx0 + cw, cy1 = cy0 + ch;
+
+	int ix0 = (ox0 + ipx) > cx0 ? (ox0 + ipx) : cx0;
+	int iy0 = (oy0 + ipy) > cy0 ? (oy0 + ipy) : cy0;
+	int ix1 = (ox1 + ipx) < cx1 ? (ox1 + ipx) : cx1;
+	int iy1 = (oy1 + ipy) < cy1 ? (oy1 + ipy) : cy1;
+	if (ix0 >= ix1 || iy0 >= iy1)
+		return;
+
+	size_t row_bytes = (size_t)(ix1 - ix0) * sizeof(uint32_t);
+	for (int wy = iy0; wy < iy1; wy++) {
+		int sy = wy - ipy;
+		uint32_t *drow = dst + sy * (int)screen_w + (ix0 - ipx);
+		const uint32_t *srow = src + (wy - cy0) * cw + (ix0 - cx0);
+		memcpy(drow, srow, row_bytes);
+	}
+}
+
+/*
+ * Fixed-point nearest-neighbour blit (16.16).
+ * - No float in the inner loops.
+ * - When magnifying (zoom > 1), consecutive screen pixels often sample the
+ *   same source texel; those runs are written with fill_u32 (cursor-style).
+ * - X mapping is independent of Y: compute x0_fp once, reuse every row.
+ */
+static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
+                               const uint32_t *src, int cw, int ch,
+                               int cli_x, int cli_y,
+                               int ox0, int oy0, int ox1, int oy1,
+                               float pan_x, float pan_y, float zoom)
+{
+	const float inv_z = 1.0f / zoom;
+	const int32_t step_fp = (int32_t)(inv_z * 65536.0f + 0.5f);
+	/* world_x at sx=ox0, in 16.16, already minus cli_x so >>16 yields icx. */
+	const int32_t x0_fp = (int32_t)floorf(
+		((float)ox0 * inv_z + pan_x - (float)cli_x) * 65536.0f);
+	/* Same for Y: icy = (y_base + sy * step) >> 16, with y_base at sy=0. */
+	const int32_t y_step_fp = step_fp;
+	const int32_t y0_fp = (int32_t)floorf(
+		((float)oy0 * inv_z + pan_y - (float)cli_y) * 65536.0f);
+
+	const int magnify = (zoom > 1.001f);
+	const int width = ox1 - ox0;
+
+	if (magnify) {
+		/* Run-length fill along X; Y still one source row at a time. */
+		int32_t y_fp = y0_fp;
+		for (int sy = oy0; sy < oy1; sy++) {
+			int icy = y_fp >> 16;
+			y_fp += y_step_fp;
+			if ((unsigned)icy >= (unsigned)ch)
+				continue;
+
+			uint32_t *drow = dst + sy * (int)screen_w + ox0;
+			const uint32_t *srow = src + icy * cw;
+			int32_t x_fp = x0_fp;
+			int sx = 0;
+			while (sx < width) {
+				int icx = x_fp >> 16;
+				int run = 1;
+				int32_t probe = x_fp + step_fp;
+				while (sx + run < width && (probe >> 16) == icx) {
+					run++;
+					probe += step_fp;
+				}
+				if ((unsigned)icx < (unsigned)cw)
+					fill_u32(drow + sx, run, srow[icx]);
+				sx += run;
+				x_fp = x0_fp + (int32_t)sx * step_fp;
+			}
+		}
+		return;
+	}
+
+	/* Minify / arbitrary zoom: one sample per screen pixel, fixed-point.
+	 * Precompute source-X for every column once (independent of Y). */
+	{
+		int stack_map[2048];
+		int *xmap = stack_map;
+		int heap = 0;
+
+		if (width > (int)(sizeof(stack_map) / sizeof(stack_map[0]))) {
+			xmap = malloc((size_t)width * sizeof(int));
+			if (!xmap)
+				return;
+			heap = 1;
+		}
+		{
+			int32_t x_fp = x0_fp;
+			for (int i = 0; i < width; i++) {
+				xmap[i] = x_fp >> 16;
+				x_fp += step_fp;
+			}
+		}
+
+		int32_t y_fp = y0_fp;
+		for (int sy = oy0; sy < oy1; sy++) {
+			int icy = y_fp >> 16;
+			y_fp += y_step_fp;
+			if ((unsigned)icy >= (unsigned)ch)
+				continue;
+
+			uint32_t *drow = dst + sy * (int)screen_w + ox0;
+			const uint32_t *srow = src + icy * cw;
+			for (int i = 0; i < width; i++) {
+				int icx = xmap[i];
+				if ((unsigned)icx < (unsigned)cw)
+					drow[i] = srow[icx];
+			}
+		}
+		if (heap)
+			free(xmap);
+	}
+}
+
+/*
  * Nearest-neighbour blit of a client into a screen-space damage rect.
  * Client geometry is in world coordinates; the viewport (pan/zoom) maps
  * world → screen.
+ *
+ * Paths (fastest first):
+ *  1. zoom ≈ 1  → 1:1 row memcpy (skips all scaling)
+ *  2. otherwise → fixed-point NN, with run-fills when zoomed in
  */
 static void blit_client_overlap(struct ServerState* srv, const struct Client* cli,
                                 int rx0, int ry0, int rx1, int ry1) {
@@ -593,62 +741,25 @@ static void blit_client_overlap(struct ServerState* srv, const struct Client* cl
 		return;
 
 	uint32_t screen_w = display_stride_px(srv);
-	uint32_t* dst = (uint32_t*)srv->framebuffer;
-	uint32_t* src = (uint32_t*)cli->buffer;
+	uint32_t *dst = (uint32_t *)srv->framebuffer;
+	const uint32_t *src = (const uint32_t *)cli->buffer;
 	const int cw = (int)cli->width;
 	const int ch = (int)cli->height;
-	const float inv_z = 1.0f / srv->zoom;
 	const float pan_x = srv->pan_x;
 	const float pan_y = srv->pan_y;
-	const float cli_x = (float)cli->x;
-	const float cli_y = (float)cli->y;
+	const float zoom = srv->zoom > 0.0f ? srv->zoom : 1.0f;
 
-	/* Fast path: identity transform (zoom≈1, pan integer, aligned). */
-	if (fabsf(srv->zoom - 1.0f) < 1e-6f &&
-	    fabsf(pan_x - roundf(pan_x)) < 1e-6f &&
-	    fabsf(pan_y - roundf(pan_y)) < 1e-6f) {
-		int ipx = (int)roundf(pan_x);
-		int ipy = (int)roundf(pan_y);
-		int wox0 = ox0 + ipx;
-		int woy0 = oy0 + ipy;
-		int wox1 = ox1 + ipx;
-		int woy1 = oy1 + ipy;
-
-		int cx0 = (int)cli->x;
-		int cy0 = (int)cli->y;
-		int cx1 = cx0 + cw;
-		int cy1 = cy0 + ch;
-
-		int ix0 = wox0 > cx0 ? wox0 : cx0;
-		int iy0 = woy0 > cy0 ? woy0 : cy0;
-		int ix1 = wox1 < cx1 ? wox1 : cx1;
-		int iy1 = woy1 < cy1 ? woy1 : cy1;
-		if (ix0 >= ix1 || iy0 >= iy1)
-			return;
-
-		for (int wy = iy0; wy < iy1; wy++) {
-			int sy = wy - ipy;
-			uint32_t* drow = dst + sy * (int)screen_w + (ix0 - ipx);
-			uint32_t* srow = src + (wy - cy0) * cw + (ix0 - cx0);
-			memcpy(drow, srow, (size_t)(ix1 - ix0) * 4);
-		}
+	/* Identity zoom: pure memcpy rows — no NN sampling at all. */
+	if (fabsf(zoom - 1.0f) < 1e-4f) {
+		blit_client_1to1(dst, screen_w, src, cw, ch,
+		                 (int)cli->x, (int)cli->y,
+		                 ox0, oy0, ox1, oy1, pan_x, pan_y);
 		return;
 	}
 
-	for (int sy = oy0; sy < oy1; sy++) {
-		float wy = (float)sy * inv_z + pan_y;
-		int icy = (int)floorf(wy - cli_y);
-		if (icy < 0 || icy >= ch)
-			continue;
-		uint32_t* drow = dst + sy * (int)screen_w;
-		uint32_t* srow = src + icy * cw;
-		for (int sx = ox0; sx < ox1; sx++) {
-			float wx = (float)sx * inv_z + pan_x;
-			int icx = (int)floorf(wx - cli_x);
-			if (icx >= 0 && icx < cw)
-				drow[sx] = srow[icx];
-		}
-	}
+	blit_client_scaled(dst, screen_w, src, cw, ch,
+	                   (int)cli->x, (int)cli->y,
+	                   ox0, oy0, ox1, oy1, pan_x, pan_y, zoom);
 }
 
 static void composite_chain_to_rect(struct ServerState* srv, struct Client* first,
