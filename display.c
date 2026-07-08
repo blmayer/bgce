@@ -24,6 +24,12 @@ extern struct ServerState server;
 extern struct config config;
 
 static int vt_fd = -1;
+/* Previous KDSKBMODE so we can restore on exit (KDGKBMODE uses long). */
+static long vt_saved_kbmode = -1;
+#ifndef K_OFF
+/* Disabled keyboard → console (Linux ≥ 2.6.39). */
+#define K_OFF 0x04
+#endif
 
 #if CURSOR_WIDTH != 32 || CURSOR_HEIGHT != 32
 #error "software cursor blit assumes CURSOR_WIDTH/HEIGHT == 32"
@@ -482,38 +488,72 @@ void set_cursor_type(enum BGCECursorType type)
 
 
 int setup_vt_handling(void) {
-	/* Try the current tty first, then fall back to /dev/tty0 */
+	/*
+	 * KD_GRAPHICS only stops the *console driver drawing* text.
+	 * Keys still go to the VT line discipline unless we also disable
+	 * keyboard mode (K_OFF).  Without that, getty/shell/new apps on the
+	 * same tty still see keystrokes while bgce reads /dev/input.
+	 */
 	vt_fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
 	if (vt_fd < 0)
 		vt_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
 	if (vt_fd < 0) {
 		fprintf(stderr, "[BGCE] VT: cannot open tty: %s "
-		        "(keystrokes will echo on the console)\n",
+		        "(keystrokes may still go to the console)\n",
 		        strerror(errno));
 		return -1;
+	}
+
+	vt_saved_kbmode = -1;
+	if (ioctl(vt_fd, KDGKBMODE, &vt_saved_kbmode) < 0) {
+		fprintf(stderr, "[BGCE] VT: KDGKBMODE failed: %s\n",
+		        strerror(errno));
+		vt_saved_kbmode = -1;
 	}
 
 	if (ioctl(vt_fd, KDSETMODE, KD_GRAPHICS) < 0) {
 		fprintf(stderr, "[BGCE] VT: KDSETMODE KD_GRAPHICS failed: %s "
-		        "(keystrokes will echo on the console)\n",
+		        "(keystrokes may still go to the console)\n",
 		        strerror(errno));
 		close(vt_fd);
 		vt_fd = -1;
+		vt_saved_kbmode = -1;
 		return -1;
 	}
 
-	printf("[BGCE] VT: switched to KD_GRAPHICS mode\n");
+	/*
+	 * Silence the VT keyboard: no more cooked input / Ctrl+C / echo for
+	 * processes on this console.  bgce keeps using /dev/input/event*.
+	 */
+	if (ioctl(vt_fd, KDSKBMODE, (long)K_OFF) < 0) {
+		fprintf(stderr, "[BGCE] VT: KDSKBMODE K_OFF failed: %s "
+		        "(keys may still reach the tty)\n",
+		        strerror(errno));
+	} else {
+		printf("[BGCE] VT: KD_GRAPHICS + keyboard off "
+		       "(input via /dev/input only)\n");
+	}
+
 	return 0;
 }
 
 void release_vt(void) {
 	if (vt_fd < 0)
 		return;
+
+	if (vt_saved_kbmode >= 0) {
+		if (ioctl(vt_fd, KDSKBMODE, vt_saved_kbmode) < 0)
+			fprintf(stderr, "[BGCE] VT: restore KDSKBMODE failed: %s\n",
+			        strerror(errno));
+		vt_saved_kbmode = -1;
+	}
+
 	if (ioctl(vt_fd, KDSETMODE, KD_TEXT) < 0)
 		fprintf(stderr, "[BGCE] VT: KDSETMODE KD_TEXT failed: %s\n",
 		        strerror(errno));
 	else
-		printf("[BGCE] VT: restored KD_TEXT mode\n");
+		printf("[BGCE] VT: restored KD_TEXT + keyboard mode\n");
+
 	close(vt_fd);
 	vt_fd = -1;
 }

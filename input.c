@@ -499,16 +499,23 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			} else if (sc->type == SHORTCUT_COMMAND) {
 				pid_t pid = fork();
 				if (pid == 0) {
+					int devnull;
 					/*
-					 * Leave bgce's process group / session.  Otherwise a
-					 * terminal Ctrl+C delivers SIGINT to every shortcut
-					 * child as well as the server (kernel process-group
-					 * broadcast), while bgce only meant to forward a
-					 * synthetic Ctrl+C to the focused client.
+					 * Detach from bgce's session/tty so the child is not
+					 * a console job: no process-group SIGINT with the
+					 * server, and no stdin/stdout bound to the VT (apps
+					 * would otherwise treat the tty as their terminal).
 					 */
 					if (setsid() < 0)
-						/* still try to run; better than _exit */
 						(void)setpgid(0, 0);
+					devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+					if (devnull >= 0) {
+						dup2(devnull, STDIN_FILENO);
+						dup2(devnull, STDOUT_FILENO);
+						dup2(devnull, STDERR_FILENO);
+						if (devnull > STDERR_FILENO)
+							close(devnull);
+					}
 					signal(SIGINT, SIG_DFL);
 					signal(SIGTERM, SIG_DFL);
 					execl("/bin/sh", "sh", "-c", sc->value, (char *)NULL);
