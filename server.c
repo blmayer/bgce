@@ -127,7 +127,7 @@ void bgce_request_shutdown(void)
 {
 	/* Prefer the real console — avoid printf/stderr (log pipe can block). */
 	if (console_fd >= 0)
-		dprintf(console_fd, "[BGCE] shutting down\n");
+		dprintf(console_fd, "[BGCE] Shortcut: exit — shutting down\n");
 	cleanup_and_exit(SIGTERM);
 }
 

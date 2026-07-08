@@ -486,25 +486,39 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		if (sc) {
 			if (sc->type == SHORTCUT_BUILTIN) {
 				if (strcmp(sc->value, "exit") == 0) {
-					/* Do not printf here: a full log pipe can block
-					 * forever so exit() never runs. */
+					/*
+					 * Do not printf to the log pipe here: a full
+					 * pipe can block forever so shutdown never
+					 * runs.  bgce_request_shutdown announces on
+					 * the real console.
+					 */
 					bgce_request_shutdown();
 					return 1; /* not reached */
 				} else if (strcmp(sc->value, "screenshot") == 0) {
-					if (server.focused_client)
+					if (server.focused_client) {
+						printf("[BGCE] Shortcut: screenshot "
+						       "skipped (client focused — "
+						       "forward key to app)\n");
 						return 0;
+					}
+					printf("[BGCE] Shortcut: builtin screenshot\n");
 					take_screenshot("screenshot.png");
 					return 1;
 				}
+				printf("[BGCE] Shortcut: unknown builtin '%s'\n",
+				       sc->value);
 			} else if (sc->type == SHORTCUT_COMMAND) {
 				pid_t pid = fork();
 				if (pid == 0) {
+					char line[sizeof(sc->value)];
+					char *argv[64];
+					int argc = 0;
+					char *p;
 					int devnull;
+
 					/*
 					 * Detach from bgce's session/tty so the child is not
-					 * a console job: no process-group SIGINT with the
-					 * server, and no stdin/stdout bound to the VT (apps
-					 * would otherwise treat the tty as their terminal).
+					 * a console job (SIGINT / controlling terminal).
 					 */
 					if (setsid() < 0)
 						(void)setpgid(0, 0);
@@ -518,10 +532,45 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 					}
 					signal(SIGINT, SIG_DFL);
 					signal(SIGTERM, SIG_DFL);
-					execl("/bin/sh", "sh", "-c", sc->value, (char *)NULL);
+
+					/*
+					 * No shell: split on whitespace (optional "quoted"
+					 * args) and execvp the binary directly.
+					 */
+					strncpy(line, sc->value, sizeof(line) - 1);
+					line[sizeof(line) - 1] = '\0';
+					p = line;
+					while (*p && argc < (int)(sizeof(argv) / sizeof(argv[0])) - 1) {
+						while (*p == ' ' || *p == '\t')
+							p++;
+						if (!*p)
+							break;
+						if (*p == '"') {
+							p++;
+							argv[argc++] = p;
+							while (*p && *p != '"')
+								p++;
+							if (*p)
+								*p++ = '\0';
+						} else {
+							argv[argc++] = p;
+							while (*p && *p != ' ' && *p != '\t')
+								p++;
+							if (*p)
+								*p++ = '\0';
+						}
+					}
+					argv[argc] = NULL;
+					if (argc < 1)
+						_exit(127);
+					execvp(argv[0], argv);
+					/* Only reached if exec fails — nowhere to log. */
 					_exit(127);
 				} else if (pid < 0) {
 					perror("[BGCE] fork for shortcut command");
+				} else {
+					printf("[BGCE] Shortcut: exec pid=%d: %s\n",
+					       (int)pid, sc->value);
 				}
 				return 1;
 			}
@@ -632,7 +681,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				struct BGCEMessage lost = {0};
 				lost.type = MSG_FOCUS_CHANGE;
 				lost.data.focus_event.state = 0;
-				bgce_send_msg(old_focus->fd, &lost);
+				/* Non-blocking send: never stall the input thread. */
+				(void)bgce_send_msg(old_focus->fd, &lost);
 			}
 
 			/* keep z monotonic (if no previous focus, keep current z) */
@@ -644,10 +694,15 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			struct BGCEMessage got = {0};
 			got.type = MSG_FOCUS_CHANGE;
 			got.data.focus_event.state = 1;
-			bgce_send_msg(c->fd, &got);
+			(void)bgce_send_msg(c->fd, &got);
 
+			/*
+			 * Raise only: blit this client on top.  Do not wait for the
+			 * app to finish a heavy redraw — that runs on the client
+			 * thread when it posts MSG_DRAW.  Never do client work here.
+			 */
 			draw(&server, *c);
-			printf("[BGCE] Client focused.\n");
+			printf("[BGCE] Client focused (fd=%d).\n", c->fd);
 		}
 
 		if (!alt_down) {
@@ -976,7 +1031,8 @@ void* input_loop(void* arg) {
 			struct BGCEMessage msg;
 			msg.type = MSG_INPUT_EVENT;
 			msg.data.input_event = e;
-			bgce_send_msg(c.fd, &msg);
+			/* Drop if the client is not reading (busy); keep the cursor live. */
+			(void)bgce_send_msg(c.fd, &msg);
 		}
 	}
 	return NULL;

@@ -207,10 +207,9 @@ void* client_thread(void* arg) {
 		}
 
 		case MSG_DRAW: {
-			printf("[BGCE] Received draw event from client %s\n", client->shm_name);
 			/*
-			 * Drawing must be allowed even when the client is not focused.
-			 * Focus only affects input routing.
+			 * Blit on this client thread only — never on the input thread.
+			 * A slow composite must not freeze the software cursor.
 			 */
 			draw(&server, *client);
 			break;

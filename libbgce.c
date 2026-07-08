@@ -188,18 +188,18 @@ void bgce_buf_unlink(const char *name)
 		unlink(path);
 }
 
-/* Write exactly 'size' bytes */
+/* Send one full BGCEMessage in a single send(). */
 ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg) {
 	size_t size = sizeof(struct BGCEMessage);
+	ssize_t n = send(conn, msg, size, MSG_NOSIGNAL);
 
-	ssize_t n = write(conn, msg, size);
 	if (n < 0) {
-		/* EPIPE/ECONNRESET: peer gone — caller should drop the client.
-		 * With SIGPIPE ignored on the server, this is a normal path. */
-		if (errno != EPIPE && errno != ECONNRESET && errno != EINTR)
-			perror("[BGCE] write");
+		if (errno != EPIPE && errno != ECONNRESET)
+			perror("[BGCE] send");
 		return -1;
 	}
+	if ((size_t)n != size)
+		return -1;
 	return n;
 }
 

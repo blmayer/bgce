@@ -126,7 +126,8 @@ enum shortcut_parse_result {
 struct shortcut {
 	struct key_combo combo;
 	enum shortcut_type type;
-	char value[256]; // for builtin: "exit" or "screenshot"; for command: the command line to run
+	/* builtin: "exit"/"screenshot"; command: program + args (no shell) */
+	char value[256];
 };
 
 // Cursor theme: per-type image data (ARGB, pre-scaled to CURSOR_WIDTH x CURSOR_HEIGHT)

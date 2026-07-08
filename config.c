@@ -186,7 +186,7 @@ static struct key_combo parse_key_combo(const char* str) {
 	return kc;
 }
 
-// Parse a shortcut rhs of the form "builtin:exit" or "command:alacritty -e foo"
+// Parse rhs: "builtin:exit" or "command:/bin/foo arg1 arg2" (execvp, no shell)
 // Stores into out and returns SHORTCUT_PARSE_OK on success.
 static enum shortcut_parse_result parse_shortcut_rhs(const char* rhs, struct shortcut* out) {
 	if (!rhs || !*rhs || !out)

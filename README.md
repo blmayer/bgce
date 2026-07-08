@@ -176,7 +176,7 @@ color = #RRGGBBAA # Hex color with alpha (e.g., #FF000080 for semi-transparent r
 #
 # type is one of:
 #   builtin  - value must be "exit" or "screenshot"
-#   command  - value is a shell command to run in a new process
+#   command  - program + args, exec'd directly (no shell; quote args with ")
 #
 # Combo examples: ctrl+alt+q, sysrq, f12, ctrl+shift+s, super+r
 
@@ -209,10 +209,10 @@ With custom shortcuts:
 ctrl+alt+q = builtin:exit
 sysrq = builtin:screenshot
 
-# Launch programs (commands run via /bin/sh -c in a separate process)
+# Launch programs: fork + execvp (no /bin/sh)
 ctrl+alt+t = command:alacritty
 super+r = command:rofi -show drun
-f12 = command:sh -c 'import -window root ~/screenshot.png'
+f12 = command:import -window root /tmp/screenshot.png
 ```
 
 
