@@ -26,9 +26,14 @@ extern struct config config;
 static int vt_fd = -1;
 /* Previous KDSKBMODE so we can restore on exit (KDGKBMODE uses long). */
 static long vt_saved_kbmode = -1;
+/* 1 if we successfully set K_OFF and must undo it even when KDGKBMODE failed. */
+static int vt_kb_off_active;
 #ifndef K_OFF
 /* Disabled keyboard → console (Linux ≥ 2.6.39). */
 #define K_OFF 0x04
+#endif
+#ifndef K_XLATE
+#define K_XLATE 0x00
 #endif
 
 #if CURSOR_WIDTH != 32 || CURSOR_HEIGHT != 32
@@ -504,9 +509,11 @@ int setup_vt_handling(void) {
 		return -1;
 	}
 
+	vt_kb_off_active = 0;
 	vt_saved_kbmode = -1;
 	if (ioctl(vt_fd, KDGKBMODE, &vt_saved_kbmode) < 0) {
-		fprintf(stderr, "[BGCE] VT: KDGKBMODE failed: %s\n",
+		fprintf(stderr, "[BGCE] VT: KDGKBMODE failed: %s "
+		        "(will restore K_XLATE on exit)\n",
 		        strerror(errno));
 		vt_saved_kbmode = -1;
 	}
@@ -530,6 +537,7 @@ int setup_vt_handling(void) {
 		        "(keys may still reach the tty)\n",
 		        strerror(errno));
 	} else {
+		vt_kb_off_active = 1;
 		printf("[BGCE] VT: KD_GRAPHICS + keyboard off "
 		       "(input via /dev/input only)\n");
 	}
@@ -537,25 +545,56 @@ int setup_vt_handling(void) {
 	return 0;
 }
 
+/*
+ * Always put the console back to a usable state.  Leaving K_OFF active
+ * freezes the tty (no keyboard) after quit — that was the exit bug.
+ */
 void release_vt(void) {
-	if (vt_fd < 0)
-		return;
+	int fd = vt_fd;
+	long mode;
 
-	if (vt_saved_kbmode >= 0) {
-		if (ioctl(vt_fd, KDSKBMODE, vt_saved_kbmode) < 0)
-			fprintf(stderr, "[BGCE] VT: restore KDSKBMODE failed: %s\n",
-			        strerror(errno));
-		vt_saved_kbmode = -1;
+	/* Re-open if needed so we can still recover after a partial teardown. */
+	if (fd < 0) {
+		fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
+		if (fd < 0)
+			fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
+		if (fd < 0)
+			return;
 	}
 
-	if (ioctl(vt_fd, KDSETMODE, KD_TEXT) < 0)
+	/*
+	 * Prefer the saved mode; never restore K_OFF.  If we never saw a
+	 * mode (KDGKBMODE failed), fall back to K_XLATE so the shell works.
+	 * K_XLATE is 0 — do not use ">= 0" alone as a "valid" flag.
+	 */
+	if (vt_saved_kbmode >= 0 && vt_saved_kbmode != (long)K_OFF)
+		mode = vt_saved_kbmode;
+	else
+		mode = (long)K_XLATE;
+
+	/* Keyboard first so the console can accept input as soon as text is on. */
+	if (vt_kb_off_active || vt_saved_kbmode >= 0) {
+		if (ioctl(fd, KDSKBMODE, mode) < 0) {
+			fprintf(stderr, "[BGCE] VT: restore KDSKBMODE %ld failed: %s; "
+			        "trying K_XLATE\n",
+			        mode, strerror(errno));
+			if (ioctl(fd, KDSKBMODE, (long)K_XLATE) < 0)
+				fprintf(stderr, "[BGCE] VT: K_XLATE restore failed: %s\n",
+				        strerror(errno));
+		}
+	}
+
+	if (ioctl(fd, KDSETMODE, KD_TEXT) < 0)
 		fprintf(stderr, "[BGCE] VT: KDSETMODE KD_TEXT failed: %s\n",
 		        strerror(errno));
 	else
 		printf("[BGCE] VT: restored KD_TEXT + keyboard mode\n");
 
-	close(vt_fd);
-	vt_fd = -1;
+	if (fd == vt_fd)
+		vt_fd = -1;
+	close(fd);
+	vt_saved_kbmode = -1;
+	vt_kb_off_active = 0;
 }
 
 /* ------------------------------------------------------------------
