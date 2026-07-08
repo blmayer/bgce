@@ -26,11 +26,6 @@ int shift_down = 0;
 int mouse_x;
 int mouse_y;
 
-/* Accumulate REL/ABS until EV_SYN so the software cursor is painted once
- * per hardware report, not once per axis. */
-static int pointer_dirty;
-static int skip_cursor_paint; /* set when a redraw will repaint the cursor */
-
 size_t count;
 struct pollfd fds[MAX_INPUT_DEVICES];
 
@@ -714,8 +709,6 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			if (mouse_y > max_y) mouse_y = max_y;
 		}
 
-		pointer_dirty = 1;
-
 		if (drag.active) {
 			switch (drag.type) {
 			case DRAG_PAN: {
@@ -725,9 +718,9 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				server.pan_x -= (float)dx / z;
 				server.pan_y -= (float)dy / z;
 				clamp_viewport(&server);
-				skip_cursor_paint = 1;
-				/* Shift existing FB pixels; only paint exposed edges. */
+				/* Scroll scene (cursor lifted); re-paint at mouse. */
 				redraw_pan(&server, old_px, old_py);
+				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			case DRAG_MOVE: {
@@ -738,12 +731,11 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				screen_delta_to_world((float)dx, (float)dy,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
-					skip_cursor_paint = 1;
-					/* Scroll window pixels + fill exposed strips (behind). */
 					redraw_region(&server, *c, wdx, wdy);
 					c->x = (uint32_t)((int)c->x + wdx);
 					c->y = (uint32_t)((int)c->y + wdy);
 				}
+				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			case DRAG_RESIZE: {
@@ -752,23 +744,21 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				drag.dx += wdx;
 				drag.dy += wdy;
+				/* Keep cursor on top of the live drag. */
+				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			}
 			return 1;
 		}
+
+		/* Normal move: update software cursor on every axis event. */
+		set_cursor_pos(&server, mouse_x, mouse_y);
 		return 0;
 	}
 
-	if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-		if (pointer_dirty) {
-			if (!skip_cursor_paint)
-				set_cursor_pos(&server, mouse_x, mouse_y);
-			pointer_dirty = 0;
-			skip_cursor_paint = 0;
-		}
+	if (ev.type == EV_SYN && ev.code == SYN_REPORT)
 		return 0;
-	}
 
 	/* Absolute pointer events (touchpads, touchscreens, tablets) */
 	if (ev.type == EV_ABS && dev_idx < MAX_INPUT_DEVICES &&
@@ -807,8 +797,6 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			if (mouse_y > max_y) mouse_y = max_y;
 		}
 
-		pointer_dirty = 1;
-
 		if (drag.active) {
 			int dx = mouse_x - old_x;
 			int dy = mouse_y - old_y;
@@ -821,8 +809,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				server.pan_x -= (float)dx / z;
 				server.pan_y -= (float)dy / z;
 				clamp_viewport(&server);
-				skip_cursor_paint = 1;
 				redraw_pan(&server, old_px, old_py);
+				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			case DRAG_MOVE: {
@@ -833,11 +821,11 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				screen_delta_to_world((float)dx, (float)dy,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
-					skip_cursor_paint = 1;
 					redraw_region(&server, *c, wdx, wdy);
 					c->x = (uint32_t)((int)c->x + wdx);
 					c->y = (uint32_t)((int)c->y + wdy);
 				}
+				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			case DRAG_RESIZE: {
@@ -846,11 +834,15 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				drag.dx += wdx;
 				drag.dy += wdy;
+				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			}
 			return 1;
 		}
+
+		set_cursor_pos(&server, mouse_x, mouse_y);
+		return 0;
 	}
 
 	// This means nothing was handled

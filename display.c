@@ -32,9 +32,17 @@ static int vt_fd = -1;
 /* Software cursor: fixed 32×32 glyph + underlay, row memcpy onto fbdev. */
 static uint32_t cur_img[32 * 32];
 static uint32_t cur_underlay[32 * 32];
+/* Logical hotspot (mouse) position — top-left of the 32×32 tile. */
 static int cursor_x;
 static int cursor_y;
-static int cursor_visible;
+/*
+ * Where cur_underlay was captured / the glyph was last drawn.  Restoring
+ * always uses these coords, not cursor_x/y, so a move never leaves a trail
+ * if paint/restore get out of sync.
+ */
+static int cur_saved_x;
+static int cur_saved_y;
+static int cur_underlay_valid; /* 1 = FB has glyph; underlay is live */
 
 static enum BGCECursorType current_cursor = BGCE_CURSOR_DEFAULT;
 
@@ -389,27 +397,38 @@ int display_cursor_init(void)
 	/* Not visible yet: first scene draw restores (no-op) then paints.
 	 * Painting here would capture a black/empty underlay and leave a
 	 * permanent black square on the first mouse move. */
-	cursor_visible = 0;
+	cur_underlay_valid = 0;
+	cur_saved_x = cursor_x;
+	cur_saved_y = cursor_y;
 	return 0;
 }
 
 void display_cursor_fini(void)
 {
 	cursor_restore();
-	cursor_visible = 0;
 }
 
+/*
+ * Put back the pixels under the last painted glyph.  Uses cur_saved_* so a
+ * pending move of cursor_x/y cannot restore the wrong square.
+ */
 static void cursor_restore(void)
 {
 	uint32_t sp;
 
-	if (!cursor_visible || !server.framebuffer)
+	if (!cur_underlay_valid || !server.framebuffer)
 		return;
 	sp = display_stride_px(&server);
-	fb_scatter32(server.framebuffer, sp, cursor_x, cursor_y, cur_underlay);
-	cursor_visible = 0;
+	fb_scatter32(server.framebuffer, sp, cur_saved_x, cur_saved_y,
+	             cur_underlay);
+	cur_underlay_valid = 0;
 }
 
+/*
+ * Draw the glyph at cursor_x/y.  Always lifts any previous glyph first so
+ * calling paint twice never bakes a pointer into the underlay (that was a
+ * common source of trails when only moving the mouse).
+ */
 static void cursor_paint(void)
 {
 	uint32_t sp;
@@ -417,12 +436,18 @@ static void cursor_paint(void)
 
 	if (!server.framebuffer)
 		return;
+
+	if (cur_underlay_valid)
+		cursor_restore();
+
 	sp = display_stride_px(&server);
 	fb_gather32(block, server.framebuffer, sp, cursor_x, cursor_y);
 	memcpy(cur_underlay, block, sizeof(block));
 	blend_sq32(block, cur_img);
 	fb_scatter32(server.framebuffer, sp, cursor_x, cursor_y, block);
-	cursor_visible = 1;
+	cur_saved_x = cursor_x;
+	cur_saved_y = cursor_y;
+	cur_underlay_valid = 1;
 }
 
 void display_cursor_refresh(void)
@@ -435,7 +460,7 @@ void set_cursor_pos(struct ServerState *srv, int x, int y)
 {
 	(void)srv;
 	clamp_cursor_pos(&x, &y);
-	if (x == cursor_x && y == cursor_y && cursor_visible)
+	if (x == cursor_x && y == cursor_y && cur_underlay_valid)
 		return;
 	cursor_restore();
 	cursor_x = x;
@@ -447,7 +472,7 @@ void set_cursor_type(enum BGCECursorType type)
 {
 	if (type < 0 || type >= BGCE_CURSOR_COUNT)
 		type = BGCE_CURSOR_DEFAULT;
-	if (type == current_cursor)
+	if (type == current_cursor && cur_underlay_valid)
 		return;
 	current_cursor = type;
 	cursor_restore();
@@ -990,12 +1015,15 @@ void redraw_pan(struct ServerState *srv, float old_pan_x, float old_pan_y)
 	if (sdx == 0 && sdy == 0)
 		return;
 
+	/*
+	 * Lift the cursor before scrolling.  Leave unrestored; caller must
+	 * set_cursor_pos() so the glyph tracks the real mouse position.
+	 */
 	cursor_restore();
 
 	/* No useful overlap — full copy from client buffers. */
 	if (sdx <= -w || sdx >= w || sdy <= -h || sdy >= h) {
 		composite_chain_to_rect(srv, srv->clients, 0, 0, w, h);
-		cursor_paint();
 		return;
 	}
 
@@ -1015,8 +1043,6 @@ void redraw_pan(struct ServerState *srv, float old_pan_x, float old_pan_y)
 		composite_chain_to_rect(srv, srv->clients, 0, 0, w, sdy);
 	else if (sdy < 0)
 		composite_chain_to_rect(srv, srv->clients, 0, h + sdy, w, h);
-
-	cursor_paint();
 }
 
 void draw(struct ServerState* srv, struct Client cli) {
@@ -1084,13 +1110,11 @@ void redraw_region(struct ServerState* srv, struct Client c, int wdx, int wdy) {
 	sdx = (int)lroundf((float)wdx * z);
 	sdy = (int)lroundf((float)wdy * z);
 
-	cursor_restore();
-
-	if (sdx == 0 && sdy == 0) {
-		/* Sub-pixel world move that did not cross a screen pixel — nothing. */
-		cursor_paint();
+	if (sdx == 0 && sdy == 0)
 		return;
-	}
+
+	/* Lift cursor before copying FB pixels; caller repositions with set_cursor_pos. */
+	cursor_restore();
 
 	/*
 	 * 1) Slide the window's existing pixels to the new place (overlap-safe).
@@ -1136,8 +1160,6 @@ void redraw_region(struct ServerState* srv, struct Client c, int wdx, int wdy) {
 		if (clip_to_display(srv, &bx0, &by0, &bx1, &by1))
 			blit_client_overlap(srv, &moved, bx0, by0, bx1, by1);
 	}
-
-	cursor_paint();
 }
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
@@ -1187,24 +1209,32 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
 }
 
 int take_screenshot(const char* filename) {
+	uint32_t width, height, stride;
+	int result;
+
 	if (!server.framebuffer) {
 		fprintf(stderr, "[BGCE] No framebuffer available for screenshot.\n");
 		return -1;
 	}
 
-	uint32_t width = server.display_w;
-	uint32_t height = server.display_h;
-	uint32_t stride = server.display_pitch ? server.display_pitch
-	                                       : width * BGCE_BYTES_PER_PIXEL;
+	/* Don't bake the software cursor into the PNG. */
+	cursor_restore();
 
-	int result = stbi_write_png(
+	width = server.display_w;
+	height = server.display_h;
+	stride = server.display_pitch ? server.display_pitch
+	                              : width * BGCE_BYTES_PER_PIXEL;
+
+	result = stbi_write_png(
 		filename,
-		width,
-		height,
+		(int)width,
+		(int)height,
 		BGCE_BYTES_PER_PIXEL,
 		server.framebuffer,
 		(int)stride
 	);
+
+	cursor_paint();
 
 	if (!result) {
 		fprintf(stderr, "[BGCE] Failed to save screenshot to %s.\n", filename);
