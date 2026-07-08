@@ -780,11 +780,19 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
 	if (n <= 0)
 		return;
 
-	struct Client** stack = malloc((size_t)n * sizeof(*stack));
-	if (!stack)
-		return;
-
+	/* Prefer stack for the common few-window case; avoid heap on every move. */
+	struct Client *stack_local[32];
+	struct Client **stack = stack_local;
+	int heap = 0;
 	int i = 0;
+
+	if (n > (int)(sizeof(stack_local) / sizeof(stack_local[0]))) {
+		stack = malloc((size_t)n * sizeof(*stack));
+		if (!stack)
+			return;
+		heap = 1;
+	}
+
 	for (struct Client* c = first; c; c = c->next)
 		stack[i++] = c;
 
@@ -796,7 +804,110 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
 		blit_client_overlap(srv, stack[i], rx0, ry0, rx1, ry1);
 	}
 
-	free(stack);
+	if (heap)
+		free(stack);
+}
+
+/* Clip [x0,x1)×[y0,y1) to the display; returns 0 if empty. */
+static int clip_to_display(const struct ServerState *srv,
+                           int *x0, int *y0, int *x1, int *y1)
+{
+	if (*x0 < 0)
+		*x0 = 0;
+	if (*y0 < 0)
+		*y0 = 0;
+	if (*x1 > (int)srv->display_w)
+		*x1 = (int)srv->display_w;
+	if (*y1 > (int)srv->display_h)
+		*y1 = (int)srv->display_h;
+	return *x0 < *x1 && *y0 < *y1;
+}
+
+/*
+ * Copy a rectangular block of framebuffer pixels by (sdx, sdy), clipped to
+ * the display.  Overlap-safe (same idea as memmove).
+ */
+static void fb_copy_rect_delta(struct ServerState *srv,
+                               int x0, int y0, int x1, int y1,
+                               int sdx, int sdy)
+{
+	uint32_t *fb;
+	uint32_t sp;
+	int sx0, sy0, sx1, sy1;
+	int dx0, dy0, dx1, dy1;
+	int w, h, y;
+
+	if (!srv || !srv->framebuffer || (sdx == 0 && sdy == 0))
+		return;
+
+	/* Source rect on screen, then destination = source + delta. */
+	sx0 = x0;
+	sy0 = y0;
+	sx1 = x1;
+	sy1 = y1;
+	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1))
+		return;
+
+	dx0 = sx0 + sdx;
+	dy0 = sy0 + sdy;
+	dx1 = sx1 + sdx;
+	dy1 = sy1 + sdy;
+	if (!clip_to_display(srv, &dx0, &dy0, &dx1, &dy1))
+		return;
+
+	/* Intersect by size after independent clips: align to the overlapping
+	 * translation that still fits both rects. */
+	{
+		int max_sx0 = sx0;
+		int max_sy0 = sy0;
+		int min_sx1 = sx1;
+		int min_sy1 = sy1;
+		if (dx0 - sdx > max_sx0)
+			max_sx0 = dx0 - sdx;
+		if (dy0 - sdy > max_sy0)
+			max_sy0 = dy0 - sdy;
+		if (dx1 - sdx < min_sx1)
+			min_sx1 = dx1 - sdx;
+		if (dy1 - sdy < min_sy1)
+			min_sy1 = dy1 - sdy;
+		sx0 = max_sx0;
+		sy0 = max_sy0;
+		sx1 = min_sx1;
+		sy1 = min_sy1;
+		if (sx0 >= sx1 || sy0 >= sy1)
+			return;
+		dx0 = sx0 + sdx;
+		dy0 = sy0 + sdy;
+		w = sx1 - sx0;
+		h = sy1 - sy0;
+	}
+
+	fb = (uint32_t *)srv->framebuffer;
+	sp = display_stride_px(srv);
+
+	if (sdy > 0 || (sdy == 0 && sdx > 0)) {
+		/* Copy bottom→top / right→left so we do not overwrite source. */
+		for (y = h - 1; y >= 0; y--) {
+			uint32_t *src = fb + (sy0 + y) * (int)sp + sx0;
+			uint32_t *dst = fb + (dy0 + y) * (int)sp + dx0;
+			memmove(dst, src, (size_t)w * sizeof(uint32_t));
+		}
+	} else {
+		for (y = 0; y < h; y++) {
+			uint32_t *src = fb + (sy0 + y) * (int)sp + sx0;
+			uint32_t *dst = fb + (dy0 + y) * (int)sp + dx0;
+			memmove(dst, src, (size_t)w * sizeof(uint32_t));
+		}
+	}
+}
+
+/* Composite everything from `behind` into a rect, clipped to the display. */
+static void composite_behind_rect(struct ServerState *srv, struct Client *behind,
+                                  int x0, int y0, int x1, int y1)
+{
+	if (!clip_to_display(srv, &x0, &y0, &x1, &y1))
+		return;
+	composite_chain_to_rect(srv, behind, x0, y0, x1, y1);
 }
 
 void redraw_all(struct ServerState* srv) {
@@ -937,47 +1048,95 @@ void draw(struct ServerState* srv, struct Client cli) {
 }
 
 /*
- * Redraw screen regions exposed when a client moves by (wdx, wdy) in
- * world space.  `c` is still at the old position when this is called.
- * dx/dy here are world-space deltas (not screen pixels).
+ * Move a client on screen by (wdx, wdy) world pixels.
+ * `c` is still at the old position when this is called.
+ *
+ * Same strategy as pan: reposition pixels already on the framebuffer,
+ * then only composite what was revealed (old rect minus new).  Clients
+ * behind (c.next) are redrawn only in those exposed strips.  Finally the
+ * window is blitted at the new position so partial off-screen / zoom cases
+ * stay correct.  Caller updates c->x/y afterward (and should not draw()).
  */
 void redraw_region(struct ServerState* srv, struct Client c, int wdx, int wdy) {
+	struct Client moved;
+	int ox0, oy0, ox1, oy1;
+	int nx0, ny0, nx1, ny1;
+	int sdx, sdy;
+	float z;
+
 	if (!srv || !srv->framebuffer) {
 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
 		return;
 	}
 
-	/* Screen bounds of the old position */
-	int ox0, oy0, ox1, oy1;
+	if (wdx == 0 && wdy == 0)
+		return;
+
 	client_screen_bounds(srv, &c, &ox0, &oy0, &ox1, &oy1);
 
-	/* Screen bounds of the new position */
-	struct Client moved = c;
+	moved = c;
 	moved.x = (uint32_t)((int)c.x + wdx);
 	moved.y = (uint32_t)((int)c.y + wdy);
-	int nx0, ny0, nx1, ny1;
 	client_screen_bounds(srv, &moved, &nx0, &ny0, &nx1, &ny1);
 
-	/* Union of old and new (the moved window will be redrawn by draw()) */
-	int ux0 = ox0 < nx0 ? ox0 : nx0;
-	int uy0 = oy0 < ny0 ? oy0 : ny0;
-	int ux1 = ox1 > nx1 ? ox1 : nx1;
-	int uy1 = oy1 > ny1 ? oy1 : ny1;
+	z = srv->zoom > 0.0f ? srv->zoom : 1.0f;
+	/* Integer screen shift of the window content. */
+	sdx = (int)lroundf((float)wdx * z);
+	sdy = (int)lroundf((float)wdy * z);
 
-	if (ux0 < 0)
-		ux0 = 0;
-	if (uy0 < 0)
-		uy0 = 0;
-	if (ux1 > (int)srv->display_w)
-		ux1 = (int)srv->display_w;
-	if (uy1 > (int)srv->display_h)
-		uy1 = (int)srv->display_h;
-
-	/* Fill the union with everything behind the moving client; caller
-	 * then draw()s the client on top at its new position. */
 	cursor_restore();
-	if (ux0 < ux1 && uy0 < uy1)
-		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
+
+	if (sdx == 0 && sdy == 0) {
+		/* Sub-pixel world move that did not cross a screen pixel — nothing. */
+		cursor_paint();
+		return;
+	}
+
+	/*
+	 * 1) Slide the window's existing pixels to the new place (overlap-safe).
+	 *    Uses the old on-screen rect as the source.
+	 */
+	fb_copy_rect_delta(srv, ox0, oy0, ox1, oy1, sdx, sdy);
+
+	/*
+	 * 2) Reveal what was under the old footprint: old − new.
+	 *    For a pure translation this is at most an L-shape (two strips),
+	 *    always clipped to the old rect so a large jump cannot paint into
+	 *    the new window area.  c.next = windows behind + background.
+	 */
+	if (sdx > 0) {
+		int ex1 = ox0 + sdx;
+		if (ex1 > ox1)
+			ex1 = ox1;
+		composite_behind_rect(srv, c.next, ox0, oy0, ex1, oy1);
+	} else if (sdx < 0) {
+		int ex0 = ox1 + sdx;
+		if (ex0 < ox0)
+			ex0 = ox0;
+		composite_behind_rect(srv, c.next, ex0, oy0, ox1, oy1);
+	}
+	if (sdy > 0) {
+		int ey1 = oy0 + sdy;
+		if (ey1 > oy1)
+			ey1 = oy1;
+		composite_behind_rect(srv, c.next, ox0, oy0, ox1, ey1);
+	} else if (sdy < 0) {
+		int ey0 = oy1 + sdy;
+		if (ey0 < oy0)
+			ey0 = oy0;
+		composite_behind_rect(srv, c.next, ox0, ey0, ox1, oy1);
+	}
+
+	/*
+	 * 3) Ensure the new rect shows this client (covers partial visibility,
+	 *    zoom≠1, and any strip that scrolled in from off-screen).
+	 */
+	{
+		int bx0 = nx0, by0 = ny0, bx1 = nx1, by1 = ny1;
+		if (clip_to_display(srv, &bx0, &by0, &bx1, &by1))
+			blit_client_overlap(srv, &moved, bx0, by0, bx1, by1);
+	}
+
 	cursor_paint();
 }
 

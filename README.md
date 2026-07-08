@@ -17,6 +17,8 @@
 
 BGCE is a minimal graphical environment for Linux written in C. It acts as a bare-bones window system, similar in concept to Xorg or Wayland, but much simpler and designed to run **without root privileges**.
 
+**Highlight: a zoomable, pannable virtual desktop** — the canvas is larger than the screen; zoom in to focus, zoom out to see the whole workspace, pan to move around. No root, no X11/Wayland.
+
 
 ## Overview
 
@@ -56,18 +58,32 @@ I also posted a video on my blog:
 - Educational reference for framebuffer-based compositing and IPC
 
 
+### Zoom & virtual desktop
+
+The desktop is a **virtual canvas** larger than the physical display, with a zoomable viewport:
+
+| | |
+|---|---|
+| **Canvas size** | **2×** physical resolution on each axis (**4×** screen area) |
+| **Zoom range** | **50% – 400%** (0.5× – 4.0×), 100% = one world pixel per screen pixel |
+| **Zoom** | `Alt` + scroll wheel — in/out toward the cursor |
+| **Pan** | `Alt` + left-drag on empty desktop — slide the viewport |
+| **Move window** | `Alt` + left-drag on a client |
+| **Resize window** | `Alt` + right-drag on a client |
+
+New apps size themselves to look natural at the **current** zoom (an 800×600 request still looks about that big on screen whether you are zoomed in or out). Wallpaper can cover the full virtual desktop (`mode = scaled` stretches across the whole canvas).
+
+Pan and window moves shift pixels already on the framebuffer and only repaint revealed edges — cheap on a pure software compositor.
+
+
 ### Input
 - The server listens to keyboard and mouse events.
 - Focus determines which client receives input.
-- **Zoom / pan (virtual desktop):**
-  - `Alt` + scroll wheel — zoom in/out (50%–400%), centered on the cursor
-  - `Alt` + left-drag on empty desktop — pan the viewport
-  - The virtual desktop is **2×** the physical resolution in each axis (**4×** the screen area), so you can place work areas far apart and zoom into focus when needed
 
 
 ### Drawing
-- Each client owns its own off-screen buffer (sizes and positions are in virtual-desktop / world pixels).
-- The server composites buffers into the display based on Z-order, scaled by the current zoom and pan.
+- Each client owns its own off-screen buffer (draw size in buffer pixels; window placement in virtual-desktop / world coordinates).
+- The server composites buffers into the display based on Z-order, mapped through the current zoom and pan.
 
 
 ### Privileges

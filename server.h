@@ -210,6 +210,11 @@ void set_cursor_type(enum BGCECursorType type);
 
 void draw(struct ServerState* srv, struct Client cli);
 
+/**
+ * Move client on screen by world delta (dx, dy).  `c` is still at the old
+ * position.  Scrolls existing window pixels, composites only the revealed
+ * strips from clients behind c.next, and blits the window at the new place.
+ */
 void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);

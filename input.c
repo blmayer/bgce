@@ -726,10 +726,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
 					skip_cursor_paint = 1;
+					/* Scroll window pixels + fill exposed strips (behind). */
 					redraw_region(&server, *c, wdx, wdy);
 					c->x = (uint32_t)((int)c->x + wdx);
 					c->y = (uint32_t)((int)c->y + wdy);
-					draw(&server, *c);
 				}
 				break;
 			}
@@ -824,7 +824,6 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 					redraw_region(&server, *c, wdx, wdy);
 					c->x = (uint32_t)((int)c->x + wdx);
 					c->y = (uint32_t)((int)c->y + wdy);
-					draw(&server, *c);
 				}
 				break;
 			}

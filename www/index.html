@@ -27,6 +27,10 @@ written in C. It acts as a bare-bones window system
 similar to Xorg or Wayland, but much simpler and
 designed to run <b>without root privileges</b>.
 
+<b>Zoomable virtual desktop</b> — the canvas is larger
+than the screen. Zoom in to focus, zoom out to see
+the whole workspace, pan to move around.
+
 
 <b>Overview</b>
 
@@ -41,6 +45,29 @@ To keep track of the develoment check the commit log
 on the <a href=feed.xml>feed</a>.
 
 Here's a <a href=screenshot.png>screenshot</a>.
+
+
+<b>Zoom &amp; virtual desktop</b>
+
+The desktop is a virtual canvas larger than the
+physical display, with a zoomable viewport:
+
+- <b>Canvas:</b> 2× physical size on each axis
+  (4× screen area)
+- <b>Zoom range:</b> 50%–400% (100% = 1:1 pixels)
+- <b>Alt + scroll</b> — zoom in/out toward the cursor
+- <b>Alt + left-drag</b> on empty space — pan
+- <b>Alt + left-drag</b> on a window — move
+- <b>Alt + right-drag</b> on a window — resize
+
+New apps size themselves for the current zoom so an
+800×600 window still looks about that large on screen
+whether you are zoomed in or out. Wallpaper can cover
+the full virtual desktop (scaled mode stretches across
+the whole canvas).
+
+Pan and window moves only repaint revealed edges —
+fast on a pure software compositor.
 
 
 <b>Download</b>
@@ -64,7 +91,7 @@ Or clone the repository:
 - Minimal, understandable graphics stack in C
 - No external dependencies like OpenGL, X11 etc
 - Educational reference for framebuffer-based
-  compositing and IPC
+  compositing, zoom/pan, and IPC
 
 
 <b>Build Instructions</b>
