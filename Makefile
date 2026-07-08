@@ -1,5 +1,6 @@
 CC ?= cc
 BACKEND ?= fbdev
+UNAME_S := $(shell uname -s)
 
 # No default -g: some small linkers reject STABS (.rela.stab) and fail with
 # "Invalid relocation entry ... .rela.stab". For local debugging:
@@ -7,16 +8,26 @@ BACKEND ?= fbdev
 CFLAGS ?= -Wall -O1 -std=c99 -fPIC -I.
 LDFLAGS ?= -lm -lpthread
 
+# Non-Linux: use in-tree linux/*.h stubs for headless builds
+ifneq ($(UNAME_S),Linux)
+  CFLAGS += -Icompat
+endif
+
 ifeq ($(BACKEND),drm)
 CFLAGS += -DBGCE_USE_DRM -I/include/libdrm
 LDFLAGS += -ldrm
 DISPLAY_OBJ = display_drm.o
+else ifeq ($(BACKEND),mock)
+DISPLAY_OBJ = display_mock.o
 else
 DISPLAY_OBJ = display_fbdev.o
 endif
 
 SERVER_OBJS = server.o loop.o libbgce.so input.o display.o $(DISPLAY_OBJ) config.o
 LIB_OBJS = libbgce.o
+
+# Headless mock compositor (no fbdev/input) — works on macOS + Linux
+HEADLESS_OBJS = display.o display_mock.o config.o mock.o input_headless.o
 
 all: bgce libbgce.so
 
@@ -29,11 +40,15 @@ libbgce.so: $(LIB_OBJS)
 client: client.c bgce.h
 	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce
 
+# BGTK-style mock tests: in-memory FB + PNG screenshots
+headless: test/headless.c $(HEADLESS_OBJS)
+	$(CC) $(CFLAGS) -o $@ test/headless.c $(HEADLESS_OBJS) $(LDFLAGS)
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f *.o bgce libbgce.so client app
+	rm -f *.o bgce libbgce.so client app headless headless_*.png
 
 INSTALL_BIN = /bin
 INSTALL_LIB = /lib

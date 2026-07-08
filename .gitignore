@@ -5,3 +5,5 @@
 bgce
 libbgce.so
 client
+headless
+headless_*.png

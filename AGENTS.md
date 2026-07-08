@@ -26,12 +26,29 @@ Implement a minimal Linux graphical environment that runs without root, manages 
   - Minimal window manager support
 
 
+## Headless / mock tests (like BGTK)
+
+No framebuffer or input devices required. Develop and verify compositor
+behaviour by inspecting PNGs:
+
+```bash
+make headless && ./headless
+# writes headless_00_bg.png … headless_07_panned.png
+```
+
+API (see `mock.h`): `bgce_mock_init`, `bgce_mock_add_client`, `bgce_mock_draw`,
+`bgce_mock_click`, `bgce_mock_move`, `bgce_mock_screenshot`, `bgce_mock_fini`.
+
+On macOS, `compat/linux/` provides stub headers so headless builds without
+kernel headers. Real `bgce` still requires Linux.
+
 ## Current Milestone
 
 ### High-evel features
 [X] Implement config file
 [X] Implement taking screenshots
 [X] Implement zoomable/pannable virtual desktop (4× area, zoom 50%–400%)
+[X] Headless mock + screenshot tests (`make headless`)
 [ ] Implement a cache file to memorize the last location of clients, in order to reopen them on the same place
 
 ### Protocol features
@@ -41,6 +58,7 @@ Implement a minimal Linux graphical environment that runs without root, manages 
 ### Internal stuff
 [ ] Create more tests
   - [ ] test if events go to the correct client and only the one
+  - [X] headless stacking / move / erase screenshots
 
 ### Zoom / pan controls
 - **Alt + scroll**: zoom in/out toward the cursor (range 0.5×–4.0×)

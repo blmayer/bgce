@@ -128,6 +128,20 @@ make install
 ./client  # Start test client
 ```
 
+### Headless mock tests (no display / input)
+
+Same idea as BGTK: in-memory framebuffer and PNG screenshots for visual checks.
+Works on macOS and Linux:
+
+```bash
+make headless
+./headless
+# inspect headless_*.png
+```
+
+See `mock.h` and `test/headless.c` for the API and a sample scenario
+(stacking, move, erase, zoom, pan).
+
 Default build needs only kernel headers (`linux/fb.h`) and `/dev/fb0`
 (DRM fbdev emulation is fine). `BACKEND=drm` needs libdrm.
 
