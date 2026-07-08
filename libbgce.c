@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -188,12 +189,29 @@ void bgce_buf_unlink(const char *name)
 		unlink(path);
 }
 
-/* Send one full BGCEMessage in a single send(). */
+/*
+ * Non-blocking send of one full message (or nothing).
+ *   return size — full frame delivered in one send()
+ *   return 0    — would block / not enough room; nothing written
+ *   return -1   — hard error
+ */
 ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg) {
 	size_t size = sizeof(struct BGCEMessage);
-	ssize_t n = send(conn, msg, size, MSG_NOSIGNAL);
+	ssize_t n;
+	int queued = 0;
+	int sndbuf = 0;
+	socklen_t sl = sizeof(sndbuf);
 
+	/* Only send if the whole frame fits — avoids short writes on the stream. */
+	if (ioctl(conn, TIOCOUTQ, &queued) == 0 &&
+	    getsockopt(conn, SOL_SOCKET, SO_SNDBUF, &sndbuf, &sl) == 0 &&
+	    sndbuf > 0 && sndbuf - queued < (int)size)
+		return 0;
+
+	n = send(conn, msg, size, MSG_NOSIGNAL | MSG_DONTWAIT);
 	if (n < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return 0;
 		if (errno != EPIPE && errno != ECONNRESET)
 			perror("[BGCE] send");
 		return -1;
