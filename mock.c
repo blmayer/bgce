@@ -3,6 +3,7 @@
  */
 
 #include "mock.h"
+#include "location_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,6 +84,7 @@ int bgce_mock_init(uint32_t width, uint32_t height)
 	server.clients = bg_client;
 
 	init_input();
+	location_cache_load();
 	redraw_all(&server);
 	mock_active = 1;
 	printf("[BGCE] mock init %ux%u virtual %ux%u\n",
@@ -144,6 +146,16 @@ struct Client *bgce_mock_add_client(uint32_t x, uint32_t y,
 	c->x = x;
 	c->y = y;
 	c->fd = -1;
+	snprintf(c->app_id, sizeof(c->app_id), "mock_%u",
+	         (unsigned)server.client_count + 1);
+	/* Restore last place if this app_id was cached (tests can set app_id). */
+	{
+		uint32_t cx, cy;
+		if (location_cache_lookup(c->app_id, &cx, &cy)) {
+			c->x = cx;
+			c->y = cy;
+		}
+	}
 	c->next = server.clients;
 	c->z = server.clients ? server.clients->z + 1 : 1;
 	server.clients = c;
@@ -190,6 +202,7 @@ void bgce_mock_remove_client(struct Client *c)
 	if (server.focused_client == c)
 		server.focused_client = NULL;
 
+	location_cache_remember_client(c);
 	erase_client(&server, c);
 	if (c->buffer)
 		free(c->buffer);
@@ -244,6 +257,7 @@ void bgce_mock_move(struct Client *c, int wdx, int wdy)
 	redraw_region(&server, c, wdx, wdy);
 	c->x = (uint32_t)((int)c->x + wdx);
 	c->y = (uint32_t)((int)c->y + wdy);
+	location_cache_remember_client(c);
 }
 
 void bgce_mock_pan_screen(int sdx, int sdy)

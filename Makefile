@@ -23,11 +23,11 @@ else
 DISPLAY_OBJ = display_fbdev.o
 endif
 
-SERVER_OBJS = server.o loop.o libbgce.so input.o display.o $(DISPLAY_OBJ) config.o
+SERVER_OBJS = server.o loop.o libbgce.so input.o display.o $(DISPLAY_OBJ) config.o location_cache.o
 LIB_OBJS = libbgce.o
 
 # Headless mock compositor (no fbdev/input) — works on macOS + Linux
-HEADLESS_OBJS = display.o display_mock.o config.o mock.o input_headless.o
+HEADLESS_OBJS = display.o display_mock.o config.o mock.o input_headless.o location_cache.o
 
 all: bgce libbgce.so
 

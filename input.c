@@ -1,4 +1,5 @@
 #include "bgce.h"   /* for access to global server state */
+#include "location_cache.h"
 #include "server.h" /* for access to global server state */
 
 #include <dirent.h>
@@ -597,6 +598,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			set_cursor_type(BGCE_CURSOR_DEFAULT);
 
 			if (drag.type == DRAG_MOVE || drag.type == DRAG_PAN) {
+				if (drag.type == DRAG_MOVE && drag.target)
+					location_cache_remember_client(drag.target);
 				drag.active = 0;
 				drag.target = NULL;
 				drag.acc_x = 0;

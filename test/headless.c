@@ -7,10 +7,12 @@
  * Writes headless_*.png for visual inspection.  No real display or input.
  */
 
+#include "location_cache.h"
 #include "mock.h"
 
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 
 int main(void)
 {
@@ -70,6 +72,43 @@ int main(void)
 	bgce_mock_pan_screen(40, 30);
 	if (bgce_mock_screenshot("headless_07_panned.png") != 0)
 		return 1;
+
+	/* Location cache: remember A, reopen with same app_id */
+	{
+		uint32_t saved_x, saved_y, cx = 0, cy = 0;
+
+		strncpy(a->app_id, "test_app", sizeof(a->app_id) - 1);
+		a->app_id[sizeof(a->app_id) - 1] = '\0';
+		bgce_mock_move(a, 50, 30); /* stores cache on move */
+		saved_x = a->x;
+		saved_y = a->y;
+		bgce_mock_remove_client(a);
+		a = NULL;
+
+		a = bgce_mock_add_client(0, 0, 200, 150, 0xFF2ECC71);
+		if (!a) {
+			fprintf(stderr, "headless: re-add client failed\n");
+			bgce_mock_fini();
+			return 1;
+		}
+		strncpy(a->app_id, "test_app", sizeof(a->app_id) - 1);
+		a->app_id[sizeof(a->app_id) - 1] = '\0';
+		/* Same path as server first-buffer placement */
+		if (location_cache_lookup("test_app", &cx, &cy)) {
+			a->x = cx;
+			a->y = cy;
+		}
+		bgce_mock_draw(a);
+		if (a->x != saved_x || a->y != saved_y) {
+			fprintf(stderr,
+			        "headless: location cache failed (got %u,%u want %u,%u)\n",
+			        a->x, a->y, saved_x, saved_y);
+			bgce_mock_fini();
+			return 1;
+		}
+		if (bgce_mock_screenshot("headless_08_location_restored.png") != 0)
+			return 1;
+	}
 
 	printf("headless complete. PNG frames written.\n");
 	bgce_mock_fini();

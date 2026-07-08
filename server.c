@@ -1,5 +1,6 @@
 #include "server.h"
 #include "bgce.h"
+#include "location_cache.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -264,6 +265,7 @@ int main(void) {
 		fprintf(stderr, "[BGCE] HOME unset; using default config\n");
 	}
 	print_config(&config);
+	location_cache_load();
 
 	if (!bgce_socket_path(listen_sock_path, sizeof(listen_sock_path))) {
 		fprintf(stderr, "[BGCE] socket path too long\n");

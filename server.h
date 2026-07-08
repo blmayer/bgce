@@ -27,6 +27,8 @@
 struct Client {
 	int fd;
 	pid_t pid;
+	/* Stable app key for location cache (e.g. /proc/pid/comm). */
+	char app_id[64];
 	char shm_name[64];
 	void* buffer;
 	/* Buffer pixel size (what the client draws into). */

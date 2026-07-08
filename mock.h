@@ -24,6 +24,7 @@ void bgce_mock_fini(void);
 /**
  * Add a client window with its own buffer (ARGB), filled with solid color.
  * x,y,w,h are in world pixels.  Returns the client, or NULL.
+ * Sets app_id to mock_N; override c->app_id before draw to test location cache.
  */
 struct Client *bgce_mock_add_client(uint32_t x, uint32_t y,
                                     uint32_t w, uint32_t h, uint32_t argb);

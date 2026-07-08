@@ -33,7 +33,7 @@ behaviour by inspecting PNGs:
 
 ```bash
 make headless && ./headless
-# writes headless_00_bg.png … headless_07_panned.png
+# writes headless_00_bg.png … headless_08_location_restored.png
 ```
 
 API (see `mock.h`): `bgce_mock_init`, `bgce_mock_add_client`, `bgce_mock_draw`,
@@ -49,7 +49,7 @@ kernel headers. Real `bgce` still requires Linux.
 [X] Implement taking screenshots
 [X] Implement zoomable/pannable virtual desktop (4× area, zoom 50%–400%)
 [X] Headless mock + screenshot tests (`make headless`)
-[ ] Implement a cache file to memorize the last location of clients, in order to reopen them on the same place
+[X] Cache file to memorize last client locations (`~/.cache/bgce/windows.cache`)
 
 ### Protocol features
 [X] Add suport for moving a buffer at a specific location
@@ -59,6 +59,14 @@ kernel headers. Real `bgce` still requires Linux.
 [ ] Create more tests
   - [ ] test if events go to the correct client and only the one
   - [X] headless stacking / move / erase screenshots
+  - [X] headless location-cache restore
+
+### Location cache
+- File: `$XDG_CACHE_HOME/bgce/windows.cache` or `~/.cache/bgce/windows.cache`
+- Format: `app_id x y` (world pixels), one entry per line
+- Identity: Linux `SO_PEERCRED` + `/proc/pid/comm` (fallback `"client"`)
+- Restore on first buffer request; save on move end, MSG_MOVE, and disconnect
+- Same binary name shares one slot (last place wins)
 
 ### Zoom / pan controls
 - **Alt + scroll**: zoom in/out toward the cursor (range 0.5×–4.0×)

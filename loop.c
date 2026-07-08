@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 700
 
 #include "bgce.h"
+#include "location_cache.h"
 #include "server.h"
 
 #include <fcntl.h>
@@ -26,6 +27,7 @@ void* client_thread(void* arg) {
 	}
 
 	client->fd = client_fd;
+	location_cache_identify_client(client, client_fd);
 
 	/* Background client is always first; keep the list non-empty. */
 	if (!server.clients) {
@@ -169,21 +171,36 @@ void* client_thread(void* arg) {
 				client->height = req.height;
 				client->world_w = world_w;
 				client->world_h = world_h;
-				/* First buffer only: place at the current viewport so the window
-				 * appears on-screen even when the user has panned/zoomed. */
+				/*
+				 * First buffer only: restore last location from cache
+				 * if known; otherwise place at the current viewport.
+				 */
 				if (!had_buffer) {
-					float wx, wy;
-					screen_to_world(&server, 0.0f, 0.0f, &wx, &wy);
-					if (wx < 0.0f)
-						wx = 0.0f;
-					if (wy < 0.0f)
-						wy = 0.0f;
-					if (wx > (float)server.virtual_w)
-						wx = (float)server.virtual_w;
-					if (wy > (float)server.virtual_h)
-						wy = (float)server.virtual_h;
-					client->x = (uint32_t)wx;
-					client->y = (uint32_t)wy;
+					uint32_t cx, cy;
+					if (location_cache_lookup(client->app_id, &cx, &cy)) {
+						if (cx > server.virtual_w)
+							cx = server.virtual_w;
+						if (cy > server.virtual_h)
+							cy = server.virtual_h;
+						client->x = cx;
+						client->y = cy;
+						printf("[BGCE] restored location for '%s' "
+						       "at %u,%u\n",
+						       client->app_id, cx, cy);
+					} else {
+						float wx, wy;
+						screen_to_world(&server, 0.0f, 0.0f, &wx, &wy);
+						if (wx < 0.0f)
+							wx = 0.0f;
+						if (wy < 0.0f)
+							wy = 0.0f;
+						if (wx > (float)server.virtual_w)
+							wx = (float)server.virtual_w;
+						if (wy > (float)server.virtual_h)
+							wy = (float)server.virtual_h;
+						client->x = (uint32_t)wx;
+						client->y = (uint32_t)wy;
+					}
 				}
 				printf("[BGCE] Client buffer: %p size=%zu "
 				       "buf=%ux%u world=%ux%u name=%s\n",
@@ -220,10 +237,9 @@ void* client_thread(void* arg) {
 				"[BGCE] Client requested move to position (%d, %d)\n",
 				move_req.x, move_req.y);
 
-			// Update client position
-			client->x = move_req.x;
-			client->y = move_req.y;
-
+			client->x = (uint32_t)move_req.x;
+			client->y = (uint32_t)move_req.y;
+			location_cache_remember_client(client);
 			break;
 		}
 		case MSG_SET_CURSOR: {
@@ -279,6 +295,7 @@ void* client_thread(void* arg) {
 	 * in the stack (background + windows that sat under / overlapped it).
 	 * Other on-screen clients outside that rect are left alone.
 	 */
+	location_cache_remember_client(client);
 	erase_client(&server, client);
 
 	printf("[BGCE] Client thread finished (fd=%d); server still running\n", client_fd);
