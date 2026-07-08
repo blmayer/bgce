@@ -98,83 +98,111 @@ void* client_thread(void* arg) {
 				break;
 			}
 
-			printf(
-			        "[BGCE] Client requested buffer of size %dx%d\n",
-			        req.width,
-			        req.height);
+			/*
+			 * req size is the client's drawing buffer (logical pixels).
+			 * World geometry is buffer / zoom so the window occupies
+			 * ~req.width×req.height *screen* pixels at the current zoom —
+			 * apps opened while zoomed out still look natural.
+			 */
+			{
+				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
+				uint32_t world_w =
+				        (uint32_t)((float)req.width / z + 0.5f);
+				uint32_t world_h =
+				        (uint32_t)((float)req.height / z + 0.5f);
+				if (world_w < 1)
+					world_w = 1;
+				if (world_h < 1)
+					world_h = 1;
 
-			/* Unmap and remember old token before creating a new one. */
-			had_buffer = client->buffer != NULL;
-			old_name[0] = '\0';
-			if (had_buffer) {
-				printf("[BGCE] Client already has a buffer, unmapping.\n");
-				munmap(client->buffer, client->width * client->height * 4);
-				client->buffer = NULL;
-				strncpy(old_name, client->shm_name, sizeof(old_name) - 1);
-				old_name[sizeof(old_name) - 1] = '\0';
-			}
+				printf(
+				        "[BGCE] Client requested buffer %ux%u "
+				        "(world %ux%u @ zoom=%.2f)\n",
+				        req.width, req.height, world_w, world_h,
+				        (double)z);
 
-			buf_size = (size_t)req.width * req.height * 4;
-			shm_fd = bgce_buf_create(client->shm_name,
-			                         sizeof(client->shm_name), buf_size);
-			if (shm_fd < 0) {
-				perror("[BGCE] create buffer");
+				/* Unmap and remember old token before creating a new one. */
+				had_buffer = client->buffer != NULL;
+				old_name[0] = '\0';
+				if (had_buffer) {
+					printf("[BGCE] Client already has a buffer, unmapping.\n");
+					munmap(client->buffer,
+					       client->width * client->height * 4);
+					client->buffer = NULL;
+					strncpy(old_name, client->shm_name,
+					        sizeof(old_name) - 1);
+					old_name[sizeof(old_name) - 1] = '\0';
+				}
+
+				buf_size = (size_t)req.width * req.height * 4;
+				shm_fd = bgce_buf_create(client->shm_name,
+				                         sizeof(client->shm_name),
+				                         buf_size);
+				if (shm_fd < 0) {
+					perror("[BGCE] create buffer");
+					if (old_name[0])
+						bgce_buf_unlink(old_name);
+					msg.data.buffer_reply = reply;
+					bgce_send_msg(client_fd, &msg);
+					break;
+				}
+
+				map = mmap(NULL, buf_size, PROT_READ | PROT_WRITE,
+				           MAP_SHARED, shm_fd, 0);
+				close(shm_fd);
+				if (map == MAP_FAILED) {
+					perror("[BGCE] mmap buffer");
+					bgce_buf_unlink(client->shm_name);
+					client->shm_name[0] = '\0';
+					if (old_name[0])
+						bgce_buf_unlink(old_name);
+					msg.data.buffer_reply = reply;
+					bgce_send_msg(client_fd, &msg);
+					break;
+				}
+
 				if (old_name[0])
 					bgce_buf_unlink(old_name);
+
+				client->buffer = map;
+				client->width = req.width;
+				client->height = req.height;
+				client->world_w = world_w;
+				client->world_h = world_h;
+				/* First buffer only: place at the current viewport so the window
+				 * appears on-screen even when the user has panned/zoomed. */
+				if (!had_buffer) {
+					float wx, wy;
+					screen_to_world(&server, 0.0f, 0.0f, &wx, &wy);
+					if (wx < 0.0f)
+						wx = 0.0f;
+					if (wy < 0.0f)
+						wy = 0.0f;
+					if (wx > (float)server.virtual_w)
+						wx = (float)server.virtual_w;
+					if (wy > (float)server.virtual_h)
+						wy = (float)server.virtual_h;
+					client->x = (uint32_t)wx;
+					client->y = (uint32_t)wy;
+				}
+				printf("[BGCE] Client buffer: %p size=%zu "
+				       "buf=%ux%u world=%ux%u name=%s\n",
+				       client->buffer,
+				       client->width * client->height * 4UL,
+				       client->width, client->height,
+				       client->world_w, client->world_h,
+				       client->shm_name);
+
+				reply.status = 0;
+				strncpy(reply.shm_name, client->shm_name,
+				        sizeof(reply.shm_name) - 1);
+				reply.shm_name[sizeof(reply.shm_name) - 1] = '\0';
+				/* Reply size is the buffer the client draws into. */
+				reply.width = req.width;
+				reply.height = req.height;
 				msg.data.buffer_reply = reply;
 				bgce_send_msg(client_fd, &msg);
-				break;
 			}
-
-			map = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-			           shm_fd, 0);
-			close(shm_fd);
-			if (map == MAP_FAILED) {
-				perror("[BGCE] mmap buffer");
-				bgce_buf_unlink(client->shm_name);
-				client->shm_name[0] = '\0';
-				if (old_name[0])
-					bgce_buf_unlink(old_name);
-				msg.data.buffer_reply = reply;
-				bgce_send_msg(client_fd, &msg);
-				break;
-			}
-
-			if (old_name[0])
-				bgce_buf_unlink(old_name);
-
-			client->buffer = map;
-			client->width = req.width;
-			client->height = req.height;
-			/* First buffer only: place at the current viewport so the window
-			 * appears on-screen even when the user has panned/zoomed. */
-			if (!had_buffer) {
-				float wx, wy;
-				screen_to_world(&server, 0.0f, 0.0f, &wx, &wy);
-				if (wx < 0.0f)
-					wx = 0.0f;
-				if (wy < 0.0f)
-					wy = 0.0f;
-				if (wx > (float)server.virtual_w)
-					wx = (float)server.virtual_w;
-				if (wy > (float)server.virtual_h)
-					wy = (float)server.virtual_h;
-				client->x = (uint32_t)wx;
-				client->y = (uint32_t)wy;
-			}
-			printf("[BGCE] Client buffer: %p size=%zu (%dx%d) name=%s\n",
-			       client->buffer,
-			       client->width * client->height * 4UL,
-			       client->width, client->height,
-			       client->shm_name);
-
-			reply.status = 0;
-			strncpy(reply.shm_name, client->shm_name, sizeof(reply.shm_name) - 1);
-			reply.shm_name[sizeof(reply.shm_name) - 1] = '\0';
-			reply.width = req.width;
-			reply.height = req.height;
-			msg.data.buffer_reply = reply;
-			bgce_send_msg(client_fd, &msg);
 			break;
 		}
 

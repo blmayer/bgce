@@ -551,8 +551,10 @@ void clamp_viewport(struct ServerState* srv) {
 static void client_screen_bounds(const struct ServerState* srv, const struct Client* cli,
                                  int* sx0, int* sy0, int* sx1, int* sy1) {
 	float fsx0, fsy0, fsx1, fsy1;
+	uint32_t ww = cli->world_w ? cli->world_w : cli->width;
+	uint32_t wh = cli->world_h ? cli->world_h : cli->height;
 	world_to_screen(srv, (float)cli->x, (float)cli->y, &fsx0, &fsy0);
-	world_to_screen(srv, (float)(cli->x + cli->width), (float)(cli->y + cli->height),
+	world_to_screen(srv, (float)(cli->x + ww), (float)(cli->y + wh),
 	                &fsx1, &fsy1);
 	*sx0 = (int)floorf(fsx0);
 	*sy0 = (int)floorf(fsy0);
@@ -575,10 +577,9 @@ static inline void fill_u32(uint32_t *p, int n, uint32_t v)
 }
 
 /*
- * 1:1 blit when zoom ≈ 1.  Nearest-neighbour is an integer offset only:
+ * 1:1 blit when zoom ≈ 1 and buffer size == world size.
  *   world = screen + floor(pan)
  * so we row-memcpy (same spirit as the cursor gather/scatter path).
- * Fractional pan is fine — no need for pan to be exactly integer.
  */
 static void blit_client_1to1(uint32_t *dst, uint32_t screen_w,
                              const uint32_t *src, int cw, int ch,
@@ -609,62 +610,65 @@ static void blit_client_1to1(uint32_t *dst, uint32_t screen_w,
 
 /*
  * Fixed-point nearest-neighbour blit (16.16).
- * - No float in the inner loops.
- * - When magnifying (zoom > 1), consecutive screen pixels often sample the
- *   same source texel; those runs are written with fill_u32 (cursor-style).
- * - X mapping is independent of Y: compute x0_fp once, reuse every row.
+ * Maps screen → world → buffer, supporting windows whose world size differs
+ * from their buffer size (zoom-at-create scaling).
+ *
+ *   wx = sx / zoom + pan
+ *   icx = (wx - cli_x) * bw / ww
  */
 static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
-                               const uint32_t *src, int cw, int ch,
+                               const uint32_t *src, int bw, int bh,
+                               int ww, int wh,
                                int cli_x, int cli_y,
                                int ox0, int oy0, int ox1, int oy1,
                                float pan_x, float pan_y, float zoom)
 {
 	const float inv_z = 1.0f / zoom;
-	const int32_t step_fp = (int32_t)(inv_z * 65536.0f + 0.5f);
-	/* world_x at sx=ox0, in 16.16, already minus cli_x so >>16 yields icx. */
+	const float scale_x = (float)bw / (float)ww; /* buffer px per world px */
+	const float scale_y = (float)bh / (float)wh;
+	const int32_t step_x_fp =
+	        (int32_t)(inv_z * scale_x * 65536.0f + 0.5f);
+	const int32_t step_y_fp =
+	        (int32_t)(inv_z * scale_y * 65536.0f + 0.5f);
 	const int32_t x0_fp = (int32_t)floorf(
-		((float)ox0 * inv_z + pan_x - (float)cli_x) * 65536.0f);
-	/* Same for Y: icy = (y_base + sy * step) >> 16, with y_base at sy=0. */
-	const int32_t y_step_fp = step_fp;
+		((float)ox0 * inv_z + pan_x - (float)cli_x) * scale_x * 65536.0f);
 	const int32_t y0_fp = (int32_t)floorf(
-		((float)oy0 * inv_z + pan_y - (float)cli_y) * 65536.0f);
+		((float)oy0 * inv_z + pan_y - (float)cli_y) * scale_y * 65536.0f);
 
-	const int magnify = (zoom > 1.001f);
+	/* Effective magnification in buffer-space samples per screen pixel. */
+	const int magnify = (zoom * scale_x > 1.001f);
 	const int width = ox1 - ox0;
 
 	if (magnify) {
-		/* Run-length fill along X; Y still one source row at a time. */
 		int32_t y_fp = y0_fp;
 		for (int sy = oy0; sy < oy1; sy++) {
 			int icy = y_fp >> 16;
-			y_fp += y_step_fp;
-			if ((unsigned)icy >= (unsigned)ch)
+			y_fp += step_y_fp;
+			if ((unsigned)icy >= (unsigned)bh)
 				continue;
 
 			uint32_t *drow = dst + sy * (int)screen_w + ox0;
-			const uint32_t *srow = src + icy * cw;
+			const uint32_t *srow = src + icy * bw;
 			int32_t x_fp = x0_fp;
 			int sx = 0;
 			while (sx < width) {
 				int icx = x_fp >> 16;
 				int run = 1;
-				int32_t probe = x_fp + step_fp;
+				int32_t probe = x_fp + step_x_fp;
 				while (sx + run < width && (probe >> 16) == icx) {
 					run++;
-					probe += step_fp;
+					probe += step_x_fp;
 				}
-				if ((unsigned)icx < (unsigned)cw)
+				if ((unsigned)icx < (unsigned)bw)
 					fill_u32(drow + sx, run, srow[icx]);
 				sx += run;
-				x_fp = x0_fp + (int32_t)sx * step_fp;
+				x_fp = x0_fp + (int32_t)sx * step_x_fp;
 			}
 		}
 		return;
 	}
 
-	/* Minify / arbitrary zoom: one sample per screen pixel, fixed-point.
-	 * Precompute source-X for every column once (independent of Y). */
+	/* Minify / arbitrary: one sample per screen pixel. */
 	{
 		int stack_map[2048];
 		int *xmap = stack_map;
@@ -680,22 +684,22 @@ static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
 			int32_t x_fp = x0_fp;
 			for (int i = 0; i < width; i++) {
 				xmap[i] = x_fp >> 16;
-				x_fp += step_fp;
+				x_fp += step_x_fp;
 			}
 		}
 
 		int32_t y_fp = y0_fp;
 		for (int sy = oy0; sy < oy1; sy++) {
 			int icy = y_fp >> 16;
-			y_fp += y_step_fp;
-			if ((unsigned)icy >= (unsigned)ch)
+			y_fp += step_y_fp;
+			if ((unsigned)icy >= (unsigned)bh)
 				continue;
 
 			uint32_t *drow = dst + sy * (int)screen_w + ox0;
-			const uint32_t *srow = src + icy * cw;
+			const uint32_t *srow = src + icy * bw;
 			for (int i = 0; i < width; i++) {
 				int icx = xmap[i];
-				if ((unsigned)icx < (unsigned)cw)
+				if ((unsigned)icx < (unsigned)bw)
 					drow[i] = srow[icx];
 			}
 		}
@@ -706,12 +710,11 @@ static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
 
 /*
  * Nearest-neighbour blit of a client into a screen-space damage rect.
- * Client geometry is in world coordinates; the viewport (pan/zoom) maps
- * world → screen.
+ * Client geometry is in world coordinates; buffer may differ in size.
  *
  * Paths (fastest first):
- *  1. zoom ≈ 1  → 1:1 row memcpy (skips all scaling)
- *  2. otherwise → fixed-point NN, with run-fills when zoomed in
+ *  1. zoom ≈ 1 and world == buffer → 1:1 row memcpy
+ *  2. otherwise → fixed-point NN (handles zoom and buf≠world)
  */
 static void blit_client_overlap(struct ServerState* srv, const struct Client* cli,
                                 int rx0, int ry0, int rx1, int ry1) {
@@ -743,21 +746,23 @@ static void blit_client_overlap(struct ServerState* srv, const struct Client* cl
 	uint32_t screen_w = display_stride_px(srv);
 	uint32_t *dst = (uint32_t *)srv->framebuffer;
 	const uint32_t *src = (const uint32_t *)cli->buffer;
-	const int cw = (int)cli->width;
-	const int ch = (int)cli->height;
+	const int bw = (int)cli->width;
+	const int bh = (int)cli->height;
+	const int ww = (int)(cli->world_w ? cli->world_w : cli->width);
+	const int wh = (int)(cli->world_h ? cli->world_h : cli->height);
 	const float pan_x = srv->pan_x;
 	const float pan_y = srv->pan_y;
 	const float zoom = srv->zoom > 0.0f ? srv->zoom : 1.0f;
 
-	/* Identity zoom: pure memcpy rows — no NN sampling at all. */
-	if (fabsf(zoom - 1.0f) < 1e-4f) {
-		blit_client_1to1(dst, screen_w, src, cw, ch,
+	/* Identity: zoom≈1 and buffer matches world footprint. */
+	if (fabsf(zoom - 1.0f) < 1e-4f && bw == ww && bh == wh) {
+		blit_client_1to1(dst, screen_w, src, bw, bh,
 		                 (int)cli->x, (int)cli->y,
 		                 ox0, oy0, ox1, oy1, pan_x, pan_y);
 		return;
 	}
 
-	blit_client_scaled(dst, screen_w, src, cw, ch,
+	blit_client_scaled(dst, screen_w, src, bw, bh, ww, wh,
 	                   (int)cli->x, (int)cli->y,
 	                   ox0, oy0, ox1, oy1, pan_x, pan_y, zoom);
 }
@@ -801,6 +806,105 @@ void redraw_all(struct ServerState* srv) {
 	cursor_restore();
 	composite_chain_to_rect(srv, srv->clients, 0, 0,
 	                        (int)srv->display_w, (int)srv->display_h);
+	cursor_paint();
+}
+
+/*
+ * Shift framebuffer pixels by (sdx, sdy) screen pixels.
+ * Positive sdx/sdy move content right/down.
+ */
+static void fb_scroll(struct ServerState *srv, int sdx, int sdy)
+{
+	uint32_t *fb;
+	uint32_t sp;
+	int w, h, y;
+	size_t row_bytes;
+
+	if (!srv || !srv->framebuffer || (sdx == 0 && sdy == 0))
+		return;
+
+	fb = (uint32_t *)srv->framebuffer;
+	sp = display_stride_px(srv);
+	w = (int)srv->display_w;
+	h = (int)srv->display_h;
+	row_bytes = (size_t)w * sizeof(uint32_t);
+
+	/* Vertical first (full-width rows). */
+	if (sdy > 0 && sdy < h) {
+		for (y = h - 1; y >= sdy; y--)
+			memcpy(fb + y * (int)sp, fb + (y - sdy) * (int)sp, row_bytes);
+	} else if (sdy < 0 && -sdy < h) {
+		int ady = -sdy;
+		for (y = 0; y < h - ady; y++)
+			memcpy(fb + y * (int)sp, fb + (y + ady) * (int)sp, row_bytes);
+	}
+
+	/* Horizontal per row. */
+	if (sdx > 0 && sdx < w) {
+		size_t keep = (size_t)(w - sdx) * sizeof(uint32_t);
+		for (y = 0; y < h; y++) {
+			uint32_t *row = fb + y * (int)sp;
+			memmove(row + sdx, row, keep);
+		}
+	} else if (sdx < 0 && -sdx < w) {
+		int adx = -sdx;
+		size_t keep = (size_t)(w - adx) * sizeof(uint32_t);
+		for (y = 0; y < h; y++) {
+			uint32_t *row = fb + y * (int)sp;
+			memmove(row, row + adx, keep);
+		}
+	}
+}
+
+void redraw_pan(struct ServerState *srv, float old_pan_x, float old_pan_y)
+{
+	float z;
+	int sdx, sdy;
+	int w, h;
+
+	if (!srv || !srv->framebuffer)
+		return;
+
+	z = srv->zoom > 0.0f ? srv->zoom : 1.0f;
+	/*
+	 * Fixed world points move on screen by -Δpan * zoom when the viewport
+	 * origin changes.  Integer pixel shift only — sub-pixel pan is a no-op
+	 * until it crosses a pixel boundary.
+	 */
+	sdx = (int)lroundf(-(srv->pan_x - old_pan_x) * z);
+	sdy = (int)lroundf(-(srv->pan_y - old_pan_y) * z);
+	w = (int)srv->display_w;
+	h = (int)srv->display_h;
+
+	if (sdx == 0 && sdy == 0)
+		return;
+
+	cursor_restore();
+
+	/* No useful overlap — full copy from client buffers. */
+	if (sdx <= -w || sdx >= w || sdy <= -h || sdy >= h) {
+		composite_chain_to_rect(srv, srv->clients, 0, 0, w, h);
+		cursor_paint();
+		return;
+	}
+
+	/* Reposition pixels already on screen. */
+	fb_scroll(srv, sdx, sdy);
+
+	/*
+	 * Only the newly exposed edge(s) need samples from client buffers.
+	 * Corners may be filled twice; that is cheap vs a full redraw.
+	 */
+	if (sdx > 0)
+		composite_chain_to_rect(srv, srv->clients, 0, 0, sdx, h);
+	else if (sdx < 0)
+		composite_chain_to_rect(srv, srv->clients, w + sdx, 0, w, h);
+
+	if (sdy > 0)
+		composite_chain_to_rect(srv, srv->clients, 0, 0, w, sdy);
+	else if (sdy < 0)
+		composite_chain_to_rect(srv, srv->clients, 0, h + sdy, w, h);
+
 	cursor_paint();
 }
 
@@ -889,8 +993,13 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
 	 * `c` already has the new size; old size = new - (dx,dy).
 	 */
 	struct Client old = c;
-	old.width = (uint32_t)((int)c.width - dx);
-	old.height = (uint32_t)((int)c.height - dy);
+	/* dx/dy are world-size deltas; bounds use world_* only. */
+	{
+		uint32_t ww = c.world_w ? c.world_w : c.width;
+		uint32_t wh = c.world_h ? c.world_h : c.height;
+		old.world_w = (uint32_t)((int)ww - dx);
+		old.world_h = (uint32_t)((int)wh - dy);
+	}
 
 	int ox0, oy0, ox1, oy1;
 	int nx0, ny0, nx1, ny1;

@@ -29,9 +29,18 @@ struct Client {
 	pid_t pid;
 	char shm_name[64];
 	void* buffer;
+	/* Buffer pixel size (what the client draws into). */
 	uint32_t width;
 	uint32_t height;
-	/* Position and size are in virtual-desktop (world) pixels */
+	/*
+	 * On-screen geometry in virtual-desktop (world) pixels.
+	 * New windows set world ≈ buffer / current_zoom so a client that
+	 * asks for e.g. 800×600 looks ~800×600 screen pixels at any zoom.
+	 * Background uses world_* == width/height (1:1).
+	 */
+	uint32_t world_w;
+	uint32_t world_h;
+	/* Position in virtual-desktop (world) pixels */
 	uint32_t x;
 	uint32_t y;
 	uint32_t z;
@@ -144,7 +153,14 @@ struct config {
 int load_config(struct config* config);
 /** Log the full effective configuration (background, shortcuts, cursors). */
 void print_config(const struct config* config);
-int apply_background(struct config* config, uint32_t* buffer, uint32_t width, uint32_t height);
+/**
+ * Paint background into a width×height buffer (usually the full virtual desktop).
+ * IMAGE_SCALED stretches the image over the whole buffer; IMAGE_TILED repeats
+ * source texels. tile_w/tile_h are reserved (pass display size; unused for scaled).
+ */
+int apply_background(struct config* config, uint32_t* buffer,
+                     uint32_t width, uint32_t height,
+                     uint32_t tile_w, uint32_t tile_h);
 
 /* ----------------------------
  * Cursor
@@ -198,8 +214,16 @@ void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);
 
-/** Full-scene recomposite (used after pan/zoom changes). */
+/** Full-scene recomposite (used after zoom and other full invalidations). */
 void redraw_all(struct ServerState* srv);
+
+/**
+ * Pan: shift pixels already on the framebuffer and only composite the
+ * newly exposed edge(s).  old_pan_* is the viewport origin before the pan
+ * update.  No rescaling of existing pixels — scale is only applied when
+ * filling exposed edges (and when zoom changes via redraw_all).
+ */
+void redraw_pan(struct ServerState* srv, float old_pan_x, float old_pan_y);
 
 /** Clamp pan so the viewport stays over the virtual desktop. */
 void clamp_viewport(struct ServerState* srv);

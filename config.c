@@ -481,31 +481,46 @@ int load_config(struct config* config) {
 
 		char key[32];
 		char value[MAX_PATH_LEN];
-		sscanf(trimmed, "%31s = %511[^\n]", key, value);
+		char *valp;
+		/* Accept "key = value", "key=value", and trim the value. */
+		if (sscanf(trimmed, "%31s = %511[^\n]", key, value) != 2 &&
+		    sscanf(trimmed, "%31[^=]=%511[^\n]", key, value) != 2)
+			continue;
+		{
+			char *kp = trim(key);
+			if (kp != key)
+				memmove(key, kp, strlen(kp) + 1);
+		}
+		valp = trim(value);
 
 		if (strcmp(current_section, "background") == 0) {
+			/*
+			 * Accept keys in any order: path/mode/color are stored even
+			 * before type= is seen (type used to gate path and silently
+			 * drop wallpapers when path came first).
+			 */
 			if (strcmp(key, "type") == 0) {
-				if (strcmp(value, "color") == 0) {
+				if (strcmp(valp, "color") == 0) {
 					config->type = BG_COLOR;
-				} else if (strcmp(value, "image") == 0) {
+				} else if (strcmp(valp, "image") == 0) {
 					config->type = BG_IMAGE;
 				}
-			} else if (strcmp(key, "color") == 0 && config->type == BG_COLOR) {
-				config->color = parse_hex_color(value);
-			} else if (strcmp(key, "path") == 0 && config->type == BG_IMAGE) {
-				strncpy(config->path, value, MAX_PATH_LEN - 1);
+			} else if (strcmp(key, "color") == 0) {
+				config->color = parse_hex_color(valp);
+			} else if (strcmp(key, "path") == 0) {
+				strncpy(config->path, valp, MAX_PATH_LEN - 1);
 				config->path[MAX_PATH_LEN - 1] = '\0';
-			} else if (strcmp(key, "mode") == 0 && config->type == BG_IMAGE) {
-				if (strcmp(value, "tiled") == 0) {
+			} else if (strcmp(key, "mode") == 0) {
+				if (strcmp(valp, "tiled") == 0) {
 					config->mode = IMAGE_TILED;
 					printf("[BGCE] image tiled\n");
-				} else if (strcmp(value, "scaled") == 0) {
+				} else if (strcmp(valp, "scaled") == 0) {
 					config->mode = IMAGE_SCALED;
 				}
 			}
 		} else if (strcmp(current_section, "cursors") == 0) {
 			if (strcmp(key, "theme") == 0) {
-				load_cursor_theme(value, &config->cursors);
+				load_cursor_theme(valp, &config->cursors);
 			} else {
 				fprintf(stderr, "[BGCE] Unknown cursor config key: %s "
 				        "(expected 'theme')\n", key);
@@ -515,24 +530,30 @@ int load_config(struct config* config) {
 				struct key_combo kc = parse_key_combo(key);
 				if (kc.key != 0) {
 					struct shortcut sc = {0};
-					enum shortcut_parse_result rc = parse_shortcut_rhs(value, &sc);
+					enum shortcut_parse_result rc = parse_shortcut_rhs(valp, &sc);
 					if (rc == SHORTCUT_PARSE_OK) {
 						sc.combo = kc;
 						config->shortcuts[config->shortcut_count] = sc;
 						config->shortcut_count++;
 					} else if (rc == SHORTCUT_PARSE_UNSUPPORTED_BUILTIN) {
 						fprintf(stderr, "[BGCE] Unsupported builtin command in shortcut '%s = %s' (must be 'exit' or 'screenshot')\n",
-						        key, value);
+						        key, valp);
 					} else if (rc == SHORTCUT_PARSE_EMPTY_COMMAND) {
-						fprintf(stderr, "[BGCE] Empty command value in shortcut '%s = %s'\n", key, value);
+						fprintf(stderr, "[BGCE] Empty command value in shortcut '%s = %s'\n", key, valp);
 					} else {
-						fprintf(stderr, "[BGCE] Invalid shortcut '%s = %s'\n", key, value);
+						fprintf(stderr, "[BGCE] Invalid shortcut '%s = %s'\n", key, valp);
 					}
 				} else {
 					fprintf(stderr, "[BGCE] Ignoring shortcut with unknown key combo: %s\n", key);
 				}
 			}
 		}
+	}
+
+	/* Image background with no path → fall back to solid color. */
+	if (config->type == BG_IMAGE && !config->path[0]) {
+		fprintf(stderr, "[BGCE] background type=image but path is empty; using color\n");
+		config->type = BG_COLOR;
 	}
 
 	// Add default exit/screenshot shortcuts unless the user explicitly
@@ -649,71 +670,86 @@ void print_config(const struct config* config)
 	printf("[BGCE] === end config ===\n");
 }
 
-// Apply background to a buffer
-int apply_background(struct config* config, uint32_t* buffer, uint32_t width, uint32_t height) {
+/* Pack stbi RGBA → ARGB uint32. */
+static inline uint32_t rgba_to_u32(const unsigned char *p)
+{
+	return ((uint32_t)p[3] << 24) | ((uint32_t)p[0] << 16) |
+	       ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+}
+
+// Apply background to a buffer (typically the full virtual desktop).
+int apply_background(struct config* config, uint32_t* buffer,
+                     uint32_t width, uint32_t height,
+                     uint32_t tile_w, uint32_t tile_h) {
+	if (!config || !buffer || width == 0 || height == 0)
+		return -1;
+
+	if (tile_w == 0)
+		tile_w = width;
+	if (tile_h == 0)
+		tile_h = height;
+
 	if (config->type == BG_COLOR) {
-		// Fill with solid color
-		for (uint32_t i = 0; i < width * height; i++) {
+		for (uint32_t i = 0; i < width * height; i++)
 			buffer[i] = config->color;
-		}
-		return 0;
-	} else if (config->type == BG_IMAGE) {
-		// Load and apply image
-		int img_width, img_height, img_channels;
-		unsigned char* img_data = stbi_load(config->path, &img_width, &img_height, &img_channels, 4);
-		if (!img_data) {
-			fprintf(stderr, "[BGCE] Failed to load image: %s\n", config->path);
-			// Fallback to a default color (dark gray with full opacity)
-			fprintf(stderr, "[BGCE] Falling back to default color #333333\n");
-			for (uint32_t i = 0; i < width * height; i++) {
-				buffer[i] = 0xFF333333;
-			}
-			return 0;
-		}
-
-		if (config->mode == IMAGE_TILED) {
-			// Tile the image
-			for (uint32_t y = 0; y < height; y++) {
-				for (uint32_t x = 0; x < width; x++) {
-					uint32_t img_x = x % img_width;
-					uint32_t img_y = y % img_height;
-					uint32_t img_idx = (img_y * img_width + img_x) * 4;
-					uint32_t buf_idx = y * width + x;
-
-					// Convert RGBA to uint32_t
-					buffer[buf_idx] =
-					        (img_data[img_idx + 3] << 24) |
-					        (img_data[img_idx] << 16) |
-					        (img_data[img_idx + 1] << 8) |
-					        img_data[img_idx + 2];
-				}
-			}
-		} else {
-			// Scale the image (simple nearest-neighbor)
-			// TODO: improve this
-			float x_ratio = (float)img_width / width;
-			float y_ratio = (float)img_height / height;
-
-			for (uint32_t y = 0; y < height; y++) {
-				for (uint32_t x = 0; x < width; x++) {
-					uint32_t img_x = (uint32_t)(x * x_ratio);
-					uint32_t img_y = (uint32_t)(y * y_ratio);
-					uint32_t img_idx = (img_y * img_width + img_x) * 4;
-					uint32_t buf_idx = y * width + x;
-
-					// Convert RGBA to uint32_t
-					buffer[buf_idx] =
-					        (img_data[img_idx + 3] << 24) |
-					        (img_data[img_idx] << 16) |
-					        (img_data[img_idx + 1] << 8) |
-					        img_data[img_idx + 2];
-				}
-			}
-		}
-
-		stbi_image_free(img_data);
 		return 0;
 	}
 
-	return -1;
+	if (config->type != BG_IMAGE)
+		return -1;
+
+	int img_width, img_height, img_channels;
+	unsigned char *img_data =
+	        stbi_load(config->path, &img_width, &img_height, &img_channels, 4);
+	if (!img_data) {
+		fprintf(stderr, "[BGCE] Failed to load background image: %s\n",
+		        config->path[0] ? config->path : "(empty path)");
+		fprintf(stderr, "[BGCE] Falling back to default color #333333\n");
+		for (uint32_t i = 0; i < width * height; i++)
+			buffer[i] = 0xFF333333;
+		return 0;
+	}
+
+	printf("[BGCE] Background image %s (%dx%d) mode=%s → canvas %ux%u\n",
+	       config->path, img_width, img_height,
+	       config->mode == IMAGE_TILED ? "tiled" : "scaled",
+	       width, height);
+
+	if (config->mode == IMAGE_TILED) {
+		/* Repeat source texels over the whole canvas. */
+		for (uint32_t y = 0; y < height; y++) {
+			uint32_t img_y = y % (uint32_t)img_height;
+			for (uint32_t x = 0; x < width; x++) {
+				uint32_t img_x = x % (uint32_t)img_width;
+				uint32_t img_idx = (img_y * (uint32_t)img_width + img_x) * 4;
+				buffer[y * width + x] = rgba_to_u32(img_data + img_idx);
+			}
+		}
+	} else {
+		/*
+		 * Scaled: stretch the image over the full canvas (virtual desktop).
+		 * tile_w/tile_h are unused for this mode (kept for API stability).
+		 */
+		(void)tile_w;
+		(void)tile_h;
+		float x_ratio = (float)img_width / (float)width;
+		float y_ratio = (float)img_height / (float)height;
+
+		for (uint32_t y = 0; y < height; y++) {
+			uint32_t img_y = (uint32_t)(y * y_ratio);
+			if (img_y >= (uint32_t)img_height)
+				img_y = (uint32_t)img_height - 1;
+			for (uint32_t x = 0; x < width; x++) {
+				uint32_t img_x = (uint32_t)(x * x_ratio);
+				if (img_x >= (uint32_t)img_width)
+					img_x = (uint32_t)img_width - 1;
+				uint32_t img_idx =
+				        (img_y * (uint32_t)img_width + img_x) * 4;
+				buffer[y * width + x] = rgba_to_u32(img_data + img_idx);
+			}
+		}
+	}
+
+	stbi_image_free(img_data);
+	return 0;
 }

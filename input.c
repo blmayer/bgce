@@ -63,15 +63,29 @@ int resize_buffer(struct Client* c, int dx, int dy) {
 	size_t buf_size;
 	int shm_fd;
 	void *map;
-	uint32_t new_w, new_h;
+	uint32_t new_world_w, new_world_h, new_w, new_h;
+	uint32_t old_ww, old_wh;
 
 	if (!c)
 		return 0;
 
-	new_w = (uint32_t)((int)c->width + dx);
-	new_h = (uint32_t)((int)c->height + dy);
-	if (new_w == 0 || new_h == 0)
+	old_ww = c->world_w ? c->world_w : c->width;
+	old_wh = c->world_h ? c->world_h : c->height;
+	new_world_w = (uint32_t)((int)old_ww + dx);
+	new_world_h = (uint32_t)((int)old_wh + dy);
+	if (new_world_w == 0 || new_world_h == 0)
 		return 0;
+
+	/*
+	 * Keep buffer:world ratio so content scale matches creation zoom.
+	 * Client is told the new buffer size via MSG_BUFFER_CHANGE.
+	 */
+	new_w = (uint32_t)((float)new_world_w * (float)c->width / (float)old_ww + 0.5f);
+	new_h = (uint32_t)((float)new_world_h * (float)c->height / (float)old_wh + 0.5f);
+	if (new_w < 1)
+		new_w = 1;
+	if (new_h < 1)
+		new_h = 1;
 
 	old_name[0] = '\0';
 	if (c->buffer) {
@@ -107,10 +121,13 @@ int resize_buffer(struct Client* c, int dx, int dy) {
 	c->buffer = map;
 	c->width = new_w;
 	c->height = new_h;
-	printf("[BGCE] Client resized: %p size=%zu (%dx%d) name=%s\n",
+	c->world_w = new_world_w;
+	c->world_h = new_world_h;
+	printf("[BGCE] Client resized: %p size=%zu buf=%ux%u world=%ux%u name=%s\n",
 	       c->buffer,
 	       c->width * c->height * 4UL,
 	       c->width, c->height,
+	       c->world_w, c->world_h,
 	       c->shm_name);
 	return 1;
 }
@@ -123,8 +140,10 @@ struct Client* pick_client(int x, int y) {
 	struct Client* c = server.clients;
 	struct Client* picked = NULL;
 	while (c) {
-		if (wx >= (float)c->x && wx < (float)(c->x + c->width) &&
-		    wy >= (float)c->y && wy < (float)(c->y + c->height)) {
+		uint32_t ww = c->world_w ? c->world_w : c->width;
+		uint32_t wh = c->world_h ? c->world_h : c->height;
+		if (wx >= (float)c->x && wx < (float)(c->x + ww) &&
+		    wy >= (float)c->y && wy < (float)(c->y + wh)) {
 			picked = c;
 			break;
 		}
@@ -688,11 +707,14 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			switch (drag.type) {
 			case DRAG_PAN: {
 				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
+				float old_px = server.pan_x;
+				float old_py = server.pan_y;
 				server.pan_x -= (float)dx / z;
 				server.pan_y -= (float)dy / z;
 				clamp_viewport(&server);
 				skip_cursor_paint = 1;
-				redraw_all(&server);
+				/* Shift existing FB pixels; only paint exposed edges. */
+				redraw_pan(&server, old_px, old_py);
 				break;
 			}
 			case DRAG_MOVE: {
@@ -781,11 +803,13 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			switch (drag.type) {
 			case DRAG_PAN: {
 				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
+				float old_px = server.pan_x;
+				float old_py = server.pan_y;
 				server.pan_x -= (float)dx / z;
 				server.pan_y -= (float)dy / z;
 				clamp_viewport(&server);
 				skip_cursor_paint = 1;
-				redraw_all(&server);
+				redraw_pan(&server, old_px, old_py);
 				break;
 			}
 			case DRAG_MOVE: {
@@ -952,16 +976,26 @@ void* input_loop(void* arg) {
 			case EV_REL:
 			case EV_ABS: {
 				float wx, wy;
+				uint32_t ww = c.world_w ? c.world_w : c.width;
+				uint32_t wh = c.world_h ? c.world_h : c.height;
 				screen_to_world(&server, (float)mouse_x, (float)mouse_y,
 				                &wx, &wy);
 				int in = wx >= (float)c.x &&
-				         wx < (float)(c.x + c.width) &&
+				         wx < (float)(c.x + ww) &&
 				         wy >= (float)c.y &&
-				         wy < (float)(c.y + c.height);
+				         wy < (float)(c.y + wh);
 				if (!in)
 					continue;
-				e.x = (int32_t)(wx - (float)c.x);
-				e.y = (int32_t)(wy - (float)c.y);
+				/* Report buffer-local coords so clients match their pixels. */
+				if (ww > 0 && wh > 0) {
+					e.x = (int32_t)((wx - (float)c.x) *
+					                (float)c.width / (float)ww);
+					e.y = (int32_t)((wy - (float)c.y) *
+					                (float)c.height / (float)wh);
+				} else {
+					e.x = (int32_t)(wx - (float)c.x);
+					e.y = (int32_t)(wy - (float)c.y);
+				}
 				break;
 			}
 			default:

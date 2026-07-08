@@ -200,12 +200,41 @@ static void setup_log_file(void) {
 	/* pipefd[0] is owned by the log thread */
 }
 
+static void print_startup_banner(void)
+{
+	/* Matches the project site / README mark — first thing in the log. */
+	static const char *const logo[] = {
+		"┌────────────────────────────────────┐",
+		"│ BGCE.                              │",
+		"│     |\\                             │",
+		"│      ^                             │",
+		"│                   ┌───────┐        │",
+		"│      ┌───────┐    │       │        │",
+		"│      │       │    │       │        │",
+		"│      │       │    │       │        │",
+		"│      │       │    │       │        │",
+		"│      └───────┘    └───────┘        │",
+		"│                                    │",
+		"└────────────────────────────────────┘",
+		"Brian's Graphical Computer Environment",
+		NULL,
+	};
+	int i;
+
+	puts("");
+	for (i = 0; logo[i]; i++)
+		puts(logo[i]);
+	puts("");
+}
+
 int main(void) {
 	setup_log_file();
 
 	/* Line-buffered so each log line is timestamped as a unit */
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	setvbuf(stderr, NULL, _IOLBF, 0);
+
+	print_startup_banner();
 
 	/* Auto-reap child processes so command shortcuts don't leave zombies */
 	signal(SIGCHLD, SIG_IGN);
@@ -307,6 +336,9 @@ int main(void) {
 	background_client.z = 0; /* special: never focusable */
 	background_client.width = server.virtual_w;
 	background_client.height = server.virtual_h;
+	/* 1:1 world ↔ buffer for the desktop surface */
+	background_client.world_w = server.virtual_w;
+	background_client.world_h = server.virtual_h;
 	background_client.buffer = malloc((size_t)server.virtual_w * server.virtual_h * 4);
 	if (!background_client.buffer) {
 		perror("[BGCE] malloc background");
@@ -317,11 +349,15 @@ int main(void) {
 	background_client.fd = -1;
 	server.clients = &background_client;
 
+	/* Wallpaper covers the full virtual desktop (scaled mode stretches). */
 	apply_background(&config, background_client.buffer,
+	                 server.virtual_w, server.virtual_h,
 	                 server.virtual_w, server.virtual_h);
 
 	puts("[BGCE] Drawing background");
-	draw(&server, background_client);
+	/* Full recomposite so the wallpaper fills the screen even if draw()
+	 * bounds are edge-clamped oddly on the first paint. */
+	redraw_all(&server);
 
 	if (init_input() != 0) {
 		perror("[BGCE] Failed to start input thread");

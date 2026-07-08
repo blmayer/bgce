@@ -150,8 +150,9 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
 
 /**
  * Request a shared memory buffer from the server.
- * width/height are in virtual-desktop (world) pixels.
- * Returns a mapped buffer pointer on success, or NULL on failure.
+ * width/height are the client's drawing size (buffer pixels). The server
+ * places the window so it appears roughly that large on screen at the
+ * current zoom (world size = buffer / zoom). Returns a mapped buffer, or NULL.
  */
 void* bgce_get_buffer(int conn, struct BufferRequest req);
 
