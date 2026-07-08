@@ -19,8 +19,8 @@
 struct ServerState server = {}; /* Global server state */
 struct config config = {};            /* Global config (background + shortcuts) */
 
-/* SIGINT (Ctrl+C on the controlling tty) — do not kill the server; the input
- * thread turns this into key events for the focused client. */
+/* SIGINT (Ctrl+C on the controlling tty) — swallow only; do not exit.
+ * Client Ctrl+C comes from /dev/input as normal keys to the focused client. */
 volatile sig_atomic_t bgce_sigint_pending = 0;
 
 static void on_sigint(int sig)
@@ -242,7 +242,7 @@ int main(void) {
 	/* A crashed client must not take down the server on the next write(). */
 	signal(SIGPIPE, SIG_IGN);
 
-	/* Ctrl+C on the tty must not kill the compositor — forward to focus. */
+	/* Ctrl+C on the tty must not kill the compositor (trap & ignore). */
 	signal(SIGINT, on_sigint);
 	/* Real shutdown: kill/SIGTERM or configured exit shortcut (e.g. ctrl+alt+q) */
 	signal(SIGTERM, cleanup_and_exit);

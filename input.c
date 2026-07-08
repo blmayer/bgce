@@ -8,6 +8,7 @@
 #include <linux/kd.h>
 #include <math.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -503,6 +504,18 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			} else if (sc->type == SHORTCUT_COMMAND) {
 				pid_t pid = fork();
 				if (pid == 0) {
+					/*
+					 * Leave bgce's process group / session.  Otherwise a
+					 * terminal Ctrl+C delivers SIGINT to every shortcut
+					 * child as well as the server (kernel process-group
+					 * broadcast), while bgce only meant to forward a
+					 * synthetic Ctrl+C to the focused client.
+					 */
+					if (setsid() < 0)
+						/* still try to run; better than _exit */
+						(void)setpgid(0, 0);
+					signal(SIGINT, SIG_DFL);
+					signal(SIGTERM, SIG_DFL);
 					execl("/bin/sh", "sh", "-c", sc->value, (char *)NULL);
 					_exit(127);
 				} else if (pid < 0) {
@@ -844,52 +857,14 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 	return 0;
 }
 
-/* Send one EV_KEY to the focused client (no-op if nothing focused). */
-static void send_key_to_focused(uint16_t code, int32_t value)
-{
-	struct Client *fc = server.focused_client;
-	struct BGCEMessage msg;
-	struct InputEvent *e;
-
-	if (!fc || fc->fd < 0)
-		return;
-
-	memset(&msg, 0, sizeof(msg));
-	msg.type = MSG_INPUT_EVENT;
-	e = &msg.data.input_event;
-	e->type = EV_KEY;
-	e->code = code;
-	e->value = value;
-	if (server.input.count > 0)
-		e->device = server.input.devs[0];
-	bgce_send_msg(fc->fd, &msg);
-}
-
+/*
+ * Tty Ctrl+C → SIGINT on the process group.  We only swallow it so the
+ * compositor does not exit.  Clients get Ctrl+C solely from /dev/input
+ * (keys to the focused client).  Synthesizing a chord here double-fired.
+ */
 void deliver_interrupt_to_focus(void)
 {
-	struct Client *fc = server.focused_client;
-	int inject_ctrl;
-
-	if (!fc || fc->fd < 0) {
-		printf("[BGCE] SIGINT/Ctrl+C: no focused client — ignored "
-		       "(use exit shortcut to quit the server)\n");
-		return;
-	}
-
-	printf("[BGCE] SIGINT/Ctrl+C: forwarding to focused client fd=%d\n", fc->fd);
-
-	/*
-	 * Clients see normal EV_KEY traffic (not Unix signals). Synthesize the
-	 * usual Ctrl+C chord. If Ctrl is already held from the keyboard, only
-	 * send C press/release.
-	 */
-	inject_ctrl = !ctrl_down;
-	if (inject_ctrl)
-		send_key_to_focused(KEY_LEFTCTRL, 1);
-	send_key_to_focused(KEY_C, 1);
-	send_key_to_focused(KEY_C, 0);
-	if (inject_ctrl)
-		send_key_to_focused(KEY_LEFTCTRL, 0);
+	/* No-op for clients; retained for API stability. */
 }
 
 static void poll_sigint(void)
@@ -897,7 +872,6 @@ static void poll_sigint(void)
 	if (!bgce_sigint_pending)
 		return;
 	bgce_sigint_pending = 0;
-	deliver_interrupt_to_focus();
 }
 
 void* input_loop(void* arg) {
@@ -915,7 +889,7 @@ void* input_loop(void* arg) {
 	printf("[BGCE] Input: polling %zu device(s)\n", count);
 
 	while (1) {
-		/* Finite timeout so SIGINT (set from another thread/handler) is noticed. */
+		/* Finite timeout so SIGINT is cleared and does not kill us. */
 		int ret = poll(fds, count, 200);
 		poll_sigint();
 		if (ret < 0) {
@@ -985,7 +959,6 @@ void* input_loop(void* arg) {
 				         wy < (float)(c.y + wh);
 				if (!in)
 					continue;
-				/* Report buffer-local coords so clients match their pixels. */
 				if (ww > 0 && wh > 0) {
 					e.x = (int32_t)((wx - (float)c.x) *
 					                (float)c.width / (float)ww);

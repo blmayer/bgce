@@ -182,10 +182,10 @@ int apply_background(struct config* config, uint32_t* buffer,
  */
 void bgce_announce(const char *fmt, ...);
 
-/** Set by SIGINT handler; input thread delivers as Ctrl+C to focus. */
+/** Set by SIGINT handler; input thread clears it (server stays up). */
 extern volatile sig_atomic_t bgce_sigint_pending;
 
-/** Forward a synthetic Ctrl+C (KEY_LEFTCTRL + KEY_C) to the focused client. */
+/** Historical hook; SIGINT is swallowed — clients use keyboard input only. */
 void deliver_interrupt_to_focus(void);
 
 /** Clean shutdown (restore VT, unlink socket). Safe from the input thread. */
