@@ -32,7 +32,7 @@ HEADLESS_OBJS = display.o display_mock.o config.o mock.o input_headless.o locati
 all: bgce libbgce.so
 
 bgce: $(SERVER_OBJS)
-	$(CC) $(CFLAGS) -o $@ server.o loop.o input.o display.o $(DISPLAY_OBJ) config.o -L. -lbgce $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ server.o loop.o input.o display.o $(DISPLAY_OBJ) config.o location_cache.o -L. -lbgce $(LDFLAGS)
 
 libbgce.so: $(LIB_OBJS)
 	$(CC) -shared -o $@ $(LIB_OBJS)
