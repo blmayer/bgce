@@ -225,10 +225,10 @@ void* client_thread(void* arg) {
 
 		case MSG_DRAW: {
 			/*
-			 * Blit on this client thread only — never on the input thread.
-			 * A slow composite must not freeze the software cursor.
+			 * Blit this client only (clipped by windows above).
+			 * On this client thread only — never on the input thread.
 			 */
-			draw(&server, *client);
+			draw(&server, client);
 			break;
 		}
 		case MSG_MOVE: {

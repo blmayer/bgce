@@ -177,7 +177,7 @@ void bgce_mock_draw(struct Client *c)
 {
 	if (!c)
 		return;
-	draw(&server, *c);
+	draw(&server, c);
 }
 
 void bgce_mock_remove_client(struct Client *c)
@@ -237,7 +237,7 @@ void bgce_mock_focus(struct Client *c)
 	if (server.focused_client)
 		c->z = server.focused_client->z + 1;
 	server.focused_client = c;
-	draw(&server, *c);
+	draw(&server, c);
 }
 
 struct Client *bgce_mock_click(int screen_x, int screen_y)

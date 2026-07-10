@@ -16,6 +16,10 @@ Implement a minimal Linux graphical environment that runs without root, manages 
 - **IPC:** UNIX domain sockets for commands, FIFO for input events.
 - **Buffers:** Each client has an off-screen buffer; server composites into real framebuffer.
 - **Rendering:** CPU-based memory blitting only (no OpenGL/DRI accel for now).
+- **MSG_DRAW:** Blit only the client that asked, clipped by opaque windows
+  above (subtract their rects). Do **not** full-stack recompose wallpaper /
+  clients below on ordinary draw — that was a regression (blink/refill).
+  Full stack is for erase/move expose/pan/zoom only.
 - **Focus Handling:** Server tracks which client receives keyboard/mouse events.
 - **Event Model:** Blocking reads (no polling); async draw calls.
 - **Security:** Clients are sandboxed via file descriptors; no root operations.

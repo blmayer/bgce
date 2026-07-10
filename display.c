@@ -1080,6 +1080,111 @@ static int clip_to_display(const struct ServerState *srv,
 	return *x0 < *x1 && *y0 < *y1;
 }
 
+/* ------------------------------------------------------------------
+ * Visible-region helpers for MSG_DRAW (opaque windows).
+ *
+ * Subtract occluder [bx0,by0)×[bx1,by1) from subject [ax0,ay0)×[ax1,ay1).
+ * Writes 0–4 non-empty remnants into out[]; returns count.
+ * ------------------------------------------------------------------ */
+static int rect_subtract(int ax0, int ay0, int ax1, int ay1,
+                         int bx0, int by0, int bx1, int by1,
+                         int out[][4], int out_max)
+{
+	int n = 0;
+	int ix0, iy0, ix1, iy1;
+
+	if (out_max < 1)
+		return 0;
+	/* No intersection → subject unchanged. */
+	if (bx1 <= ax0 || bx0 >= ax1 || by1 <= ay0 || by0 >= ay1) {
+		out[0][0] = ax0;
+		out[0][1] = ay0;
+		out[0][2] = ax1;
+		out[0][3] = ay1;
+		return 1;
+	}
+	/* Clip occluder to subject. */
+	ix0 = bx0 > ax0 ? bx0 : ax0;
+	iy0 = by0 > ay0 ? by0 : ay0;
+	ix1 = bx1 < ax1 ? bx1 : ax1;
+	iy1 = by1 < ay1 ? by1 : ay1;
+	if (ix0 >= ix1 || iy0 >= iy1) {
+		out[0][0] = ax0;
+		out[0][1] = ay0;
+		out[0][2] = ax1;
+		out[0][3] = ay1;
+		return 1;
+	}
+	/* Top strip */
+	if (ay0 < iy0 && n < out_max) {
+		out[n][0] = ax0;
+		out[n][1] = ay0;
+		out[n][2] = ax1;
+		out[n][3] = iy0;
+		n++;
+	}
+	/* Bottom strip */
+	if (iy1 < ay1 && n < out_max) {
+		out[n][0] = ax0;
+		out[n][1] = iy1;
+		out[n][2] = ax1;
+		out[n][3] = ay1;
+		n++;
+	}
+	/* Left strip (middle band only) */
+	if (ax0 < ix0 && n < out_max) {
+		out[n][0] = ax0;
+		out[n][1] = iy0;
+		out[n][2] = ix0;
+		out[n][3] = iy1;
+		n++;
+	}
+	/* Right strip (middle band only) */
+	if (ix1 < ax1 && n < out_max) {
+		out[n][0] = ix1;
+		out[n][1] = iy0;
+		out[n][2] = ax1;
+		out[n][3] = iy1;
+		n++;
+	}
+	return n;
+}
+
+#define DRAW_VIS_MAX 32
+
+/*
+ * Subtract one opaque occluder screen rect from a list of visible rects.
+ * in_n rects in vis[][4]; result written back into vis, returns new count.
+ */
+static int vis_subtract_occluder(int vis[][4], int in_n,
+                                 int ox0, int oy0, int ox1, int oy1)
+{
+	int tmp[DRAW_VIS_MAX][4];
+	int out_n = 0;
+	int i, j, k;
+	int pieces[4][4];
+	int np;
+
+	for (i = 0; i < in_n; i++) {
+		np = rect_subtract(vis[i][0], vis[i][1], vis[i][2], vis[i][3],
+		                   ox0, oy0, ox1, oy1, pieces, 4);
+		for (j = 0; j < np && out_n < DRAW_VIS_MAX; j++) {
+			tmp[out_n][0] = pieces[j][0];
+			tmp[out_n][1] = pieces[j][1];
+			tmp[out_n][2] = pieces[j][2];
+			tmp[out_n][3] = pieces[j][3];
+			out_n++;
+		}
+	}
+	for (k = 0; k < out_n; k++) {
+		vis[k][0] = tmp[k][0];
+		vis[k][1] = tmp[k][1];
+		vis[k][2] = tmp[k][2];
+		vis[k][3] = tmp[k][3];
+	}
+	return out_n;
+}
+
 /* Composite everything from `behind` into a rect, clipped to the display. */
 static void composite_behind_rect(struct ServerState *srv, struct Client *behind,
                                   int x0, int y0, int x1, int y1)
@@ -1291,31 +1396,81 @@ void redraw_pan(struct ServerState *srv, int old_pan_x, int old_pan_y)
 	cursor_fb_end(1);
 }
 
-void draw(struct ServerState* srv, struct Client cli) {
+/*
+ * MSG_DRAW — design (do not “fix” by full-stack recomposite):
+ *
+ * Original BGCE model: the client that asked to draw only updates *its own*
+ * visible pixels.  We do NOT repaint wallpaper or windows below, and we do
+ * NOT walk the whole stack bottom→top into the client’s rect (that caused
+ * visible refill/blink and was a regression from this design).
+ *
+ * Algorithm (opaque windows; list is top → bottom):
+ *   1. Start with the drawer’s screen bounds as the visible region.
+ *   2. Walk clients from the head (topmost) until we reach `cli`.
+ *      Each window above subtracts its screen rect from the visible region.
+ *   3. When we arrive at `cli`, blit only the remaining rects from its buffer.
+ *   4. Windows above are never overwritten; windows below are never touched.
+ *
+ * Use composite_chain_to_rect / erase_client when underlay must change
+ * (unmap, move expose, pan edges, zoom) — not for ordinary MSG_DRAW.
+ *
+ * Cursor: lift only if damage hits the glyph; input thread re-presents.
+ */
+void draw(struct ServerState *srv, struct Client *cli)
+{
 	int sx0, sy0, sx1, sy1;
-	int lifted;
+	int vis[DRAW_VIS_MAX][4];
+	int nvis;
+	int lifted = 0;
+	int i;
+	struct Client *c;
 
-	if (!srv || !srv->framebuffer || !cli.buffer) {
-		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
+	if (!srv || !srv->framebuffer || !cli || !cli->buffer) {
+		fprintf(stderr,
+		        "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
 		return;
 	}
 
-	/*
-	 * Recompose the stack into this client's screen footprint only.
-	 * Blitting only `cli` would paint it on top of everyone (raise on
-	 * every MSG_DRAW).  Windows above it stay above; others outside
-	 * the rect are untouched.
-	 *
-	 * Cursor: lift if the damage hits the glyph; do not paint — the
-	 * input thread re-presents via display_cursor_present / set_cursor_pos.
-	 */
-	client_screen_bounds(srv, &cli, &sx0, &sy0, &sx1, &sy1);
+	client_screen_bounds(srv, cli, &sx0, &sy0, &sx1, &sy1);
 	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1))
 		return;
 
+	/* Visible pieces of this client after subtracting occluders above. */
+	vis[0][0] = sx0;
+	vis[0][1] = sy0;
+	vis[0][2] = sx1;
+	vis[0][3] = sy1;
+	nvis = 1;
+
+	for (c = srv->clients; c; c = c->next) {
+		int cx0, cy0, cx1, cy1;
+
+		if (c == cli)
+			break;
+		/* Skip non-drawable entries (e.g. empty); still occlude if they have size. */
+		client_screen_bounds(srv, c, &cx0, &cy0, &cx1, &cy1);
+		if (!clip_to_display(srv, &cx0, &cy0, &cx1, &cy1))
+			continue;
+		nvis = vis_subtract_occluder(vis, nvis, cx0, cy0, cx1, cy1);
+		if (nvis <= 0)
+			return; /* fully covered by windows above */
+	}
+
+	if (!c) {
+		/* Drawer not in the list — should not happen; refuse full-stack fallback. */
+		fprintf(stderr, "[BGCE] Draw: client not in stack, skip\n");
+		return;
+	}
+
 	cursor_fb_begin();
-	lifted = cursor_lift_for_rect_ret(sx0, sy0, sx1, sy1);
-	composite_chain_to_rect(srv, srv->clients, sx0, sy0, sx1, sy1);
+	for (i = 0; i < nvis; i++) {
+		if (cursor_lift_for_rect_ret(vis[i][0], vis[i][1],
+		                             vis[i][2], vis[i][3]))
+			lifted = 1;
+	}
+	for (i = 0; i < nvis; i++)
+		blit_client_overlap(srv, cli, vis[i][0], vis[i][1],
+		                    vis[i][2], vis[i][3]);
 	cursor_fb_end(lifted);
 }
 

@@ -226,10 +226,11 @@ void display_cursor_present(void);
 void set_cursor_type(enum BGCECursorType type);
 
 /**
- * Client content changed (MSG_DRAW): recompose the stacking order into
- * this client's screen rect only.  Does not raise the client.
+ * Client content changed (MSG_DRAW): blit only this client, clipped by
+ * windows stacked above it.  Does not repaint wallpaper or clients below,
+ * and does not raise the client.  See draw() in display.c for the model.
  */
-void draw(struct ServerState* srv, struct Client cli);
+void draw(struct ServerState *srv, struct Client *cli);
 
 /**
  * Move client on screen by world delta (dx, dy).  `c` is still at the old

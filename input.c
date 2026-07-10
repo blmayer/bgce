@@ -620,7 +620,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				if (drag.dx < 0 || drag.dy < 0) {
 					redraw_from_resize(&server, *c, drag.dx, drag.dy);
 				}
-				draw(&server, *c);
+				draw(&server, c);
 
 				struct BGCEMessage msg;
 				msg.type = MSG_BUFFER_CHANGE;
@@ -716,7 +716,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			 * app to finish a heavy redraw — that runs on the client
 			 * thread when it posts MSG_DRAW.  Never do client work here.
 			 */
-			draw(&server, *c);
+			draw(&server, c);
 			printf("[BGCE] Client focused (fd=%d).\n", c->fd);
 		}
 
