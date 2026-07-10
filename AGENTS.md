@@ -19,9 +19,10 @@ Implement a minimal Linux graphical environment that runs without root, manages 
 - **MSG_DRAW:** Blit only the client that asked, clipped by opaque windows
   above (subtract their rects). Do **not** full-stack recompose wallpaper /
   clients below on ordinary draw — that was a regression (blink/refill).
-- **Window move:** L-shaped expose only → underlay stack (bottom→top) in those
-  strips; then full blit of the moving client from its buffer. No FB scroll
-  of the window body; no full-stack recompose of old∪new.
+- **Window move:** expose = old screen rect \\ new (L when translating);
+  underlay those pieces with every client *except* the mover (bottom→top,
+  always includes wallpaper); then full blit of the mover at the new place.
+  No FB scroll of the body; no underlay under the mover’s new footprint.
   Full stack remains for erase / pan edges / zoom.
 - **Focus Handling:** Server tracks which client receives keyboard/mouse events.
 - **Event Model:** Blocking reads (no polling); async draw calls.

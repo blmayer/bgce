@@ -1185,15 +1185,6 @@ static int vis_subtract_occluder(int vis[][4], int in_n,
 	return out_n;
 }
 
-/* Composite everything from `behind` into a rect, clipped to the display. */
-static void composite_behind_rect(struct ServerState *srv, struct Client *behind,
-                                  int x0, int y0, int x1, int y1)
-{
-	if (!clip_to_display(srv, &x0, &y0, &x1, &y1))
-		return;
-	composite_chain_to_rect(srv, behind, x0, y0, x1, y1);
-}
-
 void redraw_all(struct ServerState* srv) {
 	if (!srv || !srv->framebuffer)
 		return;
@@ -1397,26 +1388,72 @@ void draw(struct ServerState *srv, struct Client *cli)
 }
 
 /*
+ * Paint every client except `skip` into a screen rect, bottom → top.
+ * Used for move expose so wallpaper (and true underlay) always runs even
+ * if list topology is odd — never leave the mover’s old pixels in the trail.
+ */
+static void composite_all_except(struct ServerState *srv,
+                                 const struct Client *skip,
+                                 int x0, int y0, int x1, int y1)
+{
+	struct Client *stack_local[64];
+	struct Client **stack = stack_local;
+	struct Client *c;
+	int n = 0, i, heap = 0;
+
+	if (!clip_to_display(srv, &x0, &y0, &x1, &y1))
+		return;
+
+	for (c = srv->clients; c; c = c->next) {
+		if (c == skip || !c->buffer)
+			continue;
+		n++;
+	}
+	if (n <= 0)
+		return;
+	if (n > (int)(sizeof(stack_local) / sizeof(stack_local[0]))) {
+		stack = malloc((size_t)n * sizeof(*stack));
+		if (!stack)
+			return;
+		heap = 1;
+	}
+	i = 0;
+	for (c = srv->clients; c; c = c->next) {
+		if (c == skip || !c->buffer)
+			continue;
+		stack[i++] = c;
+	}
+	/* stack[0] is topmost among remaining; paint bottom → top. */
+	for (i = n - 1; i >= 0; i--)
+		blit_client_overlap(srv, stack[i], x0, y0, x1, y1);
+	if (heap)
+		free(stack);
+}
+
+/*
  * Window move — design (initial BGCE model; do not “optimize” with FB scroll
  * of the whole window or full-stack recompose of old∪new):
  *
  * Caller: `c` is still at the OLD world position; apply (wdx,wdy) after.
  *
- *   1. Split the L-shaped expose: parts of the OLD screen rect that the
- *      window no longer covers after the move (axis strips when size is
- *      unchanged; old minus new when size changes).
- *   2. For each L strip only: composite bottom → top from clients *under*
- *      the mover (`c->next` … wallpaper). Small area, full underlay stack.
- *   3. For the moving client itself: blit it FULL from its buffer at the
- *      NEW position.  Do NOT re-walk windows under that body — only the
- *      drawer’s pixels.  (Same spirit as MSG_DRAW’s “only me”.)
- *   4. Re-blit windows stacked *above* the mover over old∪new so we never
- *      paint over them.
+ *   1. Expose = old screen rect minus new screen rect (L-shape when the
+ *      box only translates; general difference if size changes).  Exact
+ *      rect_subtract — not ad-hoc strips (strips can miss pixels when
+ *      integer world→screen bounds shift, leaving old window content on
+ *      the wallpaper).
+ *   2. For each expose piece only: composite bottom → top every client
+ *      *except* the mover (wallpaper + windows under + windows above that
+ *      cover the hole).  Overwrites the trail; never leaves mover pixels.
+ *   3. Blit the mover FULL from its buffer at the NEW position only —
+ *      do not re-stack under that body.
+ *   4. Re-blit windows stacked above the mover over old∪new (mover blit
+ *      may have covered them).
  *
  * Forbidden regressions:
- *   - fb_copy_rect_delta / FB scroll of the window body (looks fast, trails
- *     and wrong underlay; was mislabeled “fast path”).
+ *   - fb_copy_rect_delta / FB scroll of the window body.
  *   - composite_chain over the entire union of old and new for a move.
+ *   - Expose underlay that skips the wallpaper (c->next-only when the
+ *     chain is wrong) — leaves “L of old window” on the desktop.
  */
 void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 {
@@ -1424,12 +1461,10 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	struct Client *p;
 	int ox0, oy0, ox1, oy1;
 	int nx0, ny0, nx1, ny1;
-	int sdx, sdy;
-	int ow, oh, nw, nh;
 	int ux0, uy0, ux1, uy1;
 	int bx0, by0, bx1, by1;
-	int expose[4][4];
-	int nexp = 0;
+	int expose[8][4];
+	int nexp;
 	int i;
 
 	if (!srv || !srv->framebuffer || !c) {
@@ -1445,60 +1480,38 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	moved.y = (uint32_t)((int)c->y + wdy);
 	client_screen_bounds(srv, &moved, &nx0, &ny0, &nx1, &ny1);
 
-	sdx = nx0 - ox0;
-	sdy = ny0 - oy0;
-	if (sdx == 0 && sdy == 0 &&
-	    (ox1 - ox0) == (nx1 - nx0) && (oy1 - oy0) == (ny1 - ny0))
+	if (ox0 == nx0 && oy0 == ny0 && ox1 == nx1 && oy1 == ny1)
 		return;
 
-	ow = ox1 - ox0;
-	oh = oy1 - oy0;
-	nw = nx1 - nx0;
-	nh = ny1 - ny0;
+	/*
+	 * 1. Exact expose = old \ new.  Inflate old by 1px before subtract to
+	 * catch integer world→screen rounding hairs that otherwise keep a
+	 * 1-pixel ribbon of the previous window on the desktop.
+	 */
+	{
+		int ax0 = ox0 > 0 ? ox0 - 1 : ox0;
+		int ay0 = oy0 > 0 ? oy0 - 1 : oy0;
+		int ax1 = ox1 + 1;
+		int ay1 = oy1 + 1;
+
+		if (ax1 > (int)srv->display_w)
+			ax1 = (int)srv->display_w;
+		if (ay1 > (int)srv->display_h)
+			ay1 = (int)srv->display_h;
+		nexp = rect_subtract(ax0, ay0, ax1, ay1, nx0, ny0, nx1, ny1,
+		                     expose, 8);
+	}
 
 	cursor_fb_begin();
 	(void)cursor_lift_all_ret();
 
-	/* ---- 1–2. L-shaped (or old\\new) expose: underlay only ---- */
-	if (ow == nw && oh == nh) {
-		/* Classic L strips from translation of a fixed-size box. */
-		if (sdx > 0) {
-			int ex1 = ox0 + sdx;
-			if (ex1 > ox1)
-				ex1 = ox1;
-			if (ox0 < ex1)
-				composite_behind_rect(srv, c->next, ox0, oy0, ex1, oy1);
-		} else if (sdx < 0) {
-			int ex0 = ox1 + sdx;
-			if (ex0 < ox0)
-				ex0 = ox0;
-			if (ex0 < ox1)
-				composite_behind_rect(srv, c->next, ex0, oy0, ox1, oy1);
-		}
-		if (sdy > 0) {
-			int ey1 = oy0 + sdy;
-			if (ey1 > oy1)
-				ey1 = oy1;
-			if (oy0 < ey1)
-				composite_behind_rect(srv, c->next, ox0, oy0, ox1, ey1);
-		} else if (sdy < 0) {
-			int ey0 = oy1 + sdy;
-			if (ey0 < oy0)
-				ey0 = oy0;
-			if (ey0 < oy1)
-				composite_behind_rect(srv, c->next, ox0, ey0, ox1, oy1);
-		}
-	} else {
-		/* Size changed: expose = old rect minus new rect. */
-		nexp = rect_subtract(ox0, oy0, ox1, oy1, nx0, ny0, nx1, ny1,
-		                     expose, 4);
-		for (i = 0; i < nexp; i++)
-			composite_behind_rect(srv, c->next,
-			                      expose[i][0], expose[i][1],
-			                      expose[i][2], expose[i][3]);
-	}
+	/* 2. Underlay each expose piece (everyone but the mover). */
+	for (i = 0; i < nexp; i++)
+		composite_all_except(srv, c,
+		                     expose[i][0], expose[i][1],
+		                     expose[i][2], expose[i][3]);
 
-	/* ---- 3. Moving client: full buffer blit at new place only ---- */
+	/* 3. Moving client: full buffer blit at new place only. */
 	bx0 = nx0;
 	by0 = ny0;
 	bx1 = nx1;
@@ -1506,11 +1519,19 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	if (clip_to_display(srv, &bx0, &by0, &bx1, &by1))
 		blit_client_overlap(srv, &moved, bx0, by0, bx1, by1);
 
-	/* ---- 4. Windows above: redraw over old∪new ---- */
+	/* 4. Windows above: redraw over old∪new. */
 	ux0 = ox0 < nx0 ? ox0 : nx0;
 	uy0 = oy0 < ny0 ? oy0 : ny0;
 	ux1 = ox1 > nx1 ? ox1 : nx1;
 	uy1 = oy1 > ny1 ? oy1 : ny1;
+	if (ux0 > 0)
+		ux0--;
+	if (uy0 > 0)
+		uy0--;
+	if (ux1 < (int)srv->display_w)
+		ux1++;
+	if (uy1 < (int)srv->display_h)
+		uy1++;
 	if (clip_to_display(srv, &ux0, &uy0, &ux1, &uy1)) {
 		for (p = srv->clients; p && p != c; p = p->next)
 			blit_client_overlap(srv, p, ux0, uy0, ux1, uy1);
