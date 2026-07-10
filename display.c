@@ -59,8 +59,13 @@ static int cur_underlay_valid; /* 1 = FB has glyph; underlay is live */
  * (restore underlay) when they damage that tile, then set cursor_dirty so
  * the input thread re-presents.  Avoids restore/paint races that left a
  * 32×32 square of stale underlay (wallpaper under a redrawing window).
+ *
+ * fb_writing: compositor is mid-blit.  Input must not paint/restore then
+ * (would sample or replay a half-updated tile and freeze the look of the
+ * window under the pointer).  Only update cursor_x/y + dirty.
  */
 static volatile int cursor_dirty;
+static volatile int fb_writing;
 
 static enum BGCECursorType current_cursor = BGCE_CURSOR_DEFAULT;
 
@@ -480,48 +485,35 @@ static int cursor_tile_overlaps(int x0, int y0, int x1, int y1)
 	return x0 < cx1 && x1 > cx && y0 < cy1 && y1 > cy;
 }
 
-/*
- * Compositor: remove glyph if it sits in the damage rect so blits do not
- * bake it into client content.  Does not re-paint (input owns that).
- */
-static void cursor_lift_for_rect(int x0, int y0, int x1, int y1)
+static int cursor_lift_for_rect_ret(int x0, int y0, int x1, int y1)
 {
 	if (!cur_underlay_valid)
-		return;
+		return 0;
 	if (!cursor_tile_overlaps(x0, y0, x1, y1))
-		return;
+		return 0;
 	cursor_restore();
+	return 1;
 }
 
-/* Compositor: full-scene / scroll paths — glyph must not ride FB copies. */
-static void cursor_lift_all(void)
+static int cursor_lift_all_ret(void)
 {
+	if (!cur_underlay_valid)
+		return 0;
 	cursor_restore();
+	return 1;
 }
 
-/*
- * After a full-scene / scroll composite: glyph must be re-presented.
- * Lift if input painted mid-draw.
- */
-static void cursor_after_composite(void)
+/* Begin/end compositor FB writes (paired). */
+static void cursor_fb_begin(void)
 {
-	if (cur_underlay_valid)
-		cursor_restore();
-	cursor_dirty = 1;
+	fb_writing = 1;
 }
 
-/*
- * After a damage-rect composite: only disturb the cursor if the glyph
- * intersects that rect (or is already lifted / never painted).
- */
-static void cursor_after_damage(int x0, int y0, int x1, int y1)
+static void cursor_fb_end(int need_present)
 {
-	if (cur_underlay_valid && cursor_tile_overlaps(x0, y0, x1, y1)) {
-		cursor_restore();
+	fb_writing = 0;
+	if (need_present)
 		cursor_dirty = 1;
-	} else if (!cur_underlay_valid) {
-		cursor_dirty = 1;
-	}
 }
 
 int display_cursor_pending(void)
@@ -531,7 +523,7 @@ int display_cursor_pending(void)
 
 void display_cursor_present(void)
 {
-	if (!server.framebuffer)
+	if (!server.framebuffer || fb_writing)
 		return;
 	if (!cursor_dirty && cur_underlay_valid)
 		return;
@@ -540,7 +532,10 @@ void display_cursor_present(void)
 
 void display_cursor_refresh(void)
 {
-	/* Input-owned full refresh. */
+	if (fb_writing) {
+		cursor_dirty = 1;
+		return;
+	}
 	cursor_restore();
 	cursor_paint();
 }
@@ -549,8 +544,19 @@ void set_cursor_pos(struct ServerState *srv, int x, int y)
 {
 	(void)srv;
 	clamp_cursor_pos(&x, &y);
+
+	/*
+	 * Compositor owns the FB right now: only remember the hotspot.
+	 * Painting would sample a half-drawn frame and leave a frozen tile.
+	 */
+	if (fb_writing) {
+		cursor_x = x;
+		cursor_y = y;
+		cursor_dirty = 1;
+		return;
+	}
+
 	if (x == cursor_x && y == cursor_y) {
-		/* Same spot: still re-present if a compositor dirtied us. */
 		if (cursor_dirty || !cur_underlay_valid)
 			cursor_paint();
 		return;
@@ -565,6 +571,12 @@ void set_cursor_type(enum BGCECursorType type)
 {
 	if (type < 0 || type >= BGCE_CURSOR_COUNT)
 		type = BGCE_CURSOR_DEFAULT;
+	if (fb_writing) {
+		current_cursor = type;
+		render_cursor(cur_img, 32, 32, 32);
+		cursor_dirty = 1;
+		return;
+	}
 	if (type == current_cursor && cur_underlay_valid && !cursor_dirty)
 		return;
 	current_cursor = type;
@@ -1158,14 +1170,16 @@ static void fb_copy_rect_delta(struct ServerState *srv,
 void redraw_all(struct ServerState* srv) {
 	if (!srv || !srv->framebuffer)
 		return;
-	cursor_lift_all();
+	cursor_fb_begin();
+	(void)cursor_lift_all_ret();
 	composite_chain_to_rect(srv, srv->clients, 0, 0,
 	                        (int)srv->display_w, (int)srv->display_h);
-	cursor_after_composite();
+	cursor_fb_end(1);
 }
 
 void erase_client(struct ServerState* srv, const struct Client* gone) {
 	int sx0, sy0, sx1, sy1;
+	int lifted;
 
 	if (!srv || !srv->framebuffer || !gone)
 		return;
@@ -1174,10 +1188,11 @@ void erase_client(struct ServerState* srv, const struct Client* gone) {
 	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1))
 		return;
 
-	cursor_lift_for_rect(sx0, sy0, sx1, sy1);
+	cursor_fb_begin();
+	lifted = cursor_lift_for_rect_ret(sx0, sy0, sx1, sy1);
 	/* Remaining clients only (caller already unlinked `gone`). */
 	composite_chain_to_rect(srv, srv->clients, sx0, sy0, sx1, sy1);
-	cursor_after_damage(sx0, sy0, sx1, sy1);
+	cursor_fb_end(lifted);
 }
 
 /*
@@ -1246,13 +1261,13 @@ void redraw_pan(struct ServerState *srv, int old_pan_x, int old_pan_y)
 	if (sdx == 0 && sdy == 0)
 		return;
 
-	/* Lift glyph so it does not scroll with the FB; input re-presents. */
-	cursor_lift_all();
+	cursor_fb_begin();
+	(void)cursor_lift_all_ret();
 
 	/* No useful overlap — full copy from client buffers. */
 	if (sdx <= -w || sdx >= w || sdy <= -h || sdy >= h) {
 		composite_chain_to_rect(srv, srv->clients, 0, 0, w, h);
-		cursor_after_composite();
+		cursor_fb_end(1);
 		return;
 	}
 
@@ -1273,11 +1288,12 @@ void redraw_pan(struct ServerState *srv, int old_pan_x, int old_pan_y)
 	else if (sdy < 0)
 		composite_chain_to_rect(srv, srv->clients, 0, h + sdy, w, h);
 
-	cursor_after_composite();
+	cursor_fb_end(1);
 }
 
 void draw(struct ServerState* srv, struct Client cli) {
 	int sx0, sy0, sx1, sy1;
+	int lifted;
 
 	if (!srv || !srv->framebuffer || !cli.buffer) {
 		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
@@ -1297,9 +1313,10 @@ void draw(struct ServerState* srv, struct Client cli) {
 	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1))
 		return;
 
-	cursor_lift_for_rect(sx0, sy0, sx1, sy1);
+	cursor_fb_begin();
+	lifted = cursor_lift_for_rect_ret(sx0, sy0, sx1, sy1);
 	composite_chain_to_rect(srv, srv->clients, sx0, sy0, sx1, sy1);
-	cursor_after_damage(sx0, sy0, sx1, sy1);
+	cursor_fb_end(lifted);
 }
 
 /*
@@ -1342,8 +1359,9 @@ void redraw_region(struct ServerState* srv, struct Client* c, int wdx, int wdy) 
 	nw = nx1 - nx0;
 	nh = ny1 - ny0;
 
+	cursor_fb_begin();
 	/* Move path may scroll FB pixels; always lift glyph first. */
-	cursor_lift_all();
+	(void)cursor_lift_all_ret();
 
 	if (ow == nw && oh == nh) {
 		/* L-shape: scroll body, fill exposed strips only. */
@@ -1397,7 +1415,7 @@ void redraw_region(struct ServerState* srv, struct Client* c, int wdx, int wdy) 
 			blit_client_overlap(srv, p, ux0, uy0, ux1, uy1);
 	}
 
-	cursor_after_composite();
+	cursor_fb_end(1);
 }
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
@@ -1440,10 +1458,14 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
 		uy1 = (int)srv->display_h;
 
 	/* Everything behind the resized client into the union; draw() later. */
-	cursor_lift_for_rect(ux0, uy0, ux1, uy1);
-	if (ux0 < ux1 && uy0 < uy1)
-		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
-	cursor_after_damage(ux0, uy0, ux1, uy1);
+	{
+		int lifted;
+		cursor_fb_begin();
+		lifted = cursor_lift_for_rect_ret(ux0, uy0, ux1, uy1);
+		if (ux0 < ux1 && uy0 < uy1)
+			composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
+		cursor_fb_end(lifted);
+	}
 }
 
 int take_screenshot(const char* filename) {
@@ -1456,7 +1478,8 @@ int take_screenshot(const char* filename) {
 	}
 
 	/* Don't bake the software cursor into the PNG. */
-	cursor_lift_all();
+	cursor_fb_begin();
+	(void)cursor_lift_all_ret();
 
 	width = server.display_w;
 	height = server.display_h;
@@ -1472,8 +1495,9 @@ int take_screenshot(const char* filename) {
 		(int)stride
 	);
 
+	cursor_fb_end(1);
 	/* Re-present immediately; screenshot runs on input/server path. */
-	cursor_paint();
+	display_cursor_present();
 
 	if (!result) {
 		fprintf(stderr, "[BGCE] Failed to save screenshot to %s.\n", filename);
