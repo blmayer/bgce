@@ -50,8 +50,8 @@ void bgce_mock_move(struct Client *c, int wdx, int wdy);
 /** Pan viewport by screen-pixel mouse delta. */
 void bgce_mock_pan_screen(int sdx, int sdy);
 
-/** Zoom by factor toward screen point (sx, sy). */
-void bgce_mock_zoom_at(float factor, int sx, int sy);
+/** Set absolute zoom percent (50–400, 100 = 1×) toward screen point. */
+void bgce_mock_zoom_to(int zoom_pct, int sx, int sy);
 
 /** Dump framebuffer to PNG (cursor omitted). path NULL → mock_shot.png */
 int bgce_mock_screenshot(const char *path);

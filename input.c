@@ -35,9 +35,9 @@ struct {
 	struct Client* target;
 	int dx;
 	int dy;
-	/* Sub-pixel accumulators so fine zoom still moves windows smoothly */
-	float acc_x;
-	float acc_y;
+	/* Sub-pixel residual in 256ths of a world pixel (integer only). */
+	int acc_x;
+	int acc_y;
 	enum {
 		DRAG_MOVE,
 		DRAG_RESIZE,
@@ -131,16 +131,16 @@ int resize_buffer(struct Client* c, int dx, int dy) {
 
 /* Pick topmost non-background client under screen-space (x, y). */
 struct Client* pick_client(int x, int y) {
-	float wx, wy;
-	screen_to_world(&server, (float)x, (float)y, &wx, &wy);
+	int wx, wy;
+	screen_to_world(&server, x, y, &wx, &wy);
 
 	struct Client* c = server.clients;
 	struct Client* picked = NULL;
 	while (c) {
 		uint32_t ww = c->world_w ? c->world_w : c->width;
 		uint32_t wh = c->world_h ? c->world_h : c->height;
-		if (wx >= (float)c->x && wx < (float)(c->x + ww) &&
-		    wy >= (float)c->y && wy < (float)(c->y + wh)) {
+		if (wx >= (int)c->x && wx < (int)(c->x + ww) &&
+		    wy >= (int)c->y && wy < (int)(c->y + wh)) {
 			picked = c;
 			break;
 		}
@@ -151,43 +151,49 @@ struct Client* pick_client(int x, int y) {
 
 /*
  * Screen-pixel mouse delta → integer world delta.
- *   world += mouse * speed / zoom
- * so on-screen motion ≈ mouse * speed at any zoom (relative speed constant).
- * Fractional remainder is accumulated for smooth slow drags.
+ *   world += mouse * speed * 100 / zoom_pct
+ * Residual stored in 256ths of a world pixel.
+ * `speed` is only converted from config float at the call boundary.
  */
-static void screen_delta_to_world(float sdx, float sdy, float speed,
-                                  float* acc_x, float* acc_y,
-                                  int* wdx, int* wdy) {
-	float z = server.zoom > 0.0f ? server.zoom : 1.0f;
-	float s = speed > 0.0f ? speed : 1.0f;
-	*acc_x += sdx * s / z;
-	*acc_y += sdy * s / z;
-	*wdx = (int)truncf(*acc_x);
-	*wdy = (int)truncf(*acc_y);
-	*acc_x -= (float)*wdx;
-	*acc_y -= (float)*wdy;
+static void screen_delta_to_world(int sdx, int sdy, float speed,
+                                  int *acc_x, int *acc_y,
+                                  int *wdx, int *wdy)
+{
+	int z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+	/* speed 1.0 → 256; keep integer after this conversion */
+	int sp = (int)(speed * 256.0f + 0.5f);
+	if (sp < 1)
+		sp = 256;
+
+	/* delta_256 = sdx * sp * 100 / z */
+	*acc_x += sdx * sp * 100 / z;
+	*acc_y += sdy * sp * 100 / z;
+	*wdx = *acc_x / 256;
+	*wdy = *acc_y / 256;
+	*acc_x -= *wdx * 256;
+	*acc_y -= *wdy * 256;
 }
 
-static void apply_zoom_at_cursor(float factor) {
-	float old_zoom = server.zoom;
-	float new_zoom = old_zoom * factor;
-	if (new_zoom < BGCE_ZOOM_MIN)
-		new_zoom = BGCE_ZOOM_MIN;
-	if (new_zoom > BGCE_ZOOM_MAX)
-		new_zoom = BGCE_ZOOM_MAX;
-	if (fabsf(new_zoom - old_zoom) < 1e-6f)
-		return;
+static void apply_zoom_at_cursor(int dir)
+{
+	int old_pct = server.zoom_pct;
+	int wx, wy;
+	int z;
 
 	/* Keep the world point under the cursor fixed on screen. */
-	float wx, wy;
-	screen_to_world(&server, (float)mouse_x, (float)mouse_y, &wx, &wy);
-	server.zoom = new_zoom;
-	server.pan_x = wx - (float)mouse_x / new_zoom;
-	server.pan_y = wy - (float)mouse_y / new_zoom;
+	screen_to_world(&server, mouse_x, mouse_y, &wx, &wy);
+
+	if (!bgce_zoom_step(&server, dir))
+		return;
+
+	z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+	server.pan_x = wx - mouse_x * 100 / z;
+	server.pan_y = wy - mouse_y * 100 / z;
 	clamp_viewport(&server);
 	redraw_all(&server);
-	printf("[BGCE] Zoom: %.2f  pan=(%.1f, %.1f)\n",
-	       server.zoom, server.pan_x, server.pan_y);
+	display_cursor_present();
+	printf("[BGCE] Zoom: %d%%  pan=(%d, %d)  was %d%%\n",
+	       server.zoom_pct, server.pan_x, server.pan_y, old_pct);
 }
 
 void client_disconnected(struct Client* c)
@@ -742,12 +748,12 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 	/* Alt + scroll wheel → zoom toward cursor */
 	if (ev.type == EV_REL && ev.code == REL_WHEEL && alt_down) {
 		/* Positive value = scroll up = zoom in */
-		float factor = (ev.value > 0) ? BGCE_ZOOM_STEP : (1.0f / BGCE_ZOOM_STEP);
+		int dir = (ev.value > 0) ? 1 : -1;
 		int steps = ev.value >= 0 ? ev.value : -ev.value;
 		if (steps < 1)
 			steps = 1;
 		for (int i = 0; i < steps; i++)
-			apply_zoom_at_cursor(factor);
+			apply_zoom_at_cursor(dir);
 		return 1;
 	}
 
@@ -783,13 +789,15 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		if (drag.active) {
 			switch (drag.type) {
 			case DRAG_PAN: {
-				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
-				float s = config.pan_speed > 0.0f ? config.pan_speed : 1.0f;
-				float old_px = server.pan_x;
-				float old_py = server.pan_y;
-				/* Same relative on-screen speed as window move. */
-				server.pan_x -= (float)dx * s / z;
-				server.pan_y -= (float)dy * s / z;
+				int z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+				int sp = (int)(config.pan_speed * 256.0f + 0.5f);
+				int old_px = server.pan_x;
+				int old_py = server.pan_y;
+				if (sp < 1)
+					sp = 256;
+				/* world pan so on-screen speed ≈ mouse * pan_speed */
+				server.pan_x -= dx * sp * 100 / (z * 256);
+				server.pan_y -= dy * sp * 100 / (z * 256);
 				clamp_viewport(&server);
 				redraw_pan(&server, old_px, old_py);
 				set_cursor_pos(&server, mouse_x, mouse_y);
@@ -800,8 +808,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				if (!c)
 					return 1;
 				int wdx, wdy;
-				screen_delta_to_world((float)dx, (float)dy,
-				                     config.move_speed,
+				screen_delta_to_world(dx, dy, config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
 					redraw_region(&server, c, wdx, wdy);
@@ -813,8 +820,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			}
 			case DRAG_RESIZE: {
 				int wdx, wdy;
-				screen_delta_to_world((float)dx, (float)dy,
-				                     config.move_speed,
+				screen_delta_to_world(dx, dy, config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				drag.dx += wdx;
 				drag.dy += wdy;
@@ -876,12 +882,14 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 			switch (drag.type) {
 			case DRAG_PAN: {
-				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
-				float s = config.pan_speed > 0.0f ? config.pan_speed : 1.0f;
-				float old_px = server.pan_x;
-				float old_py = server.pan_y;
-				server.pan_x -= (float)dx * s / z;
-				server.pan_y -= (float)dy * s / z;
+				int z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+				int sp = (int)(config.pan_speed * 256.0f + 0.5f);
+				int old_px = server.pan_x;
+				int old_py = server.pan_y;
+				if (sp < 1)
+					sp = 256;
+				server.pan_x -= dx * sp * 100 / (z * 256);
+				server.pan_y -= dy * sp * 100 / (z * 256);
 				clamp_viewport(&server);
 				redraw_pan(&server, old_px, old_py);
 				set_cursor_pos(&server, mouse_x, mouse_y);
@@ -892,8 +900,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				if (!c)
 					return 1;
 				int wdx, wdy;
-				screen_delta_to_world((float)dx, (float)dy,
-				                     config.move_speed,
+				screen_delta_to_world(dx, dy, config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
 					redraw_region(&server, c, wdx, wdy);
@@ -905,8 +912,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			}
 			case DRAG_RESIZE: {
 				int wdx, wdy;
-				screen_delta_to_world((float)dx, (float)dy,
-				                     config.move_speed,
+				screen_delta_to_world(dx, dy, config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				drag.dx += wdx;
 				drag.dy += wdy;
@@ -957,9 +963,15 @@ void* input_loop(void* arg) {
 	printf("[BGCE] Input: polling %zu device(s)\n", count);
 
 	while (1) {
-		/* Finite timeout so SIGINT is cleared and does not kill us. */
-		int ret = poll(fds, count, 200);
+		/*
+		 * Finite timeout: SIGINT handling + re-present software cursor
+		 * after client redraws (compositor sets dirty, input paints).
+		 */
+		int timeout_ms = display_cursor_pending() ? 8 : 200;
+		int ret = poll(fds, count, timeout_ms);
 		poll_sigint();
+		/* Always ok to call; no-op if cursor is already valid. */
+		display_cursor_present();
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
@@ -1016,25 +1028,24 @@ void* input_loop(void* arg) {
 				/* fall through — mouse buttons carry position */
 			case EV_REL:
 			case EV_ABS: {
-				float wx, wy;
+				int wx, wy;
 				uint32_t ww = c.world_w ? c.world_w : c.width;
 				uint32_t wh = c.world_h ? c.world_h : c.height;
-				screen_to_world(&server, (float)mouse_x, (float)mouse_y,
-				                &wx, &wy);
-				int in = wx >= (float)c.x &&
-				         wx < (float)(c.x + ww) &&
-				         wy >= (float)c.y &&
-				         wy < (float)(c.y + wh);
+				screen_to_world(&server, mouse_x, mouse_y, &wx, &wy);
+				int in = wx >= (int)c.x &&
+				         wx < (int)(c.x + ww) &&
+				         wy >= (int)c.y &&
+				         wy < (int)(c.y + wh);
 				if (!in)
 					continue;
 				if (ww > 0 && wh > 0) {
-					e.x = (int32_t)((wx - (float)c.x) *
-					                (float)c.width / (float)ww);
-					e.y = (int32_t)((wy - (float)c.y) *
-					                (float)c.height / (float)wh);
+					e.x = (int32_t)((wx - (int)c.x) *
+					                (int)c.width / (int)ww);
+					e.y = (int32_t)((wy - (int)c.y) *
+					                (int)c.height / (int)wh);
 				} else {
-					e.x = (int32_t)(wx - (float)c.x);
-					e.y = (int32_t)(wy - (float)c.y);
+					e.x = (int32_t)(wx - (int)c.x);
+					e.y = (int32_t)(wy - (int)c.y);
 				}
 				break;
 			}

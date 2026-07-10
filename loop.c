@@ -102,16 +102,17 @@ void* client_thread(void* arg) {
 
 			/*
 			 * req size is the client's drawing buffer (logical pixels).
-			 * World geometry is buffer / zoom so the window occupies
-			 * ~req.width×req.height *screen* pixels at the current zoom —
-			 * apps opened while zoomed out still look natural.
+			 * World geometry is buffer * 100 / zoom_pct so the window
+			 * occupies ~req.width×req.height screen pixels at the
+			 * current zoom — apps opened while zoomed out look natural.
 			 */
 			{
-				float z = server.zoom > 0.0f ? server.zoom : 1.0f;
+				int z = server.zoom_pct > 0 ? server.zoom_pct
+				                            : BGCE_ZOOM_PCT_1X;
 				uint32_t world_w =
-				        (uint32_t)((float)req.width / z + 0.5f);
+				        (uint32_t)((req.width * 100 + z / 2) / z);
 				uint32_t world_h =
-				        (uint32_t)((float)req.height / z + 0.5f);
+				        (uint32_t)((req.height * 100 + z / 2) / z);
 				if (world_w < 1)
 					world_w = 1;
 				if (world_h < 1)
@@ -119,9 +120,8 @@ void* client_thread(void* arg) {
 
 				printf(
 				        "[BGCE] Client requested buffer %ux%u "
-				        "(world %ux%u @ zoom=%.2f)\n",
-				        req.width, req.height, world_w, world_h,
-				        (double)z);
+				        "(world %ux%u @ zoom=%d%%)\n",
+				        req.width, req.height, world_w, world_h, z);
 
 				/* Unmap and remember old token before creating a new one. */
 				had_buffer = client->buffer != NULL;
@@ -188,16 +188,16 @@ void* client_thread(void* arg) {
 						       "at %u,%u\n",
 						       client->app_id, cx, cy);
 					} else {
-						float wx, wy;
-						screen_to_world(&server, 0.0f, 0.0f, &wx, &wy);
-						if (wx < 0.0f)
-							wx = 0.0f;
-						if (wy < 0.0f)
-							wy = 0.0f;
-						if (wx > (float)server.virtual_w)
-							wx = (float)server.virtual_w;
-						if (wy > (float)server.virtual_h)
-							wy = (float)server.virtual_h;
+						int wx, wy;
+						screen_to_world(&server, 0, 0, &wx, &wy);
+						if (wx < 0)
+							wx = 0;
+						if (wy < 0)
+							wy = 0;
+						if (wx > (int)server.virtual_w)
+							wx = (int)server.virtual_w;
+						if (wy > (int)server.virtual_h)
+							wy = (int)server.virtual_h;
 						client->x = (uint32_t)wx;
 						client->y = (uint32_t)wy;
 					}

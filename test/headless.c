@@ -66,7 +66,7 @@ int main(void)
 		return 1;
 
 	/* Zoom out and pan */
-	bgce_mock_zoom_at(0.5f, 320, 240);
+	bgce_mock_zoom_to(50, 320, 240);
 	if (bgce_mock_screenshot("headless_06_zoomed_out.png") != 0)
 		return 1;
 	bgce_mock_pan_screen(40, 30);

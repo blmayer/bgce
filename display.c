@@ -54,6 +54,13 @@ static int cursor_y;
 static int cur_saved_x;
 static int cur_saved_y;
 static int cur_underlay_valid; /* 1 = FB has glyph; underlay is live */
+/*
+ * Input thread owns cursor paint.  Compositor threads only lift the glyph
+ * (restore underlay) when they damage that tile, then set cursor_dirty so
+ * the input thread re-presents.  Avoids restore/paint races that left a
+ * 32×32 square of stale underlay (wallpaper under a redrawing window).
+ */
+static volatile int cursor_dirty;
 
 static enum BGCECursorType current_cursor = BGCE_CURSOR_DEFAULT;
 
@@ -437,8 +444,8 @@ static void cursor_restore(void)
 
 /*
  * Draw the glyph at cursor_x/y.  Always lifts any previous glyph first so
- * calling paint twice never bakes a pointer into the underlay (that was a
- * common source of trails when only moving the mouse).
+ * calling paint twice never bakes a pointer into the underlay.
+ * Input thread only (via set_cursor_pos / display_cursor_present).
  */
 static void cursor_paint(void)
 {
@@ -459,10 +466,81 @@ static void cursor_paint(void)
 	cur_saved_x = cursor_x;
 	cur_saved_y = cursor_y;
 	cur_underlay_valid = 1;
+	cursor_dirty = 0;
+}
+
+/* True if [x0,x1)×[y0,y1) intersects the cursor's 32×32 tile. */
+static int cursor_tile_overlaps(int x0, int y0, int x1, int y1)
+{
+	int cx = cur_underlay_valid ? cur_saved_x : cursor_x;
+	int cy = cur_underlay_valid ? cur_saved_y : cursor_y;
+	int cx1 = cx + 32;
+	int cy1 = cy + 32;
+
+	return x0 < cx1 && x1 > cx && y0 < cy1 && y1 > cy;
+}
+
+/*
+ * Compositor: remove glyph if it sits in the damage rect so blits do not
+ * bake it into client content.  Does not re-paint (input owns that).
+ */
+static void cursor_lift_for_rect(int x0, int y0, int x1, int y1)
+{
+	if (!cur_underlay_valid)
+		return;
+	if (!cursor_tile_overlaps(x0, y0, x1, y1))
+		return;
+	cursor_restore();
+}
+
+/* Compositor: full-scene / scroll paths — glyph must not ride FB copies. */
+static void cursor_lift_all(void)
+{
+	cursor_restore();
+}
+
+/*
+ * After a full-scene / scroll composite: glyph must be re-presented.
+ * Lift if input painted mid-draw.
+ */
+static void cursor_after_composite(void)
+{
+	if (cur_underlay_valid)
+		cursor_restore();
+	cursor_dirty = 1;
+}
+
+/*
+ * After a damage-rect composite: only disturb the cursor if the glyph
+ * intersects that rect (or is already lifted / never painted).
+ */
+static void cursor_after_damage(int x0, int y0, int x1, int y1)
+{
+	if (cur_underlay_valid && cursor_tile_overlaps(x0, y0, x1, y1)) {
+		cursor_restore();
+		cursor_dirty = 1;
+	} else if (!cur_underlay_valid) {
+		cursor_dirty = 1;
+	}
+}
+
+int display_cursor_pending(void)
+{
+	return cursor_dirty || !cur_underlay_valid;
+}
+
+void display_cursor_present(void)
+{
+	if (!server.framebuffer)
+		return;
+	if (!cursor_dirty && cur_underlay_valid)
+		return;
+	cursor_paint();
 }
 
 void display_cursor_refresh(void)
 {
+	/* Input-owned full refresh. */
 	cursor_restore();
 	cursor_paint();
 }
@@ -471,8 +549,12 @@ void set_cursor_pos(struct ServerState *srv, int x, int y)
 {
 	(void)srv;
 	clamp_cursor_pos(&x, &y);
-	if (x == cursor_x && y == cursor_y && cur_underlay_valid)
+	if (x == cursor_x && y == cursor_y) {
+		/* Same spot: still re-present if a compositor dirtied us. */
+		if (cursor_dirty || !cur_underlay_valid)
+			cursor_paint();
 		return;
+	}
 	cursor_restore();
 	cursor_x = x;
 	cursor_y = y;
@@ -483,7 +565,7 @@ void set_cursor_type(enum BGCECursorType type)
 {
 	if (type < 0 || type >= BGCE_CURSOR_COUNT)
 		type = BGCE_CURSOR_DEFAULT;
-	if (type == current_cursor && cur_underlay_valid)
+	if (type == current_cursor && cur_underlay_valid && !cursor_dirty)
 		return;
 	current_cursor = type;
 	cursor_restore();
@@ -601,69 +683,117 @@ void release_vt(void) {
  * Viewport / coordinate transforms
  * ------------------------------------------------------------------ */
 
-void screen_to_world(const struct ServerState* srv, float sx, float sy,
-                     float* wx, float* wy) {
-	float z = srv->zoom > 0.0f ? srv->zoom : 1.0f;
+/* Zoom percent helpers (all integer). screen = world * pct / 100 */
+static int zoom_pct_of(const struct ServerState *srv)
+{
+	int z = srv && srv->zoom_pct > 0 ? srv->zoom_pct : BGCE_ZOOM_PCT_1X;
+	if (z < BGCE_ZOOM_PCT_MIN)
+		z = BGCE_ZOOM_PCT_MIN;
+	if (z > BGCE_ZOOM_PCT_MAX)
+		z = BGCE_ZOOM_PCT_MAX;
+	return z;
+}
+
+void screen_to_world(const struct ServerState *srv, int sx, int sy,
+                     int *wx, int *wy)
+{
+	int z = zoom_pct_of(srv);
 	if (wx)
-		*wx = sx / z + srv->pan_x;
+		*wx = sx * 100 / z + srv->pan_x;
 	if (wy)
-		*wy = sy / z + srv->pan_y;
+		*wy = sy * 100 / z + srv->pan_y;
 }
 
-void world_to_screen(const struct ServerState* srv, float wx, float wy,
-                     float* sx, float* sy) {
+void world_to_screen(const struct ServerState *srv, int wx, int wy,
+                     int *sx, int *sy)
+{
+	int z = zoom_pct_of(srv);
 	if (sx)
-		*sx = (wx - srv->pan_x) * srv->zoom;
+		*sx = (wx - srv->pan_x) * z / 100;
 	if (sy)
-		*sy = (wy - srv->pan_y) * srv->zoom;
+		*sy = (wy - srv->pan_y) * z / 100;
 }
 
-void clamp_viewport(struct ServerState* srv) {
+int bgce_zoom_set(struct ServerState *srv, int zoom_pct)
+{
+	int old;
+
+	if (!srv)
+		return 0;
+	if (zoom_pct < BGCE_ZOOM_PCT_MIN)
+		zoom_pct = BGCE_ZOOM_PCT_MIN;
+	if (zoom_pct > BGCE_ZOOM_PCT_MAX)
+		zoom_pct = BGCE_ZOOM_PCT_MAX;
+	old = srv->zoom_pct > 0 ? srv->zoom_pct : BGCE_ZOOM_PCT_1X;
+	if (zoom_pct == old)
+		return 0;
+	srv->zoom_pct = zoom_pct;
+	return 1;
+}
+
+int bgce_zoom_step(struct ServerState *srv, int dir)
+{
+	int cur, next;
+
+	if (!srv || dir == 0)
+		return 0;
+	cur = srv->zoom_pct > 0 ? srv->zoom_pct : BGCE_ZOOM_PCT_1X;
+	next = cur + (dir > 0 ? BGCE_ZOOM_PCT_STEP : -BGCE_ZOOM_PCT_STEP);
+	return bgce_zoom_set(srv, next);
+}
+
+void clamp_viewport(struct ServerState *srv)
+{
+	int z, vis_w, vis_h, max_x, max_y;
+
 	if (!srv)
 		return;
-	if (srv->zoom < BGCE_ZOOM_MIN)
-		srv->zoom = BGCE_ZOOM_MIN;
-	if (srv->zoom > BGCE_ZOOM_MAX)
-		srv->zoom = BGCE_ZOOM_MAX;
+	z = zoom_pct_of(srv);
+	srv->zoom_pct = z;
 
-	float vis_w = (float)srv->display_w / srv->zoom;
-	float vis_h = (float)srv->display_h / srv->zoom;
-	float max_x = (float)srv->virtual_w - vis_w;
-	float max_y = (float)srv->virtual_h - vis_h;
+	vis_w = (int)srv->display_w * 100 / z;
+	vis_h = (int)srv->display_h * 100 / z;
+	max_x = (int)srv->virtual_w - vis_w;
+	max_y = (int)srv->virtual_h - vis_h;
 
-	if (max_x < 0.0f) {
-		/* View larger than world — center the desktop */
-		srv->pan_x = max_x * 0.5f;
-	} else {
-		if (srv->pan_x < 0.0f)
-			srv->pan_x = 0.0f;
+	if (max_x < 0)
+		srv->pan_x = max_x / 2;
+	else {
+		if (srv->pan_x < 0)
+			srv->pan_x = 0;
 		if (srv->pan_x > max_x)
 			srv->pan_x = max_x;
 	}
 
-	if (max_y < 0.0f) {
-		srv->pan_y = max_y * 0.5f;
-	} else {
-		if (srv->pan_y < 0.0f)
-			srv->pan_y = 0.0f;
+	if (max_y < 0)
+		srv->pan_y = max_y / 2;
+	else {
+		if (srv->pan_y < 0)
+			srv->pan_y = 0;
 		if (srv->pan_y > max_y)
 			srv->pan_y = max_y;
 	}
 }
 
 /* Screen-space axis-aligned bounds of a client (exclusive end). */
-static void client_screen_bounds(const struct ServerState* srv, const struct Client* cli,
-                                 int* sx0, int* sy0, int* sx1, int* sy1) {
-	float fsx0, fsy0, fsx1, fsy1;
+static void client_screen_bounds(const struct ServerState *srv,
+                                 const struct Client *cli,
+                                 int *sx0, int *sy0, int *sx1, int *sy1)
+{
 	uint32_t ww = cli->world_w ? cli->world_w : cli->width;
 	uint32_t wh = cli->world_h ? cli->world_h : cli->height;
-	world_to_screen(srv, (float)cli->x, (float)cli->y, &fsx0, &fsy0);
-	world_to_screen(srv, (float)(cli->x + ww), (float)(cli->y + wh),
-	                &fsx1, &fsy1);
-	*sx0 = (int)floorf(fsx0);
-	*sy0 = (int)floorf(fsy0);
-	*sx1 = (int)ceilf(fsx1);
-	*sy1 = (int)ceilf(fsy1);
+	int a, b, c, d;
+
+	world_to_screen(srv, (int)cli->x, (int)cli->y, &a, &b);
+	world_to_screen(srv, (int)(cli->x + ww), (int)(cli->y + wh), &c, &d);
+	*sx0 = a;
+	*sy0 = b;
+	*sx1 = c;
+	*sy1 = d;
+	if (*sx1 <= *sx0)
+		*sx1 = *sx0 + 1;
+	if (*sy1 <= *sy0)
+		*sy1 = *sy0 + 1;
 }
 
 /*
@@ -681,18 +811,17 @@ static inline void fill_u32(uint32_t *p, int n, uint32_t v)
 }
 
 /*
- * 1:1 blit when zoom ≈ 1 and buffer size == world size.
- *   world = screen + floor(pan)
- * so we row-memcpy (same spirit as the cursor gather/scatter path).
+ * 1:1 blit when zoom_pct == 100 and buffer size == world size.
+ *   world = screen + pan
  */
 static void blit_client_1to1(uint32_t *dst, uint32_t screen_w,
                              const uint32_t *src, int cw, int ch,
                              int cli_x, int cli_y,
                              int ox0, int oy0, int ox1, int oy1,
-                             float pan_x, float pan_y)
+                             int pan_x, int pan_y)
 {
-	int ipx = (int)floorf(pan_x);
-	int ipy = (int)floorf(pan_y);
+	int ipx = pan_x;
+	int ipy = pan_y;
 	int cx0 = cli_x, cy0 = cli_y;
 	int cx1 = cx0 + cw, cy1 = cy0 + ch;
 
@@ -713,11 +842,9 @@ static void blit_client_1to1(uint32_t *dst, uint32_t screen_w,
 }
 
 /*
- * Fixed-point nearest-neighbour blit (16.16).
- * Maps screen → world → buffer, supporting windows whose world size differs
- * from their buffer size (zoom-at-create scaling).
+ * Fixed-point nearest-neighbour blit (16.16), integer zoom percent.
  *
- *   wx = sx / zoom + pan
+ *   wx = sx * 100 / zoom_pct + pan
  *   icx = (wx - cli_x) * bw / ww
  */
 static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
@@ -725,58 +852,70 @@ static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
                                int ww, int wh,
                                int cli_x, int cli_y,
                                int ox0, int oy0, int ox1, int oy1,
-                               float pan_x, float pan_y, float zoom)
+                               int pan_x, int pan_y, int zoom_pct)
 {
-	const float inv_z = 1.0f / zoom;
-	const float scale_x = (float)bw / (float)ww; /* buffer px per world px */
-	const float scale_y = (float)bh / (float)wh;
-	const int32_t step_x_fp =
-	        (int32_t)(inv_z * scale_x * 65536.0f + 0.5f);
-	const int32_t step_y_fp =
-	        (int32_t)(inv_z * scale_y * 65536.0f + 0.5f);
-	const int32_t x0_fp = (int32_t)floorf(
-		((float)ox0 * inv_z + pan_x - (float)cli_x) * scale_x * 65536.0f);
-	const int32_t y0_fp = (int32_t)floorf(
-		((float)oy0 * inv_z + pan_y - (float)cli_y) * scale_y * 65536.0f);
+	int64_t step_x_fp, step_y_fp, x0_fp, y0_fp;
+	int width = ox1 - ox0;
+	int magnify;
 
-	/* Effective magnification in buffer-space samples per screen pixel. */
-	const int magnify = (zoom * scale_x > 1.001f);
-	const int width = ox1 - ox0;
+	if (ww < 1)
+		ww = 1;
+	if (wh < 1)
+		wh = 1;
+	if (zoom_pct < 1)
+		zoom_pct = BGCE_ZOOM_PCT_1X;
+
+	step_x_fp = ((int64_t)100 * bw << 16) / ((int64_t)zoom_pct * ww);
+	step_y_fp = ((int64_t)100 * bh << 16) / ((int64_t)zoom_pct * wh);
+
+	{
+		int64_t wx0 = (int64_t)ox0 * 100 / zoom_pct + pan_x - cli_x;
+		int64_t wy0 = (int64_t)oy0 * 100 / zoom_pct + pan_y - cli_y;
+		x0_fp = (wx0 * bw << 16) / ww;
+		y0_fp = (wy0 * bh << 16) / wh;
+	}
+
+	magnify = (step_x_fp < 65536);
 
 	if (magnify) {
-		int32_t y_fp = y0_fp;
+		int32_t y_fp = (int32_t)y0_fp;
+		int32_t step_y = (int32_t)step_y_fp;
+		int32_t step_x = (int32_t)step_x_fp;
+		int32_t x0 = (int32_t)x0_fp;
 		for (int sy = oy0; sy < oy1; sy++) {
 			int icy = y_fp >> 16;
-			y_fp += step_y_fp;
+			y_fp += step_y;
 			if ((unsigned)icy >= (unsigned)bh)
 				continue;
 
 			uint32_t *drow = dst + sy * (int)screen_w + ox0;
 			const uint32_t *srow = src + icy * bw;
-			int32_t x_fp = x0_fp;
+			int32_t x_fp = x0;
 			int sx = 0;
 			while (sx < width) {
 				int icx = x_fp >> 16;
 				int run = 1;
-				int32_t probe = x_fp + step_x_fp;
+				int32_t probe = x_fp + step_x;
 				while (sx + run < width && (probe >> 16) == icx) {
 					run++;
-					probe += step_x_fp;
+					probe += step_x;
 				}
 				if ((unsigned)icx < (unsigned)bw)
 					fill_u32(drow + sx, run, srow[icx]);
 				sx += run;
-				x_fp = x0_fp + (int32_t)sx * step_x_fp;
+				x_fp = x0 + (int32_t)sx * step_x;
 			}
 		}
 		return;
 	}
 
-	/* Minify / arbitrary: one sample per screen pixel. */
 	{
 		int stack_map[2048];
 		int *xmap = stack_map;
 		int heap = 0;
+		int32_t step_x = (int32_t)step_x_fp;
+		int32_t step_y = (int32_t)step_y_fp;
+		int32_t x0 = (int32_t)x0_fp;
 
 		if (width > (int)(sizeof(stack_map) / sizeof(stack_map[0]))) {
 			xmap = malloc((size_t)width * sizeof(int));
@@ -785,26 +924,28 @@ static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
 			heap = 1;
 		}
 		{
-			int32_t x_fp = x0_fp;
+			int32_t x_fp = x0;
 			for (int i = 0; i < width; i++) {
 				xmap[i] = x_fp >> 16;
-				x_fp += step_x_fp;
+				x_fp += step_x;
 			}
 		}
 
-		int32_t y_fp = y0_fp;
-		for (int sy = oy0; sy < oy1; sy++) {
-			int icy = y_fp >> 16;
-			y_fp += step_y_fp;
-			if ((unsigned)icy >= (unsigned)bh)
-				continue;
+		{
+			int32_t y_fp = (int32_t)y0_fp;
+			for (int sy = oy0; sy < oy1; sy++) {
+				int icy = y_fp >> 16;
+				y_fp += step_y;
+				if ((unsigned)icy >= (unsigned)bh)
+					continue;
 
-			uint32_t *drow = dst + sy * (int)screen_w + ox0;
-			const uint32_t *srow = src + icy * bw;
-			for (int i = 0; i < width; i++) {
-				int icx = xmap[i];
-				if ((unsigned)icx < (unsigned)bw)
-					drow[i] = srow[icx];
+				uint32_t *drow = dst + sy * (int)screen_w + ox0;
+				const uint32_t *srow = src + icy * bw;
+				for (int i = 0; i < width; i++) {
+					int icx = xmap[i];
+					if ((unsigned)icx < (unsigned)bw)
+						drow[i] = srow[icx];
+				}
 			}
 		}
 		if (heap)
@@ -814,26 +955,29 @@ static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
 
 /*
  * Nearest-neighbour blit of a client into a screen-space damage rect.
- * Client geometry is in world coordinates; buffer may differ in size.
- *
- * Paths (fastest first):
- *  1. zoom ≈ 1 and world == buffer → 1:1 row memcpy
- *  2. otherwise → fixed-point NN (handles zoom and buf≠world)
+ * Paths: 1) zoom 100% + world==buffer → memcpy  2) else 16.16 NN
  */
-static void blit_client_overlap(struct ServerState* srv, const struct Client* cli,
-                                int rx0, int ry0, int rx1, int ry1) {
+static void blit_client_overlap(struct ServerState *srv, const struct Client *cli,
+                                int rx0, int ry0, int rx1, int ry1)
+{
+	int csx0, csy0, csx1, csy1;
+	int ox0, oy0, ox1, oy1;
+	uint32_t screen_w;
+	uint32_t *dst;
+	const uint32_t *src;
+	int bw, bh, ww, wh, z;
+
 	if (!srv || !srv->framebuffer || !cli || !cli->buffer)
 		return;
 	if (cli->width == 0 || cli->height == 0)
 		return;
 
-	int csx0, csy0, csx1, csy1;
 	client_screen_bounds(srv, cli, &csx0, &csy0, &csx1, &csy1);
 
-	int ox0 = rx0 > csx0 ? rx0 : csx0;
-	int oy0 = ry0 > csy0 ? ry0 : csy0;
-	int ox1 = rx1 < csx1 ? rx1 : csx1;
-	int oy1 = ry1 < csy1 ? ry1 : csy1;
+	ox0 = rx0 > csx0 ? rx0 : csx0;
+	oy0 = ry0 > csy0 ? ry0 : csy0;
+	ox1 = rx1 < csx1 ? rx1 : csx1;
+	oy1 = ry1 < csy1 ? ry1 : csy1;
 
 	if (ox0 < 0)
 		ox0 = 0;
@@ -847,28 +991,25 @@ static void blit_client_overlap(struct ServerState* srv, const struct Client* cl
 	if (ox0 >= ox1 || oy0 >= oy1)
 		return;
 
-	uint32_t screen_w = display_stride_px(srv);
-	uint32_t *dst = (uint32_t *)srv->framebuffer;
-	const uint32_t *src = (const uint32_t *)cli->buffer;
-	const int bw = (int)cli->width;
-	const int bh = (int)cli->height;
-	const int ww = (int)(cli->world_w ? cli->world_w : cli->width);
-	const int wh = (int)(cli->world_h ? cli->world_h : cli->height);
-	const float pan_x = srv->pan_x;
-	const float pan_y = srv->pan_y;
-	const float zoom = srv->zoom > 0.0f ? srv->zoom : 1.0f;
+	screen_w = display_stride_px(srv);
+	dst = (uint32_t *)srv->framebuffer;
+	src = (const uint32_t *)cli->buffer;
+	bw = (int)cli->width;
+	bh = (int)cli->height;
+	ww = (int)(cli->world_w ? cli->world_w : cli->width);
+	wh = (int)(cli->world_h ? cli->world_h : cli->height);
+	z = zoom_pct_of(srv);
 
-	/* Identity: zoom≈1 and buffer matches world footprint. */
-	if (fabsf(zoom - 1.0f) < 1e-4f && bw == ww && bh == wh) {
+	if (z == BGCE_ZOOM_PCT_1X && bw == ww && bh == wh) {
 		blit_client_1to1(dst, screen_w, src, bw, bh,
 		                 (int)cli->x, (int)cli->y,
-		                 ox0, oy0, ox1, oy1, pan_x, pan_y);
+		                 ox0, oy0, ox1, oy1, srv->pan_x, srv->pan_y);
 		return;
 	}
 
 	blit_client_scaled(dst, screen_w, src, bw, bh, ww, wh,
 	                   (int)cli->x, (int)cli->y,
-	                   ox0, oy0, ox1, oy1, pan_x, pan_y, zoom);
+	                   ox0, oy0, ox1, oy1, srv->pan_x, srv->pan_y, z);
 }
 
 static void composite_chain_to_rect(struct ServerState* srv, struct Client* first,
@@ -1017,11 +1158,10 @@ static void fb_copy_rect_delta(struct ServerState *srv,
 void redraw_all(struct ServerState* srv) {
 	if (!srv || !srv->framebuffer)
 		return;
-	/* Restore underlay before overwriting framebuffer pixels. */
-	cursor_restore();
+	cursor_lift_all();
 	composite_chain_to_rect(srv, srv->clients, 0, 0,
 	                        (int)srv->display_w, (int)srv->display_h);
-	cursor_paint();
+	cursor_after_composite();
 }
 
 void erase_client(struct ServerState* srv, const struct Client* gone) {
@@ -1034,10 +1174,10 @@ void erase_client(struct ServerState* srv, const struct Client* gone) {
 	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1))
 		return;
 
-	cursor_restore();
+	cursor_lift_for_rect(sx0, sy0, sx1, sy1);
 	/* Remaining clients only (caller already unlinked `gone`). */
 	composite_chain_to_rect(srv, srv->clients, sx0, sy0, sx1, sy1);
-	cursor_paint();
+	cursor_after_damage(sx0, sy0, sx1, sy1);
 }
 
 /*
@@ -1087,38 +1227,32 @@ static void fb_scroll(struct ServerState *srv, int sdx, int sdy)
 	}
 }
 
-void redraw_pan(struct ServerState *srv, float old_pan_x, float old_pan_y)
+void redraw_pan(struct ServerState *srv, int old_pan_x, int old_pan_y)
 {
-	float z;
+	int z;
 	int sdx, sdy;
 	int w, h;
 
 	if (!srv || !srv->framebuffer)
 		return;
 
-	z = srv->zoom > 0.0f ? srv->zoom : 1.0f;
-	/*
-	 * Fixed world points move on screen by -Δpan * zoom when the viewport
-	 * origin changes.  Integer pixel shift only — sub-pixel pan is a no-op
-	 * until it crosses a pixel boundary.
-	 */
-	sdx = (int)lroundf(-(srv->pan_x - old_pan_x) * z);
-	sdy = (int)lroundf(-(srv->pan_y - old_pan_y) * z);
+	z = zoom_pct_of(srv);
+	/* Fixed world points move on screen by -Δpan * zoom_pct / 100. */
+	sdx = -((srv->pan_x - old_pan_x) * z) / 100;
+	sdy = -((srv->pan_y - old_pan_y) * z) / 100;
 	w = (int)srv->display_w;
 	h = (int)srv->display_h;
 
 	if (sdx == 0 && sdy == 0)
 		return;
 
-	/*
-	 * Lift the cursor before scrolling.  Leave unrestored; caller must
-	 * set_cursor_pos() so the glyph tracks the real mouse position.
-	 */
-	cursor_restore();
+	/* Lift glyph so it does not scroll with the FB; input re-presents. */
+	cursor_lift_all();
 
 	/* No useful overlap — full copy from client buffers. */
 	if (sdx <= -w || sdx >= w || sdy <= -h || sdy >= h) {
 		composite_chain_to_rect(srv, srv->clients, 0, 0, w, h);
+		cursor_after_composite();
 		return;
 	}
 
@@ -1138,6 +1272,8 @@ void redraw_pan(struct ServerState *srv, float old_pan_x, float old_pan_y)
 		composite_chain_to_rect(srv, srv->clients, 0, 0, w, sdy);
 	else if (sdy < 0)
 		composite_chain_to_rect(srv, srv->clients, 0, h + sdy, w, h);
+
+	cursor_after_composite();
 }
 
 void draw(struct ServerState* srv, struct Client cli) {
@@ -1153,14 +1289,17 @@ void draw(struct ServerState* srv, struct Client cli) {
 	 * Blitting only `cli` would paint it on top of everyone (raise on
 	 * every MSG_DRAW).  Windows above it stay above; others outside
 	 * the rect are untouched.
+	 *
+	 * Cursor: lift if the damage hits the glyph; do not paint — the
+	 * input thread re-presents via display_cursor_present / set_cursor_pos.
 	 */
 	client_screen_bounds(srv, &cli, &sx0, &sy0, &sx1, &sy1);
 	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1))
 		return;
 
-	cursor_restore();
+	cursor_lift_for_rect(sx0, sy0, sx1, sy1);
 	composite_chain_to_rect(srv, srv->clients, sx0, sy0, sx1, sy1);
-	cursor_paint();
+	cursor_after_damage(sx0, sy0, sx1, sy1);
 }
 
 /*
@@ -1203,7 +1342,8 @@ void redraw_region(struct ServerState* srv, struct Client* c, int wdx, int wdy) 
 	nw = nx1 - nx0;
 	nh = ny1 - ny0;
 
-	cursor_restore();
+	/* Move path may scroll FB pixels; always lift glyph first. */
+	cursor_lift_all();
 
 	if (ow == nw && oh == nh) {
 		/* L-shape: scroll body, fill exposed strips only. */
@@ -1256,6 +1396,8 @@ void redraw_region(struct ServerState* srv, struct Client* c, int wdx, int wdy) 
 		for (p = srv->clients; p && p != c; p = p->next)
 			blit_client_overlap(srv, p, ux0, uy0, ux1, uy1);
 	}
+
+	cursor_after_composite();
 }
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
@@ -1298,10 +1440,10 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
 		uy1 = (int)srv->display_h;
 
 	/* Everything behind the resized client into the union; draw() later. */
-	cursor_restore();
+	cursor_lift_for_rect(ux0, uy0, ux1, uy1);
 	if (ux0 < ux1 && uy0 < uy1)
 		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
-	cursor_paint();
+	cursor_after_damage(ux0, uy0, ux1, uy1);
 }
 
 int take_screenshot(const char* filename) {
@@ -1314,7 +1456,7 @@ int take_screenshot(const char* filename) {
 	}
 
 	/* Don't bake the software cursor into the PNG. */
-	cursor_restore();
+	cursor_lift_all();
 
 	width = server.display_w;
 	height = server.display_h;
@@ -1330,6 +1472,7 @@ int take_screenshot(const char* filename) {
 		(int)stride
 	);
 
+	/* Re-present immediately; screenshot runs on input/server path. */
 	cursor_paint();
 
 	if (!result) {

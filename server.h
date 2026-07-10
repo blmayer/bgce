@@ -12,13 +12,13 @@
 #define MAX_PATH_LEN 512
 
 /* Virtual desktop is WORLD_SCALE × display in each axis (4× area).
- * Zoom 1.0 = 100% (1 world pixel = 1 screen pixel).
- * Zoom range [ZOOM_MIN, ZOOM_MAX]: fully zoomed-out fits the whole
- * virtual desktop; fully zoomed-in is 4× magnification. */
+ * Zoom is an integer percent: 100 = 1 world pixel per screen pixel.
+ * Range [50, 400] so the full canvas fits when zoomed out (2× world). */
 #define BGCE_WORLD_SCALE 2
-#define BGCE_ZOOM_MIN 0.5f
-#define BGCE_ZOOM_MAX 4.0f
-#define BGCE_ZOOM_STEP 1.15f
+#define BGCE_ZOOM_PCT_MIN 50
+#define BGCE_ZOOM_PCT_MAX 400
+#define BGCE_ZOOM_PCT_1X 100
+#define BGCE_ZOOM_PCT_STEP 10 /* wheel click */
 
 /* ----------------------------
  * Client Representation
@@ -73,12 +73,14 @@ struct ServerState {
 	uint32_t crtc_id;
 #endif
 
-	/* Virtual desktop / viewport (see BGCE_WORLD_SCALE) */
+	/* Virtual desktop / viewport (see BGCE_WORLD_SCALE) — all integers */
 	uint32_t virtual_w;
 	uint32_t virtual_h;
-	float zoom;   /* screen_pixels = world_pixels * zoom */
-	float pan_x;  /* world coords of top-left of the screen */
-	float pan_y;
+	/* Zoom percent: screen = world * zoom_pct / 100.  100 = identity. */
+	int zoom_pct;
+	/* World-pixel origin of the top-left screen pixel. */
+	int pan_x;
+	int pan_y;
 
 	struct InputState input;
 
@@ -216,6 +218,10 @@ void release_vt(void);
 int display_cursor_init(void);
 void display_cursor_fini(void);
 void display_cursor_refresh(void);
+/** 1 if the input thread should re-paint the software cursor. */
+int display_cursor_pending(void);
+/** Paint cursor if dirty (input thread only). */
+void display_cursor_present(void);
 
 void set_cursor_type(enum BGCECursorType type);
 
@@ -250,18 +256,28 @@ void erase_client(struct ServerState* srv, const struct Client* gone);
  * update.  No rescaling of existing pixels — scale is only applied when
  * filling exposed edges (and when zoom changes via redraw_all).
  */
-void redraw_pan(struct ServerState* srv, float old_pan_x, float old_pan_y);
+void redraw_pan(struct ServerState* srv, int old_pan_x, int old_pan_y);
 
 /** Clamp pan so the viewport stays over the virtual desktop. */
 void clamp_viewport(struct ServerState* srv);
 
+/**
+ * One discrete zoom click (dir > 0 = in, dir < 0 = out).
+ * Adjusts zoom_pct by ±BGCE_ZOOM_PCT_STEP, clamped to [MIN, MAX].
+ * 100 is always reachable.  Returns 1 if zoom changed.
+ */
+int bgce_zoom_step(struct ServerState *srv, int dir);
+
+/** Set zoom to an absolute percent (clamped). Returns 1 if changed. */
+int bgce_zoom_set(struct ServerState *srv, int zoom_pct);
+
 /** Map a screen pixel to virtual-desktop (world) coordinates. */
-void screen_to_world(const struct ServerState* srv, float sx, float sy,
-                     float* wx, float* wy);
+void screen_to_world(const struct ServerState* srv, int sx, int sy,
+                     int* wx, int* wy);
 
 /** Map a world point to screen coordinates. */
-void world_to_screen(const struct ServerState* srv, float wx, float wy,
-                     float* sx, float* sy);
+void world_to_screen(const struct ServerState* srv, int wx, int wy,
+                     int* sx, int* sy);
 
 /**
  * Capture the current framebuffer and save it as a screenshot.

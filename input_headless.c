@@ -50,17 +50,17 @@ int resize_buffer(struct Client *c, int dx, int dy)
 
 struct Client *pick_client(int x, int y)
 {
-	float wx, wy;
+	int wx, wy;
 	struct Client *c;
 	struct Client *picked = NULL;
 
-	screen_to_world(&server, (float)x, (float)y, &wx, &wy);
+	screen_to_world(&server, x, y, &wx, &wy);
 	c = server.clients;
 	while (c) {
 		uint32_t ww = c->world_w ? c->world_w : c->width;
 		uint32_t wh = c->world_h ? c->world_h : c->height;
-		if (wx >= (float)c->x && wx < (float)(c->x + ww) &&
-		    wy >= (float)c->y && wy < (float)(c->y + wh)) {
+		if (wx >= (int)c->x && wx < (int)(c->x + ww) &&
+		    wy >= (int)c->y && wy < (int)(c->y + wh)) {
 			picked = c;
 			break;
 		}

@@ -54,9 +54,9 @@ int bgce_mock_init(uint32_t width, uint32_t height)
 
 	server.virtual_w = server.display_w * BGCE_WORLD_SCALE;
 	server.virtual_h = server.display_h * BGCE_WORLD_SCALE;
-	server.zoom = 1.0f;
-	server.pan_x = 0.0f;
-	server.pan_y = 0.0f;
+	server.zoom_pct = BGCE_ZOOM_PCT_1X;
+	server.pan_x = 0;
+	server.pan_y = 0;
 	server.client_count = 0;
 	server.focused_client = NULL;
 
@@ -86,6 +86,7 @@ int bgce_mock_init(uint32_t width, uint32_t height)
 	init_input();
 	location_cache_load();
 	redraw_all(&server);
+	display_cursor_present();
 	mock_active = 1;
 	printf("[BGCE] mock init %ux%u virtual %ux%u\n",
 	       server.display_w, server.display_h,
@@ -262,36 +263,33 @@ void bgce_mock_move(struct Client *c, int wdx, int wdy)
 
 void bgce_mock_pan_screen(int sdx, int sdy)
 {
-	float z = server.zoom > 0.0f ? server.zoom : 1.0f;
-	float old_px = server.pan_x;
-	float old_py = server.pan_y;
-	float s = config.pan_speed > 0.0f ? config.pan_speed : 1.0f;
+	int z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+	int old_px = server.pan_x;
+	int old_py = server.pan_y;
+	int sp = (int)(config.pan_speed * 256.0f + 0.5f);
 
-	server.pan_x -= (float)sdx * s / z;
-	server.pan_y -= (float)sdy * s / z;
+	if (sp < 1)
+		sp = 256;
+	server.pan_x -= sdx * sp * 100 / (z * 256);
+	server.pan_y -= sdy * sp * 100 / (z * 256);
 	clamp_viewport(&server);
 	redraw_pan(&server, old_px, old_py);
 }
 
-void bgce_mock_zoom_at(float factor, int sx, int sy)
+void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 {
-	float old_zoom = server.zoom;
-	float new_zoom = old_zoom * factor;
-	float wx, wy;
+	int wx, wy;
+	int z;
 
-	if (new_zoom < BGCE_ZOOM_MIN)
-		new_zoom = BGCE_ZOOM_MIN;
-	if (new_zoom > BGCE_ZOOM_MAX)
-		new_zoom = BGCE_ZOOM_MAX;
-	if (new_zoom == old_zoom)
+	screen_to_world(&server, sx, sy, &wx, &wy);
+	if (!bgce_zoom_set(&server, zoom_pct))
 		return;
-
-	screen_to_world(&server, (float)sx, (float)sy, &wx, &wy);
-	server.zoom = new_zoom;
-	server.pan_x = wx - (float)sx / new_zoom;
-	server.pan_y = wy - (float)sy / new_zoom;
+	z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+	server.pan_x = wx - sx * 100 / z;
+	server.pan_y = wy - sy * 100 / z;
 	clamp_viewport(&server);
 	redraw_all(&server);
+	display_cursor_present();
 }
 
 int bgce_mock_screenshot(const char *path)

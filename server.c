@@ -320,15 +320,15 @@ int main(void) {
 	printf("[BGCE] Display initialised\n");
 
 	/* Virtual desktop: WORLD_SCALE × physical display in each axis (4× area).
-	 * Zoom 1.0 = 100%; range [0.5, 4.0] so the full canvas fits when zoomed out. */
+	 * Zoom 100% = 1:1; range [50%, 400%] so the full canvas fits at min. */
 	server.virtual_w = server.display_w * BGCE_WORLD_SCALE;
 	server.virtual_h = server.display_h * BGCE_WORLD_SCALE;
-	server.zoom = 1.0f;
-	server.pan_x = 0.0f;
-	server.pan_y = 0.0f;
-	printf("[BGCE] Virtual desktop %ux%u (%.0fx physical area), zoom=%.2f\n",
+	server.zoom_pct = BGCE_ZOOM_PCT_1X;
+	server.pan_x = 0;
+	server.pan_y = 0;
+	printf("[BGCE] Virtual desktop %ux%u (%.0fx physical area), zoom=%d%%\n",
 	       server.virtual_w, server.virtual_h,
-	       (double)(BGCE_WORLD_SCALE * BGCE_WORLD_SCALE), server.zoom);
+	       (double)(BGCE_WORLD_SCALE * BGCE_WORLD_SCALE), server.zoom_pct);
 
 	/* Background covers the entire virtual desktop */
 	struct Client background_client;
@@ -360,6 +360,7 @@ int main(void) {
 	/* Full recomposite so the wallpaper fills the screen even if draw()
 	 * bounds are edge-clamped oddly on the first paint. */
 	redraw_all(&server);
+	display_cursor_present();
 
 	if (init_input() != 0) {
 		perror("[BGCE] Failed to start input thread");

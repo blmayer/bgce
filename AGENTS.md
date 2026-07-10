@@ -69,7 +69,7 @@ kernel headers. Real `bgce` still requires Linux.
 - Same binary name shares one slot (last place wins)
 
 ### Zoom / pan controls
-- **Alt + scroll**: zoom in/out toward the cursor (range 0.5×–4.0×)
+- **Alt + scroll**: zoom in/out toward the cursor (integer percent, 50%–400%, step 10%; 100% = 1:1)
 - **Alt + left-drag on empty space**: pan the viewport over the virtual desktop
 - **Alt + left-drag on a client**: move window (existing)
 - **Alt + right-drag on a client**: resize window (existing)
