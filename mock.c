@@ -263,17 +263,15 @@ void bgce_mock_move(struct Client *c, int wdx, int wdy)
 
 void bgce_mock_pan_screen(int sdx, int sdy)
 {
-	int z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
-	int old_px = server.pan_x;
-	int old_py = server.pan_y;
 	int sp = (int)(config.pan_speed * 256.0f + 0.5f);
+	int scx, scy;
 
 	if (sp < 1)
 		sp = 256;
-	server.pan_x -= sdx * sp * 100 / (z * 256);
-	server.pan_y -= sdy * sp * 100 / (z * 256);
-	clamp_viewport(&server);
-	redraw_pan(&server, old_px, old_py);
+	scx = sdx * sp / 256;
+	scy = sdy * sp / 256;
+	if (scx || scy)
+		redraw_pan(&server, scx, scy);
 }
 
 void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)

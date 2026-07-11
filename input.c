@@ -789,17 +789,16 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		if (drag.active) {
 			switch (drag.type) {
 			case DRAG_PAN: {
-				int z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
 				int sp = (int)(config.pan_speed * 256.0f + 0.5f);
-				int old_px = server.pan_x;
-				int old_py = server.pan_y;
+				int sdx, sdy;
+
 				if (sp < 1)
 					sp = 256;
-				/* world pan so on-screen speed ≈ mouse * pan_speed */
-				server.pan_x -= dx * sp * 100 / (z * 256);
-				server.pan_y -= dy * sp * 100 / (z * 256);
-				clamp_viewport(&server);
-				redraw_pan(&server, old_px, old_py);
+				/* Integer screen pixels; redraw_pan copies the FB. */
+				sdx = dx * sp / 256;
+				sdy = dy * sp / 256;
+				if (sdx || sdy)
+					redraw_pan(&server, sdx, sdy);
 				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
@@ -882,16 +881,15 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 			switch (drag.type) {
 			case DRAG_PAN: {
-				int z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
 				int sp = (int)(config.pan_speed * 256.0f + 0.5f);
-				int old_px = server.pan_x;
-				int old_py = server.pan_y;
+				int sdx, sdy;
+
 				if (sp < 1)
 					sp = 256;
-				server.pan_x -= dx * sp * 100 / (z * 256);
-				server.pan_y -= dy * sp * 100 / (z * 256);
-				clamp_viewport(&server);
-				redraw_pan(&server, old_px, old_py);
+				sdx = dx * sp / 256;
+				sdy = dy * sp / 256;
+				if (sdx || sdy)
+					redraw_pan(&server, sdx, sdy);
 				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}

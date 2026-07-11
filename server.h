@@ -253,12 +253,11 @@ void redraw_all(struct ServerState* srv);
 void erase_client(struct ServerState* srv, const struct Client* gone);
 
 /**
- * Pan: shift pixels already on the framebuffer and only composite the
- * newly exposed edge(s).  old_pan_* is the viewport origin before the pan
- * update.  No rescaling of existing pixels — scale is only applied when
- * filling exposed edges (and when zoom changes via redraw_all).
+ * Pan by integer screen pixels (sdx, sdy): content moves by that delta.
+ * memmove the framebuffer, then composite only newly exposed edge strip(s).
+ * Never a full-scene redraw for ordinary pan.
  */
-void redraw_pan(struct ServerState* srv, int old_pan_x, int old_pan_y);
+void redraw_pan(struct ServerState *srv, int sdx, int sdy);
 
 /** Clamp pan so the viewport stays over the virtual desktop. */
 void clamp_viewport(struct ServerState* srv);

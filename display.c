@@ -1260,42 +1260,94 @@ static void fb_scroll(struct ServerState *srv, int sdx, int sdy)
 	}
 }
 
-void redraw_pan(struct ServerState *srv, int old_pan_x, int old_pan_y)
+/*
+ * Pan — integer screen delta only (no full-scene “fallback”):
+ *
+ *   pan_x/y are world origin of the screen top-left.
+ *   Content on screen moves by (sdx, sdy) pixels:
+ *     fb_scroll(sdx, sdy)          // copy the big rect
+ *     composite newly exposed strip(s) only
+ *     pan += matching world step so world_to_screen stays consistent:
+ *       pan_x -= sdx * 100 / zoom_pct
+ *       pan_y -= sdy * 100 / zoom_pct
+ *
+ * Clamp: reduce sdx/sdy so pan stays in range — never abandon scroll for a
+ * full redraw.  If |sdx|>=width or |sdy|>=height there is no overlap to
+ * copy; the whole view is “exposed” and must be sampled (not a clamp case).
+ */
+void redraw_pan(struct ServerState *srv, int sdx, int sdy)
 {
-	int z;
-	int sdx, sdy;
-	int w, h;
+	int z, w, h;
+	int vis_w, vis_h, max_x, max_y;
+	int max_scroll;
 
 	if (!srv || !srv->framebuffer)
 		return;
+	if (sdx == 0 && sdy == 0)
+		return;
 
 	z = zoom_pct_of(srv);
-	/* Fixed world points move on screen by -Δpan * zoom_pct / 100. */
-	sdx = -((srv->pan_x - old_pan_x) * z) / 100;
-	sdy = -((srv->pan_y - old_pan_y) * z) / 100;
 	w = (int)srv->display_w;
 	h = (int)srv->display_h;
+	vis_w = w * 100 / z;
+	vis_h = h * 100 / z;
+	max_x = (int)srv->virtual_w - vis_w;
+	max_y = (int)srv->virtual_h - vis_h;
+
+	/* View larger than world: pan is locked (clamp_viewport centers). */
+	if (max_x < 0)
+		sdx = 0;
+	if (max_y < 0)
+		sdy = 0;
+
+	/*
+	 * Limit scroll so pan stays in [0, max_*].
+	 * sdx > 0 → content right → pan_x decreases; stop at pan_x == 0.
+	 * sdx < 0 → content left  → pan_x increases; stop at pan_x == max_x.
+	 */
+	if (sdx > 0) {
+		max_scroll = srv->pan_x * z / 100;
+		if (sdx > max_scroll)
+			sdx = max_scroll;
+	} else if (sdx < 0) {
+		max_scroll = (max_x - srv->pan_x) * z / 100;
+		if (max_scroll < 0)
+			max_scroll = 0;
+		if (-sdx > max_scroll)
+			sdx = -max_scroll;
+	}
+	if (sdy > 0) {
+		max_scroll = srv->pan_y * z / 100;
+		if (sdy > max_scroll)
+			sdy = max_scroll;
+	} else if (sdy < 0) {
+		max_scroll = (max_y - srv->pan_y) * z / 100;
+		if (max_scroll < 0)
+			max_scroll = 0;
+		if (-sdy > max_scroll)
+			sdy = -max_scroll;
+	}
 
 	if (sdx == 0 && sdy == 0)
 		return;
 
+	/* Keep pan and screen scroll on one lattice (no 1px edge jog). */
+	srv->pan_x -= sdx * 100 / z;
+	srv->pan_y -= sdy * 100 / z;
+
 	cursor_fb_begin();
 	(void)cursor_lift_all_ret();
 
-	/* No useful overlap — full copy from client buffers. */
+	/* Whole view replaced — nothing left to copy. */
 	if (sdx <= -w || sdx >= w || sdy <= -h || sdy >= h) {
 		composite_chain_to_rect(srv, srv->clients, 0, 0, w, h);
 		cursor_fb_end(1);
 		return;
 	}
 
-	/* Reposition pixels already on screen. */
+	/* 1) Copy the overlapping rect.  2) Fill only the new edge(s). */
 	fb_scroll(srv, sdx, sdy);
 
-	/*
-	 * Only the newly exposed edge(s) need samples from client buffers.
-	 * Corners may be filled twice; that is cheap vs a full redraw.
-	 */
 	if (sdx > 0)
 		composite_chain_to_rect(srv, srv->clients, 0, 0, sdx, h);
 	else if (sdx < 0)
