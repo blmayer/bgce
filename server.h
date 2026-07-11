@@ -76,9 +76,14 @@ struct ServerState {
 	/* Virtual desktop / viewport (see BGCE_WORLD_SCALE) — all integers */
 	uint32_t virtual_w;
 	uint32_t virtual_h;
-	/* Zoom percent: screen = world * zoom_pct / 100.  100 = identity. */
+	/* Zoom percent: world→screen scale is zoom_pct/100.  100 = identity. */
 	int zoom_pct;
-	/* World-pixel origin of the top-left screen pixel. */
+	/*
+	 * Screen-pixel pan (not world).  Mapping:
+	 *   sx = (wx * zoom_pct) / 100 - pan_x
+	 *   wx = (sx + pan_x) * 100 / zoom_pct
+	 * Pan by sdx screen pixels is exactly pan_x -= sdx (and fb_scroll).
+	 */
 	int pan_x;
 	int pan_y;
 

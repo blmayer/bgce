@@ -283,8 +283,9 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 	if (!bgce_zoom_set(&server, zoom_pct))
 		return;
 	z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
-	server.pan_x = wx - sx * 100 / z;
-	server.pan_y = wy - sy * 100 / z;
+	/* pan is screen-pixel: pan = wx*z/100 - sx */
+	server.pan_x = wx * z / 100 - sx;
+	server.pan_y = wy * z / 100 - sy;
 	clamp_viewport(&server);
 	redraw_all(&server);
 	display_cursor_present();

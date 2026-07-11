@@ -187,8 +187,9 @@ static void apply_zoom_at_cursor(int dir)
 		return;
 
 	z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
-	server.pan_x = wx - mouse_x * 100 / z;
-	server.pan_y = wy - mouse_y * 100 / z;
+	/* pan is screen-pixel: sx = wx*z/100 - pan → pan = wx*z/100 - sx */
+	server.pan_x = wx * z / 100 - mouse_x;
+	server.pan_y = wy * z / 100 - mouse_y;
 	clamp_viewport(&server);
 	redraw_all(&server);
 	display_cursor_present();

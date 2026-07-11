@@ -706,14 +706,19 @@ static int zoom_pct_of(const struct ServerState *srv)
 	return z;
 }
 
+/*
+ * pan_x/y are screen-pixel offsets (see server.h):
+ *   sx = (wx * z) / 100 - pan_x
+ *   wx = (sx + pan_x) * 100 / z
+ */
 void screen_to_world(const struct ServerState *srv, int sx, int sy,
                      int *wx, int *wy)
 {
 	int z = zoom_pct_of(srv);
 	if (wx)
-		*wx = sx * 100 / z + srv->pan_x;
+		*wx = (sx + srv->pan_x) * 100 / z;
 	if (wy)
-		*wy = sy * 100 / z + srv->pan_y;
+		*wy = (sy + srv->pan_y) * 100 / z;
 }
 
 void world_to_screen(const struct ServerState *srv, int wx, int wy,
@@ -721,9 +726,9 @@ void world_to_screen(const struct ServerState *srv, int wx, int wy,
 {
 	int z = zoom_pct_of(srv);
 	if (sx)
-		*sx = (wx - srv->pan_x) * z / 100;
+		*sx = (wx * z) / 100 - srv->pan_x;
 	if (sy)
-		*sy = (wy - srv->pan_y) * z / 100;
+		*sy = (wy * z) / 100 - srv->pan_y;
 }
 
 int bgce_zoom_set(struct ServerState *srv, int zoom_pct)
@@ -756,17 +761,16 @@ int bgce_zoom_step(struct ServerState *srv, int dir)
 
 void clamp_viewport(struct ServerState *srv)
 {
-	int z, vis_w, vis_h, max_x, max_y;
+	int z, max_x, max_y;
 
 	if (!srv)
 		return;
 	z = zoom_pct_of(srv);
 	srv->zoom_pct = z;
 
-	vis_w = (int)srv->display_w * 100 / z;
-	vis_h = (int)srv->display_h * 100 / z;
-	max_x = (int)srv->virtual_w - vis_w;
-	max_y = (int)srv->virtual_h - vis_h;
+	/* Max pan in screen pixels: world [0, virtual) must cover the view. */
+	max_x = (int)srv->virtual_w * z / 100 - (int)srv->display_w;
+	max_y = (int)srv->virtual_h * z / 100 - (int)srv->display_h;
 
 	if (max_x < 0)
 		srv->pan_x = max_x / 2;
@@ -824,7 +828,7 @@ static inline void fill_u32(uint32_t *p, int n, uint32_t v)
 
 /*
  * 1:1 blit when zoom_pct == 100 and buffer size == world size.
- *   world = screen + pan
+ *   pan is screen-pixel pan: world = screen + pan
  */
 static void blit_client_1to1(uint32_t *dst, uint32_t screen_w,
                              const uint32_t *src, int cw, int ch,
@@ -856,7 +860,7 @@ static void blit_client_1to1(uint32_t *dst, uint32_t screen_w,
 /*
  * Fixed-point nearest-neighbour blit (16.16), integer zoom percent.
  *
- *   wx = sx * 100 / zoom_pct + pan
+ *   wx = (sx + pan) * 100 / zoom_pct   (pan in screen pixels)
  *   icx = (wx - cli_x) * bw / ww
  */
 static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
@@ -881,8 +885,10 @@ static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
 	step_y_fp = ((int64_t)100 * bh << 16) / ((int64_t)zoom_pct * wh);
 
 	{
-		int64_t wx0 = (int64_t)ox0 * 100 / zoom_pct + pan_x - cli_x;
-		int64_t wy0 = (int64_t)oy0 * 100 / zoom_pct + pan_y - cli_y;
+		int64_t wx0 =
+		        ((int64_t)ox0 + pan_x) * 100 / zoom_pct - cli_x;
+		int64_t wy0 =
+		        ((int64_t)oy0 + pan_y) * 100 / zoom_pct - cli_y;
 		x0_fp = (wx0 * bw << 16) / ww;
 		y0_fp = (wy0 * bh << 16) / wh;
 	}
@@ -1261,25 +1267,20 @@ static void fb_scroll(struct ServerState *srv, int sdx, int sdy)
 }
 
 /*
- * Pan — integer screen delta only (no full-scene “fallback”):
+ * Pan — pure integer screen scroll (pan is screen-pixel pan):
  *
- *   pan_x/y are world origin of the screen top-left.
- *   Content on screen moves by (sdx, sdy) pixels:
- *     fb_scroll(sdx, sdy)          // copy the big rect
- *     composite newly exposed strip(s) only
- *     pan += matching world step so world_to_screen stays consistent:
- *       pan_x -= sdx * 100 / zoom_pct
- *       pan_y -= sdy * 100 / zoom_pct
+ *   content moves by (sdx, sdy) on the FB  →  fb_scroll(sdx, sdy)
+ *   pan_x -= sdx;  pan_y -= sdy            →  exact, no zoom division
+ *   fill only the newly exposed strip(s)
  *
- * Clamp: reduce sdx/sdy so pan stays in range — never abandon scroll for a
- * full redraw.  If |sdx|>=width or |sdy|>=height there is no overlap to
- * copy; the whole view is “exposed” and must be sampled (not a clamp case).
+ * That identity is why pan must be screen pixels: world pan + zoom made
+ * Δpan→sdx non-invertible and produced 1px staircase edges + trails when
+ * zoomed out.  Clamp reduces sdx/sdy; never full-redraw as a “fallback”.
  */
 void redraw_pan(struct ServerState *srv, int sdx, int sdy)
 {
 	int z, w, h;
-	int vis_w, vis_h, max_x, max_y;
-	int max_scroll;
+	int max_x, max_y;
 
 	if (!srv || !srv->framebuffer)
 		return;
@@ -1289,51 +1290,37 @@ void redraw_pan(struct ServerState *srv, int sdx, int sdy)
 	z = zoom_pct_of(srv);
 	w = (int)srv->display_w;
 	h = (int)srv->display_h;
-	vis_w = w * 100 / z;
-	vis_h = h * 100 / z;
-	max_x = (int)srv->virtual_w - vis_w;
-	max_y = (int)srv->virtual_h - vis_h;
+	max_x = (int)srv->virtual_w * z / 100 - w;
+	max_y = (int)srv->virtual_h * z / 100 - h;
 
-	/* View larger than world: pan is locked (clamp_viewport centers). */
+	/* View larger than world: pan locked (centered). */
 	if (max_x < 0)
 		sdx = 0;
 	if (max_y < 0)
 		sdy = 0;
 
-	/*
-	 * Limit scroll so pan stays in [0, max_*].
-	 * sdx > 0 → content right → pan_x decreases; stop at pan_x == 0.
-	 * sdx < 0 → content left  → pan_x increases; stop at pan_x == max_x.
-	 */
+	/* sdx > 0: content right, pan decreases → stop at 0 */
 	if (sdx > 0) {
-		max_scroll = srv->pan_x * z / 100;
-		if (sdx > max_scroll)
-			sdx = max_scroll;
+		if (sdx > srv->pan_x)
+			sdx = srv->pan_x;
 	} else if (sdx < 0) {
-		max_scroll = (max_x - srv->pan_x) * z / 100;
-		if (max_scroll < 0)
-			max_scroll = 0;
-		if (-sdx > max_scroll)
-			sdx = -max_scroll;
+		/* pan increases → stop at max_x */
+		if (max_x >= 0 && srv->pan_x - sdx > max_x)
+			sdx = srv->pan_x - max_x;
 	}
 	if (sdy > 0) {
-		max_scroll = srv->pan_y * z / 100;
-		if (sdy > max_scroll)
-			sdy = max_scroll;
+		if (sdy > srv->pan_y)
+			sdy = srv->pan_y;
 	} else if (sdy < 0) {
-		max_scroll = (max_y - srv->pan_y) * z / 100;
-		if (max_scroll < 0)
-			max_scroll = 0;
-		if (-sdy > max_scroll)
-			sdy = -max_scroll;
+		if (max_y >= 0 && srv->pan_y - sdy > max_y)
+			sdy = srv->pan_y - max_y;
 	}
 
 	if (sdx == 0 && sdy == 0)
 		return;
 
-	/* Keep pan and screen scroll on one lattice (no 1px edge jog). */
-	srv->pan_x -= sdx * 100 / z;
-	srv->pan_y -= sdy * 100 / z;
+	srv->pan_x -= sdx;
+	srv->pan_y -= sdy;
 
 	cursor_fb_begin();
 	(void)cursor_lift_all_ret();
@@ -1345,7 +1332,6 @@ void redraw_pan(struct ServerState *srv, int sdx, int sdy)
 		return;
 	}
 
-	/* 1) Copy the overlapping rect.  2) Fill only the new edge(s). */
 	fb_scroll(srv, sdx, sdy);
 
 	if (sdx > 0)
