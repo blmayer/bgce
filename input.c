@@ -774,9 +774,11 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 	/* Alt + scroll wheel → zoom toward cursor */
 	if (ev.type == EV_REL && ev.code == REL_WHEEL && alt_down) {
-		/* Positive value = scroll up = zoom in */
+		/* Traditional: scroll up (positive) = zoom in. Natural reverses. */
 		int dir = (ev.value > 0) ? 1 : -1;
 		int steps = ev.value >= 0 ? ev.value : -ev.value;
+		if (config.natural_scrolling)
+			dir = -dir;
 		if (steps < 1)
 			steps = 1;
 		for (int i = 0; i < steps; i++)
@@ -1045,6 +1047,10 @@ void* input_loop(void* arg) {
 			e.device = server.input.devs[i];
 			e.code = ev.code;
 			e.value = ev.value;
+			/* Natural scrolling flips wheel direction for clients too. */
+			if (config.natural_scrolling && ev.type == EV_REL &&
+			    (ev.code == REL_WHEEL || ev.code == REL_HWHEEL))
+				e.value = -e.value;
 
 			switch (ev.type) {
 			case EV_KEY:

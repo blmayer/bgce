@@ -445,6 +445,7 @@ int load_config(struct config* config) {
 	memset(&config->cursors, 0, sizeof(config->cursors));
 	config->move_speed = 1.0f;
 	config->pan_speed = 1.0f;
+	config->natural_scrolling = 0;
 
 	if (!home) {
 		set_default_shortcuts(config);
@@ -529,9 +530,28 @@ int load_config(struct config* config) {
 				config->pan_speed = strtof(valp, NULL);
 				if (config->pan_speed <= 0.0f)
 					config->pan_speed = 1.0f;
+			} else if (strcmp(key, "natural_scrolling") == 0) {
+				if (strcmp(valp, "1") == 0 ||
+				    strcmp(valp, "true") == 0 ||
+				    strcmp(valp, "yes") == 0 ||
+				    strcmp(valp, "on") == 0)
+					config->natural_scrolling = 1;
+				else if (strcmp(valp, "0") == 0 ||
+				         strcmp(valp, "false") == 0 ||
+				         strcmp(valp, "no") == 0 ||
+				         strcmp(valp, "off") == 0)
+					config->natural_scrolling = 0;
+				else {
+					fprintf(stderr,
+					        "[BGCE] natural_scrolling: use "
+					        "true/false (got '%s')\n",
+					        valp);
+				}
 			} else {
 				fprintf(stderr, "[BGCE] Unknown input config key: %s "
-				        "(expected move_speed or pan_speed)\n", key);
+				        "(expected move_speed, pan_speed, or "
+				        "natural_scrolling)\n",
+				        key);
 			}
 		} else if (strcmp(current_section, "cursors") == 0) {
 			if (strcmp(key, "theme") == 0) {
@@ -683,8 +703,10 @@ void print_config(const struct config* config)
 	printf("[BGCE] cursors: %d theme image(s) loaded (of %d types)\n",
 	       cursor_loaded, BGCE_CURSOR_COUNT);
 	printf("[BGCE] input: move_speed=%.2f pan_speed=%.2f "
+	       "natural_scrolling=%s "
 	       "(on-screen speed ≈ mouse × speed / zoom)\n",
-	       (double)config->move_speed, (double)config->pan_speed);
+	       (double)config->move_speed, (double)config->pan_speed,
+	       config->natural_scrolling ? "on" : "off");
 	printf("[BGCE] === end config ===\n");
 }
 

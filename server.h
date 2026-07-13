@@ -165,6 +165,11 @@ struct config {
 	 */
 	float move_speed;
 	float pan_speed;
+	/*
+	 * Natural scrolling (macOS-style): reverse wheel direction for zoom
+	 * and for wheel events forwarded to clients.  0 = traditional, 1 = on.
+	 */
+	int natural_scrolling;
 };
 
 // Load config file (~/.config/bgce.conf) and apply defaults

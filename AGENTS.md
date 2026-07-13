@@ -82,6 +82,8 @@ kernel headers. Real `bgce` still requires Linux.
 
 ### Zoom / pan controls
 - **Alt + scroll**: zoom in/out toward the cursor (integer percent, 50%–400%, step 10%; 100% = 1:1)
+- **`[input] natural_scrolling`**: `true`/`false` (default off). Reverses wheel
+  for Alt+scroll zoom and for wheel events sent to focused clients (macOS-style).
 - **Alt + left-drag on empty space**: pan the viewport over the virtual desktop
 - **Alt + left-drag on a client**: move window (existing)
 - **Alt + right-drag on a client**: resize window (existing)

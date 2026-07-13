@@ -48,6 +48,7 @@ int bgce_mock_init(uint32_t width, uint32_t height)
 	config.mode = IMAGE_SCALED;
 	config.move_speed = 1.0f;
 	config.pan_speed = 1.0f;
+	config.natural_scrolling = 0;
 
 	if (init_display() != 0)
 		return -1;
