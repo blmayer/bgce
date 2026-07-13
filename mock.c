@@ -280,8 +280,16 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 	int z;
 
 	screen_to_world(&server, sx, sy, &wx, &wy);
-	if (!bgce_zoom_set(&server, zoom_pct))
+	if (!bgce_zoom_set(&server, zoom_pct)) {
+		/* Still re-anchor pan even when zoom is unchanged. */
+		z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+		server.pan_x = wx * z / 100 - sx;
+		server.pan_y = wy * z / 100 - sy;
+		clamp_viewport(&server);
+		redraw_all(&server);
+		display_cursor_present();
 		return;
+	}
 	z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
 	/* pan is screen-pixel: pan = wx*z/100 - sx */
 	server.pan_x = wx * z / 100 - sx;
@@ -289,6 +297,37 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 	clamp_viewport(&server);
 	redraw_all(&server);
 	display_cursor_present();
+}
+
+void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y)
+{
+	if (!mock_active)
+		return;
+	if (zoom_pct < BGCE_ZOOM_PCT_MIN)
+		zoom_pct = BGCE_ZOOM_PCT_MIN;
+	if (zoom_pct > BGCE_ZOOM_PCT_MAX)
+		zoom_pct = BGCE_ZOOM_PCT_MAX;
+	server.zoom_pct = zoom_pct;
+	server.pan_x = pan_x;
+	server.pan_y = pan_y;
+	clamp_viewport(&server);
+	redraw_all(&server);
+	display_cursor_present();
+}
+
+void bgce_mock_alt_tab(int reverse)
+{
+	if (!mock_active)
+		return;
+	bgce_cycle_focus(&server, reverse ? 1 : 0);
+	display_cursor_present();
+}
+
+void bgce_mock_remember_focus(void)
+{
+	if (!mock_active || !server.focused_client)
+		return;
+	location_cache_remember_client(server.focused_client);
 }
 
 int bgce_mock_screenshot(const char *path)
@@ -299,6 +338,26 @@ int bgce_mock_screenshot(const char *path)
 void bgce_mock_redraw_all(void)
 {
 	redraw_all(&server);
+}
+
+int bgce_mock_fb_matches_full_redraw(void)
+{
+	size_t nbytes;
+	void *snap;
+	int match;
+
+	if (!mock_active || !server.framebuffer || server.fb_size == 0)
+		return -1;
+
+	nbytes = server.fb_size;
+	snap = malloc(nbytes);
+	if (!snap)
+		return -1;
+	memcpy(snap, server.framebuffer, nbytes);
+	redraw_all(&server);
+	match = (memcmp(snap, server.framebuffer, nbytes) == 0);
+	free(snap);
+	return match ? 0 : -1;
 }
 
 /* Stubs so we don't need server.o (which provides main). */

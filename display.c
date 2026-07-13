@@ -791,21 +791,38 @@ void clamp_viewport(struct ServerState *srv)
 	}
 }
 
-/* Screen-space axis-aligned bounds of a client (exclusive end). */
+/*
+ * Screen-space axis-aligned bounds of a client (exclusive end).
+ *
+ * Screen pixel (sx,sy) samples world
+ *   wx = floor((sx + pan_x) * 100 / z)
+ * (see blit_client_scaled / screen_to_world).  The bounds must cover every
+ * pixel whose sample lands in [x, x+ww) × [y, y+wh):
+ *
+ *   sx0 = ceil(x * z / 100) - pan_x
+ *   sx1 = ceil((x + ww) * z / 100) - pan_x   (exclusive)
+ *
+ * Using floor(world_to_screen) for both corners under-covers the trailing
+ * edge and can leave 1px hairs / soft edges when the window moves slowly
+ * (especially at zoom ≠ 100%).
+ */
 static void client_screen_bounds(const struct ServerState *srv,
                                  const struct Client *cli,
                                  int *sx0, int *sy0, int *sx1, int *sy1)
 {
 	uint32_t ww = cli->world_w ? cli->world_w : cli->width;
 	uint32_t wh = cli->world_h ? cli->world_h : cli->height;
-	int a, b, c, d;
+	int z = zoom_pct_of(srv);
+	int x = (int)cli->x;
+	int y = (int)cli->y;
+	int w = (int)ww;
+	int h = (int)wh;
 
-	world_to_screen(srv, (int)cli->x, (int)cli->y, &a, &b);
-	world_to_screen(srv, (int)(cli->x + ww), (int)(cli->y + wh), &c, &d);
-	*sx0 = a;
-	*sy0 = b;
-	*sx1 = c;
-	*sy1 = d;
+	/* ceil(n/100) for n >= 0 is (n + 99) / 100 */
+	*sx0 = (x * z + 99) / 100 - srv->pan_x;
+	*sy0 = (y * z + 99) / 100 - srv->pan_y;
+	*sx1 = ((x + w) * z + 99) / 100 - srv->pan_x;
+	*sy1 = ((y + h) * z + 99) / 100 - srv->pan_y;
 	if (*sx1 <= *sx0)
 		*sx1 = *sx0 + 1;
 	if (*sy1 <= *sy0)
@@ -1504,6 +1521,7 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	int expose[8][4];
 	int nexp;
 	int i;
+	int same_bounds;
 
 	if (!srv || !srv->framebuffer || !c) {
 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
@@ -1518,13 +1536,34 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	moved.y = (uint32_t)((int)c->y + wdy);
 	client_screen_bounds(srv, &moved, &nx0, &ny0, &nx1, &ny1);
 
-	if (ox0 == nx0 && oy0 == ny0 && ox1 == nx1 && oy1 == ny1)
+	same_bounds = (ox0 == nx0 && oy0 == ny0 && ox1 == nx1 && oy1 == ny1);
+
+	cursor_fb_begin();
+	(void)cursor_lift_all_ret();
+
+	/*
+	 * When zoomed out (or at awkward zoom percents), a 1-world-pixel move
+	 * often leaves the integer screen rect unchanged.  The buffer mapping
+	 * still shifts, so we must re-blit the mover — skipping here left
+	 * stale edge samples that looked like soft / missing borders.
+	 */
+	if (same_bounds) {
+		bx0 = nx0;
+		by0 = ny0;
+		bx1 = nx1;
+		by1 = ny1;
+		if (clip_to_display(srv, &bx0, &by0, &bx1, &by1)) {
+			blit_client_overlap(srv, &moved, bx0, by0, bx1, by1);
+			for (p = srv->clients; p && p != c; p = p->next)
+				blit_client_overlap(srv, p, bx0, by0, bx1, by1);
+		}
+		cursor_fb_end(1);
 		return;
+	}
 
 	/*
 	 * 1. Exact expose = old \ new.  Inflate old by 1px before subtract to
-	 * catch integer world→screen rounding hairs that otherwise keep a
-	 * 1-pixel ribbon of the previous window on the desktop.
+	 * catch residual hairs if bounds and samples disagree by a pixel.
 	 */
 	{
 		int ax0 = ox0 > 0 ? ox0 - 1 : ox0;
@@ -1539,9 +1578,6 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 		nexp = rect_subtract(ax0, ay0, ax1, ay1, nx0, ny0, nx1, ny1,
 		                     expose, 8);
 	}
-
-	cursor_fb_begin();
-	(void)cursor_lift_all_ret();
 
 	/* 2. Underlay each expose piece (everyone but the mover). */
 	for (i = 0; i < nexp; i++)

@@ -470,6 +470,7 @@ static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t ke
  *  ALT + RIGHT_CLICK + DRAG on a client: resize window
  *  ALT + LEFT_CLICK + DRAG on empty space: pan the desktop
  *  ALT + SCROLL: zoom in/out (centered on cursor)
+ *  ALT + TAB / ALT + SHIFT + TAB: cycle focus and restore that app's viewport
  *
  *  Returns if shortcut was handled
  */
@@ -494,6 +495,31 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		/* Press only (not autorepeat) for actions */
 		if (ev.value != 1)
 			return 0;
+
+		/* Alt+Tab / Alt+Shift+Tab: cycle windows (hardwired, not config). */
+		if (alt_down && !ctrl_down && ev.code == KEY_TAB) {
+			struct Client *old_focus = server.focused_client;
+			struct Client *now;
+
+			bgce_cycle_focus(&server, shift_down ? 1 : 0);
+			now = server.focused_client;
+			if (old_focus != now) {
+				if (old_focus && old_focus->fd >= 0) {
+					struct BGCEMessage lost = {0};
+					lost.type = MSG_FOCUS_CHANGE;
+					lost.data.focus_event.state = 0;
+					(void)bgce_send_msg(old_focus->fd, &lost);
+				}
+				if (now && now->fd >= 0) {
+					struct BGCEMessage got = {0};
+					got.type = MSG_FOCUS_CHANGE;
+					got.data.focus_event.state = 1;
+					(void)bgce_send_msg(now->fd, &got);
+				}
+			}
+			display_cursor_present();
+			return 1;
+		}
 
 		struct shortcut *sc =
 		        match_shortcut(ctrl_down, alt_down, shift_down, ev.code);

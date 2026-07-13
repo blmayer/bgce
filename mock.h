@@ -53,10 +53,32 @@ void bgce_mock_pan_screen(int sdx, int sdy);
 /** Set absolute zoom percent (50–400, 100 = 1×) toward screen point. */
 void bgce_mock_zoom_to(int zoom_pct, int sx, int sy);
 
+/** Set absolute zoom percent and screen-pixel pan (clamped), then redraw. */
+void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y);
+
+/**
+ * Alt+Tab (reverse=0) / Alt+Shift+Tab (reverse=1): cycle focus, raise the
+ * target, and restore its cached viewport (zoom + pan).
+ */
+void bgce_mock_alt_tab(int reverse);
+
+/**
+ * Snapshot focused client's position + current viewport into the location
+ * cache (same as move-end / disconnect).  Desktop pan alone never does this.
+ */
+void bgce_mock_remember_focus(void);
+
 /** Dump framebuffer to PNG (cursor omitted). path NULL → mock_shot.png */
 int bgce_mock_screenshot(const char *path);
 
 /** Full redraw (background + all clients). */
 void bgce_mock_redraw_all(void);
+
+/**
+ * Snapshot the FB, run a full redraw, compare.  Returns 0 if identical,
+ * -1 if any pixel differs (FB left as after redraw_all).  Used to catch
+ * move damage holes / edge rounding bugs.
+ */
+int bgce_mock_fb_matches_full_redraw(void);
 
 #endif /* BGCE_MOCK_H */

@@ -277,6 +277,13 @@ int bgce_zoom_step(struct ServerState *srv, int dir);
 /** Set zoom to an absolute percent (clamped). Returns 1 if changed. */
 int bgce_zoom_set(struct ServerState *srv, int zoom_pct);
 
+/**
+ * Alt+Tab (reverse=0) / Alt+Shift+Tab (reverse=1): cycle focus among clients,
+ * raise the target, and restore its cached zoom/pan.  Declared here for the
+ * input path; implementation lives with the location cache.
+ */
+void bgce_cycle_focus(struct ServerState *srv, int reverse);
+
 /** Map a screen pixel to virtual-desktop (world) coordinates. */
 void screen_to_world(const struct ServerState* srv, int sx, int sy,
                      int* wx, int* wy);

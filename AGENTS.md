@@ -41,11 +41,12 @@ behaviour by inspecting PNGs:
 
 ```bash
 make headless && ./headless
-# writes headless_00_bg.png … headless_08_location_restored.png
+# writes headless_00_bg.png … headless_14_alt_shift_tab.png
 ```
 
 API (see `mock.h`): `bgce_mock_init`, `bgce_mock_add_client`, `bgce_mock_draw`,
-`bgce_mock_click`, `bgce_mock_move`, `bgce_mock_screenshot`, `bgce_mock_fini`.
+`bgce_mock_click`, `bgce_mock_move`, `bgce_mock_alt_tab`, `bgce_mock_set_viewport`,
+`bgce_mock_screenshot`, `bgce_mock_fini`.
 
 On macOS, `compat/linux/` provides stub headers so headless builds without
 kernel headers. Real `bgce` still requires Linux.
@@ -68,12 +69,15 @@ kernel headers. Real `bgce` still requires Linux.
   - [ ] test if events go to the correct client and only the one
   - [X] headless stacking / move / erase screenshots
   - [X] headless location-cache restore
+  - [X] headless Alt+Tab / viewport restore
 
 ### Location cache
 - File: `$XDG_CACHE_HOME/bgce/windows.cache` or `~/.cache/bgce/windows.cache`
-- Format: `app_id x y` (world pixels), one entry per line
+- Format: `app_id x y [zoom_pct pan_x pan_y]` (world x/y; optional viewport)
 - Identity: Linux `SO_PEERCRED` + `/proc/pid/comm` (fallback `"client"`)
-- Restore on first buffer request; save on move end, MSG_MOVE, and disconnect
+- Restore position on first buffer request; restore viewport on Alt+Tab
+- Save on move end, MSG_MOVE, disconnect, and when leaving a window via Alt+Tab
+- **Desktop pan alone does not write the cache**
 - Same binary name shares one slot (last place wins)
 
 ### Zoom / pan controls
@@ -81,6 +85,9 @@ kernel headers. Real `bgce` still requires Linux.
 - **Alt + left-drag on empty space**: pan the viewport over the virtual desktop
 - **Alt + left-drag on a client**: move window (existing)
 - **Alt + right-drag on a client**: resize window (existing)
+- **Alt + Tab** / **Alt + Shift + Tab**: cycle focus (raise app); pan + zoom to
+  that app’s last viewport so it appears where it was left (does not move the
+  window rect). Shift reverses the cycle.
 - Virtual desktop is 2× the physical resolution in each axis (4× area). Client
   positions and buffer sizes are in world pixels; the compositor scales to the
   screen using the current zoom and pan.

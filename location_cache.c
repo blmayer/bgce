@@ -1,10 +1,15 @@
 /*
- * Persist last window positions per app id under the user cache dir:
+ * Persist last window positions and viewports per app id under the user
+ * cache dir:
  *   $XDG_CACHE_HOME/bgce/windows.cache
  *   or ~/.cache/bgce/windows.cache
  *
  * File format (one entry per line):
- *   app_id x y
+ *   app_id x y [zoom_pct pan_x pan_y]
+ *
+ * x,y are world pixels.  Optional zoom/pan are the viewport that was active
+ * when the app was last left (Alt+Tab target restore, move end, disconnect).
+ * Pure desktop pan does not write this file.
  */
 
 #define _GNU_SOURCE
@@ -30,11 +35,16 @@ struct loc_entry {
 	char id[LOC_ID_MAX];
 	uint32_t x;
 	uint32_t y;
+	int zoom_pct; /* 0 = no viewport stored (legacy line) */
+	int pan_x;
+	int pan_y;
 	int used;
 };
 
 static struct loc_entry entries[LOC_CACHE_MAX];
 static int entries_loaded;
+
+extern struct ServerState server;
 
 static int cache_dir(char *buf, size_t buflen)
 {
@@ -105,14 +115,28 @@ void location_cache_load(void)
 	while (fgets(line, sizeof(line), f) && i < LOC_CACHE_MAX) {
 		char id[LOC_ID_MAX];
 		unsigned int x, y;
+		int zoom, pan_x, pan_y;
+		int nfields;
 
 		if (line[0] == '#' || line[0] == '\n')
 			continue;
-		if (sscanf(line, "%63s %u %u", id, &x, &y) != 3)
+		nfields = sscanf(line, "%63s %u %u %d %d %d", id, &x, &y, &zoom,
+		                 &pan_x, &pan_y);
+		if (nfields != 3 && nfields != 6)
 			continue;
 		strncpy(entries[i].id, id, sizeof(entries[i].id) - 1);
+		entries[i].id[sizeof(entries[i].id) - 1] = '\0';
 		entries[i].x = x;
 		entries[i].y = y;
+		if (nfields == 6 && zoom > 0) {
+			entries[i].zoom_pct = zoom;
+			entries[i].pan_x = pan_x;
+			entries[i].pan_y = pan_y;
+		} else {
+			entries[i].zoom_pct = 0;
+			entries[i].pan_x = 0;
+			entries[i].pan_y = 0;
+		}
 		entries[i].used = 1;
 		i++;
 	}
@@ -138,12 +162,17 @@ void location_cache_save(void)
 		perror("[BGCE] location cache write");
 		return;
 	}
-	fprintf(f, "# BGCE window locations: app_id x y (world pixels)\n");
+	fprintf(f, "# BGCE window locations: app_id x y [zoom pan_x pan_y]\n");
 	for (i = 0; i < LOC_CACHE_MAX; i++) {
 		if (!entries[i].used)
 			continue;
-		fprintf(f, "%s %u %u\n", entries[i].id, entries[i].x,
-		        entries[i].y);
+		if (entries[i].zoom_pct > 0)
+			fprintf(f, "%s %u %u %d %d %d\n", entries[i].id,
+			        entries[i].x, entries[i].y, entries[i].zoom_pct,
+			        entries[i].pan_x, entries[i].pan_y);
+		else
+			fprintf(f, "%s %u %u\n", entries[i].id, entries[i].x,
+			        entries[i].y);
 		n++;
 	}
 	fclose(f);
@@ -169,7 +198,31 @@ int location_cache_lookup(const char *app_id, uint32_t *x, uint32_t *y)
 	return 0;
 }
 
-void location_cache_store(const char *app_id, uint32_t x, uint32_t y)
+int location_cache_lookup_viewport(const char *app_id, int *zoom_pct,
+                                   int *pan_x, int *pan_y)
+{
+	int i;
+
+	if (!app_id || !app_id[0] || !entries_loaded)
+		return 0;
+	for (i = 0; i < LOC_CACHE_MAX; i++) {
+		if (entries[i].used && strcmp(entries[i].id, app_id) == 0) {
+			if (entries[i].zoom_pct <= 0)
+				return 0;
+			if (zoom_pct)
+				*zoom_pct = entries[i].zoom_pct;
+			if (pan_x)
+				*pan_x = entries[i].pan_x;
+			if (pan_y)
+				*pan_y = entries[i].pan_y;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+void location_cache_store(const char *app_id, uint32_t x, uint32_t y,
+                          int zoom_pct, int pan_x, int pan_y)
 {
 	int i;
 	int free_slot = -1;
@@ -183,6 +236,11 @@ void location_cache_store(const char *app_id, uint32_t x, uint32_t y)
 		if (entries[i].used && strcmp(entries[i].id, app_id) == 0) {
 			entries[i].x = x;
 			entries[i].y = y;
+			if (zoom_pct > 0) {
+				entries[i].zoom_pct = zoom_pct;
+				entries[i].pan_x = pan_x;
+				entries[i].pan_y = pan_y;
+			}
 			return;
 		}
 		if (!entries[i].used && free_slot < 0)
@@ -194,6 +252,15 @@ void location_cache_store(const char *app_id, uint32_t x, uint32_t y)
 	entries[free_slot].id[sizeof(entries[free_slot].id) - 1] = '\0';
 	entries[free_slot].x = x;
 	entries[free_slot].y = y;
+	if (zoom_pct > 0) {
+		entries[free_slot].zoom_pct = zoom_pct;
+		entries[free_slot].pan_x = pan_x;
+		entries[free_slot].pan_y = pan_y;
+	} else {
+		entries[free_slot].zoom_pct = 0;
+		entries[free_slot].pan_x = 0;
+		entries[free_slot].pan_y = 0;
+	}
 	entries[free_slot].used = 1;
 }
 
@@ -246,11 +313,106 @@ void location_cache_identify_client(struct Client *client, int sock_fd)
 
 void location_cache_remember_client(const struct Client *client)
 {
+	int z;
+
 	if (!client || !client->app_id[0])
 		return;
 	/* Skip placeholder background client */
 	if (client->z == 0 && client->fd < 0)
 		return;
-	location_cache_store(client->app_id, client->x, client->y);
+	z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+	location_cache_store(client->app_id, client->x, client->y, z,
+	                     server.pan_x, server.pan_y);
 	location_cache_save();
+}
+
+/*
+ * Raise client to the head of the stacking list and set focus.
+ * Does not send MSG_FOCUS_CHANGE (caller / input path may do that).
+ */
+static void raise_and_focus(struct ServerState *srv, struct Client *c)
+{
+	struct Client *prev;
+	struct Client *curr;
+
+	if (!srv || !c)
+		return;
+
+	if (c != srv->clients) {
+		prev = NULL;
+		curr = srv->clients;
+		while (curr && curr != c) {
+			prev = curr;
+			curr = curr->next;
+		}
+		if (curr && prev) {
+			prev->next = curr->next;
+			curr->next = srv->clients;
+			srv->clients = curr;
+		}
+	}
+	if (srv->focused_client && srv->focused_client != c)
+		c->z = srv->focused_client->z + 1;
+	srv->focused_client = c;
+}
+
+void bgce_cycle_focus(struct ServerState *srv, int reverse)
+{
+	struct Client *list[LOC_CACHE_MAX];
+	struct Client *c;
+	struct Client *target;
+	struct Client *old_focus;
+	int n = 0;
+	int idx = 0;
+	int next;
+	int zoom, pan_x, pan_y;
+	int i;
+
+	if (!srv)
+		return;
+
+	for (c = srv->clients; c && n < LOC_CACHE_MAX; c = c->next) {
+		if (c->z > 0)
+			list[n++] = c;
+	}
+	if (n == 0)
+		return;
+
+	old_focus = srv->focused_client;
+	if (old_focus) {
+		for (i = 0; i < n; i++) {
+			if (list[i] == old_focus) {
+				idx = i;
+				break;
+			}
+		}
+		/* Snapshot position + viewport of the window we leave. */
+		location_cache_remember_client(old_focus);
+	}
+
+	if (n == 1)
+		next = 0;
+	else if (reverse)
+		next = (idx - 1 + n) % n;
+	else
+		next = (idx + 1) % n;
+
+	target = list[next];
+	raise_and_focus(srv, target);
+
+	if (location_cache_lookup_viewport(target->app_id, &zoom, &pan_x,
+	                                   &pan_y)) {
+		if (!bgce_zoom_set(srv, zoom))
+			srv->zoom_pct = zoom; /* already at that zoom */
+		srv->pan_x = pan_x;
+		srv->pan_y = pan_y;
+		clamp_viewport(srv);
+		redraw_all(srv);
+	} else {
+		draw(srv, target);
+	}
+
+	printf("[BGCE] Alt+%sTab → '%s' zoom=%d%% pan=(%d,%d)\n",
+	       reverse ? "Shift+" : "", target->app_id,
+	       srv->zoom_pct, srv->pan_x, srv->pan_y);
 }
