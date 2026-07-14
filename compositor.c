@@ -82,6 +82,7 @@ static int work_shutdown;
 static __thread int tls_worker_id = -1;
 /* Job currently running on this thread (orchestrator or worker via task). */
 static __thread uint64_t tls_job_id;
+static __thread const char *tls_op_name;
 
 static const char *op_name(enum comp_op op)
 {
@@ -125,18 +126,24 @@ static void debug_fflush(void)
 void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
                           int worker)
 {
+	const char *op = tls_op_name ? tls_op_name : "?";
+	int w = x1 - x0;
+	int h = y1 - y0;
+
 	if (!bgce_debug)
 		return;
 	if (worker < 0)
 		worker = tls_worker_id;
 	if (worker >= 0)
-		printf("[BGCE] damage job=%llu %s rect=(%d,%d)-(%d,%d) worker=%d\n",
-		       (unsigned long long)tls_job_id, tag ? tag : "?",
-		       x0, y0, x1, y1, worker);
+		printf("[BGCE] damage job=%llu op=%s %s rect=(%d,%d)-(%d,%d) "
+		       "%dx%d worker=%d\n",
+		       (unsigned long long)tls_job_id, op, tag ? tag : "?",
+		       x0, y0, x1, y1, w, h, worker);
 	else
-		printf("[BGCE] damage job=%llu %s rect=(%d,%d)-(%d,%d) worker=orch\n",
-		       (unsigned long long)tls_job_id, tag ? tag : "?",
-		       x0, y0, x1, y1);
+		printf("[BGCE] damage job=%llu op=%s %s rect=(%d,%d)-(%d,%d) "
+		       "%dx%d worker=orch\n",
+		       (unsigned long long)tls_job_id, op, tag ? tag : "?",
+		       x0, y0, x1, y1, w, h);
 	debug_fflush();
 }
 
@@ -162,6 +169,7 @@ static void run_job(const struct comp_job *job)
 	const char *app = "";
 
 	tls_job_id = job->job_id;
+	tls_op_name = op_name(job->op);
 
 	c = (job->client_id != 0) ? bgce_comp_find_client(job->client_id) : NULL;
 	if (c && c->app_id[0])
@@ -315,11 +323,12 @@ static void run_job(const struct comp_job *job)
 	}
 
 	if (bgce_debug && job->op != COMP_CURSOR) {
-		printf("[BGCE] comp: done job=%llu %s\n",
+		printf("[BGCE] comp: done job=%llu op=%s\n",
 		       (unsigned long long)job->job_id, op_name(job->op));
 		debug_fflush();
 	}
 	tls_job_id = 0;
+	tls_op_name = NULL;
 }
 
 static void *worker_main(void *arg)
@@ -358,9 +367,11 @@ static void *worker_main(void *arg)
 		pthread_mutex_unlock(&work_mu);
 
 		tls_job_id = task.job_id;
+		/* Parent high-level op for MOVE subtasks is always MOVE. */
+		tls_op_name = "MOVE";
 
 		if (bgce_debug) {
-			printf("[BGCE] worker %d: job=%llu got task '%s' "
+			printf("[BGCE] worker %d: job=%llu op=MOVE got task '%s' "
 			       "(claim %d/%d)\n",
 			       id, (unsigned long long)task.job_id,
 			       task.tag ? task.tag : "?", my + 1, task_batch_n);
@@ -371,12 +382,13 @@ static void *worker_main(void *arg)
 			task.fn(task.arg);
 
 		if (bgce_debug) {
-			printf("[BGCE] worker %d: job=%llu done task '%s'\n",
+			printf("[BGCE] worker %d: job=%llu op=MOVE done task '%s'\n",
 			       id, (unsigned long long)task.job_id,
 			       task.tag ? task.tag : "?");
 			debug_fflush();
 		}
 		tls_job_id = 0;
+		tls_op_name = NULL;
 
 		pthread_mutex_lock(&work_mu);
 		if (tasks_left > 0)

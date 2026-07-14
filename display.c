@@ -1376,6 +1376,8 @@ void draw(struct ServerState *srv, struct Client *cli)
 	int lifted = 0;
 	int i;
 	struct Client *c;
+	uint32_t ww, wh;
+	const char *app;
 
 	if (!srv || !srv->framebuffer || !cli || !cli->buffer) {
 		fprintf(stderr,
@@ -1384,8 +1386,17 @@ void draw(struct ServerState *srv, struct Client *cli)
 	}
 
 	client_screen_bounds(srv, cli, &sx0, &sy0, &sx1, &sy1);
-	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1))
+	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1)) {
+		if (bgce_comp_debug()) {
+			printf("[BGCE] draw: id=%u app='%s' off-screen, skip "
+			       "world=(%u,%u)\n",
+			       (unsigned)cli->id,
+			       cli->app_id[0] ? cli->app_id : "?",
+			       cli->x, cli->y);
+			fflush(stdout);
+		}
 		return;
+	}
 
 	/* Visible pieces of this client after subtracting occluders above. */
 	vis[0][0] = sx0;
@@ -1403,9 +1414,25 @@ void draw(struct ServerState *srv, struct Client *cli)
 		client_screen_bounds(srv, c, &cx0, &cy0, &cx1, &cy1);
 		if (!clip_to_display(srv, &cx0, &cy0, &cx1, &cy1))
 			continue;
+		if (bgce_comp_debug()) {
+			printf("[BGCE] draw: occlude by id=%u app='%s' "
+			       "screen=(%d,%d)-(%d,%d)\n",
+			       (unsigned)c->id,
+			       c->app_id[0] ? c->app_id : "?",
+			       cx0, cy0, cx1, cy1);
+			fflush(stdout);
+		}
 		nvis = vis_subtract_occluder(vis, nvis, cx0, cy0, cx1, cy1);
-		if (nvis <= 0)
+		if (nvis <= 0) {
+			if (bgce_comp_debug()) {
+				printf("[BGCE] draw: id=%u app='%s' fully covered, "
+				       "skip blit\n",
+				       (unsigned)cli->id,
+				       cli->app_id[0] ? cli->app_id : "?");
+				fflush(stdout);
+			}
 			return; /* fully covered by windows above */
+		}
 	}
 
 	if (!c) {
@@ -1414,16 +1441,45 @@ void draw(struct ServerState *srv, struct Client *cli)
 		return;
 	}
 
+	ww = cli->world_w ? cli->world_w : cli->width;
+	wh = cli->world_h ? cli->world_h : cli->height;
+	app = cli->app_id[0] ? cli->app_id : "?";
+
+	if (bgce_comp_debug()) {
+		printf("[BGCE] draw: blit id=%u app='%s' world=(%u,%u) %ux%u "
+		       "bounds=(%d,%d)-(%d,%d) nvis=%d z=%d\n",
+		       (unsigned)cli->id, app, cli->x, cli->y, ww, wh,
+		       sx0, sy0, sx1, sy1, nvis, (int)cli->z);
+		for (i = 0; i < nvis; i++) {
+			printf("[BGCE] draw:   piece[%d] screen=(%d,%d)-(%d,%d) "
+			       "%dx%d\n",
+			       i, vis[i][0], vis[i][1], vis[i][2], vis[i][3],
+			       vis[i][2] - vis[i][0], vis[i][3] - vis[i][1]);
+		}
+		fflush(stdout);
+	}
+
 	cursor_fb_begin();
 	for (i = 0; i < nvis; i++) {
 		if (cursor_lift_for_rect_ret(vis[i][0], vis[i][1],
 		                             vis[i][2], vis[i][3]))
 			lifted = 1;
 	}
-	for (i = 0; i < nvis; i++)
+	for (i = 0; i < nvis; i++) {
+		if (bgce_comp_debug()) {
+			bgce_comp_damage_log("draw-blit", vis[i][0], vis[i][1],
+			                     vis[i][2], vis[i][3], -1);
+		}
 		blit_client_overlap(srv, cli, vis[i][0], vis[i][1],
 		                    vis[i][2], vis[i][3]);
+	}
 	cursor_fb_end(lifted);
+
+	if (bgce_comp_debug()) {
+		printf("[BGCE] draw: done id=%u app='%s' pieces=%d lifted_cursor=%d\n",
+		       (unsigned)cli->id, app, nvis, lifted);
+		fflush(stdout);
+	}
 }
 
 /*
@@ -1510,17 +1566,46 @@ struct move_blit_args {
 static void move_underlay_task(void *arg)
 {
 	struct move_underlay_args *a = arg;
+	struct Client *stack_dbg;
+	int nstack = 0;
 
-	/* worker id comes from FCFS thread that grabbed this task */
+	/* worker id comes from claim hand-out TLS */
 	bgce_comp_damage_log("underlay", a->x0, a->y0, a->x1, a->y1, -1);
+	if (bgce_comp_debug()) {
+		for (stack_dbg = a->srv->clients; stack_dbg; stack_dbg = stack_dbg->next) {
+			if (stack_dbg == a->skip || !stack_dbg->buffer)
+				continue;
+			nstack++;
+		}
+		printf("[BGCE] underlay: composite %d layer(s) except skip "
+		       "id=%u into %dx%d\n",
+		       nstack,
+		       a->skip ? (unsigned)a->skip->id : 0,
+		       a->x1 - a->x0, a->y1 - a->y0);
+		fflush(stdout);
+	}
 	composite_all_except(a->srv, a->skip, a->x0, a->y0, a->x1, a->y1);
 }
 
 static void move_blit_task(void *arg)
 {
 	struct move_blit_args *a = arg;
+	const struct Client *cli = a->cli;
 
 	bgce_comp_damage_log("mover", a->x0, a->y0, a->x1, a->y1, -1);
+	if (bgce_comp_debug() && cli) {
+		uint32_t ww = cli->world_w ? cli->world_w : cli->width;
+		uint32_t wh = cli->world_h ? cli->world_h : cli->height;
+
+		printf("[BGCE] mover: blit id=%u app='%s' world=(%u,%u) %ux%u "
+		       "screen=(%d,%d)-(%d,%d) %dx%d\n",
+		       (unsigned)cli->id,
+		       cli->app_id[0] ? cli->app_id : "?",
+		       cli->x, cli->y, ww, wh,
+		       a->x0, a->y0, a->x1, a->y1,
+		       a->x1 - a->x0, a->y1 - a->y0);
+		fflush(stdout);
+	}
 	blit_client_overlap(a->srv, a->cli, a->x0, a->y0, a->x1, a->y1);
 }
 
