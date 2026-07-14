@@ -22,7 +22,6 @@ extern struct ServerState server;
 
 #define COMP_QUEUE_CAP 256
 #define COMP_NWORKERS 3
-#define TASK_QUEUE_CAP 16
 
 enum comp_op {
 	COMP_DRAW = 1,
@@ -36,6 +35,7 @@ enum comp_op {
 
 struct comp_job {
 	enum comp_op op;
+	uint64_t job_id; /* monotonic; ties enqueue/run/worker logs together */
 	uint32_t client_id;
 	int old_x, old_y, new_x, new_y;
 	int sdx, sdy;
@@ -46,7 +46,8 @@ struct comp_job {
 struct paint_task {
 	void (*fn)(void *);
 	void *arg;
-	const char *tag; /* for debug: "underlay", "mover", … */
+	const char *tag; /* for debug: "underlay0", "mover", … */
+	uint64_t job_id;
 };
 
 static struct comp_job queue[COMP_QUEUE_CAP];
@@ -65,18 +66,22 @@ static int comp_sync;
 static int orch_running;
 static int job_in_flight;
 static int bgce_debug;
+static uint64_t next_job_id = 1; /* 0 = none */
 
-/* ---- Free FCFS task queue for blit workers ---- */
+/* ---- Parallel batch hand-out for blit workers ---- */
 static pthread_mutex_t work_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t work_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t work_done_cv = PTHREAD_COND_INITIALIZER;
-static struct paint_task task_q[TASK_QUEUE_CAP];
-static int tq_head, tq_tail, tq_count;
 static int tasks_left; /* incomplete tasks in the current batch */
+static int task_next;  /* claim index (protected by work_mu) */
+static int task_batch_n;
+static struct paint_task task_batch[COMP_NWORKERS];
 static int workers_running;
 static int work_shutdown;
 
 static __thread int tls_worker_id = -1;
+/* Job currently running on this thread (orchestrator or worker via task). */
+static __thread uint64_t tls_job_id;
 
 static const char *op_name(enum comp_op op)
 {
@@ -125,11 +130,13 @@ void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
 	if (worker < 0)
 		worker = tls_worker_id;
 	if (worker >= 0)
-		printf("[BGCE] damage %s rect=(%d,%d)-(%d,%d) worker=%d\n",
-		       tag ? tag : "?", x0, y0, x1, y1, worker);
+		printf("[BGCE] damage job=%llu %s rect=(%d,%d)-(%d,%d) worker=%d\n",
+		       (unsigned long long)tls_job_id, tag ? tag : "?",
+		       x0, y0, x1, y1, worker);
 	else
-		printf("[BGCE] damage %s rect=(%d,%d)-(%d,%d) worker=orch\n",
-		       tag ? tag : "?", x0, y0, x1, y1);
+		printf("[BGCE] damage job=%llu %s rect=(%d,%d)-(%d,%d) worker=orch\n",
+		       (unsigned long long)tls_job_id, tag ? tag : "?",
+		       x0, y0, x1, y1);
 	debug_fflush();
 }
 
@@ -153,6 +160,8 @@ static void run_job(const struct comp_job *job)
 	int wdx, wdy;
 	uint32_t save_x, save_y;
 	const char *app = "";
+
+	tls_job_id = job->job_id;
 
 	c = (job->client_id != 0) ? bgce_comp_find_client(job->client_id) : NULL;
 	if (c && c->app_id[0])
@@ -180,39 +189,44 @@ static void run_job(const struct comp_job *job)
 
 		switch (job->op) {
 		case COMP_DRAW:
-			printf("[BGCE] comp: run DRAW id=%u app='%s' "
+			printf("[BGCE] comp: run job=%llu DRAW client=%u app='%s' "
 			       "world=(%u,%u) %ux%u screen=(%d,%d)-(%d,%d) "
 			       "zoom=%d%% pan=(%d,%d)\n",
+			       (unsigned long long)job->job_id,
 			       (unsigned)job->client_id, app,
 			       c ? c->x : 0, c ? c->y : 0, ww, wh,
 			       sx0, sy0, sx1, sy1,
 			       server.zoom_pct, server.pan_x, server.pan_y);
 			break;
 		case COMP_MOVE:
-			printf("[BGCE] comp: run MOVE id=%u app='%s' "
+			printf("[BGCE] comp: run job=%llu MOVE client=%u app='%s' "
 			       "world (%d,%d)->(%d,%d) size=%ux%u "
 			       "zoom=%d%% pan=(%d,%d)\n",
+			       (unsigned long long)job->job_id,
 			       (unsigned)job->client_id, app,
 			       job->old_x, job->old_y, job->new_x, job->new_y,
 			       ww, wh, server.zoom_pct, server.pan_x,
 			       server.pan_y);
 			break;
 		case COMP_PAN:
-			printf("[BGCE] comp: run PAN d=(%d,%d) "
+			printf("[BGCE] comp: run job=%llu PAN d=(%d,%d) "
 			       "(pan was %d,%d zoom=%d%%)\n",
+			       (unsigned long long)job->job_id,
 			       job->sdx, job->sdy,
 			       server.pan_x, server.pan_y, server.zoom_pct);
 			break;
 		case COMP_ERASE:
-			printf("[BGCE] comp: run ERASE world=(%u,%u) %ux%u "
+			printf("[BGCE] comp: run job=%llu ERASE world=(%u,%u) %ux%u "
 			       "zoom=%d%% pan=(%d,%d)\n",
+			       (unsigned long long)job->job_id,
 			       job->erase_x, job->erase_y,
 			       job->erase_ww, job->erase_wh,
 			       server.zoom_pct, server.pan_x, server.pan_y);
 			break;
 		case COMP_FULL:
-			printf("[BGCE] comp: run FULL zoom=%d%% pan=(%d,%d) "
+			printf("[BGCE] comp: run job=%llu FULL zoom=%d%% pan=(%d,%d) "
 			       "display=%ux%u\n",
+			       (unsigned long long)job->job_id,
 			       server.zoom_pct, server.pan_x, server.pan_y,
 			       server.display_w, server.display_h);
 			break;
@@ -220,8 +234,9 @@ static void run_job(const struct comp_job *job)
 			/* Mouse moves constantly — log 1 in 32 so DRAW stays visible. */
 			static int cursor_run_n;
 			if ((cursor_run_n++ % 32) == 0) {
-				printf("[BGCE] comp: run CURSOR screen=(%d,%d) "
+				printf("[BGCE] comp: run job=%llu CURSOR screen=(%d,%d) "
 				       "(1/32) zoom=%d%% pan=(%d,%d)\n",
+				       (unsigned long long)job->job_id,
 				       job->cursor_x, job->cursor_y,
 				       server.zoom_pct, server.pan_x,
 				       server.pan_y);
@@ -230,7 +245,8 @@ static void run_job(const struct comp_job *job)
 			break;
 		}
 		default:
-			printf("[BGCE] comp: run %s\n", op_name(job->op));
+			printf("[BGCE] comp: run job=%llu %s\n",
+			       (unsigned long long)job->job_id, op_name(job->op));
 			break;
 		}
 		if (job->op != COMP_CURSOR)
@@ -242,7 +258,8 @@ static void run_job(const struct comp_job *job)
 		if (c)
 			draw(&server, c);
 		else if (bgce_debug) {
-			printf("[BGCE] comp: DRAW id=%u — client gone\n",
+			printf("[BGCE] comp: job=%llu DRAW client=%u — gone\n",
+			       (unsigned long long)job->job_id,
 			       (unsigned)job->client_id);
 			debug_fflush();
 		}
@@ -298,9 +315,11 @@ static void run_job(const struct comp_job *job)
 	}
 
 	if (bgce_debug && job->op != COMP_CURSOR) {
-		printf("[BGCE] comp: done %s\n", op_name(job->op));
+		printf("[BGCE] comp: done job=%llu %s\n",
+		       (unsigned long long)job->job_id, op_name(job->op));
 		debug_fflush();
 	}
+	tls_job_id = 0;
 }
 
 static void *worker_main(void *arg)
@@ -311,29 +330,40 @@ static void *worker_main(void *arg)
 
 	for (;;) {
 		struct paint_task task;
+		int my;
 
 		memset(&task, 0, sizeof(task));
 
 		pthread_mutex_lock(&work_mu);
-		while (!work_shutdown && tq_count == 0)
+		/*
+		 * Wait for a new batch (task_batch_n > 0 and claims remain),
+		 * or shutdown.  Claim index is shared so each task is taken
+		 * by exactly one worker — true parallel hand-out, not
+		 * "fastest worker drains the whole queue alone".
+		 */
+		while (!work_shutdown &&
+		       (task_batch_n == 0 || task_next >= task_batch_n))
 			pthread_cond_wait(&work_cv, &work_mu);
-		if (work_shutdown && tq_count == 0) {
+		if (work_shutdown &&
+		    (task_batch_n == 0 || task_next >= task_batch_n)) {
 			pthread_mutex_unlock(&work_mu);
 			break;
 		}
-		/* FCFS: first waiting worker takes the head task. */
-		if (tq_count == 0) {
+		my = task_next++;
+		if (my >= task_batch_n) {
 			pthread_mutex_unlock(&work_mu);
 			continue;
 		}
-		task = task_q[tq_head];
-		tq_head = (tq_head + 1) % TASK_QUEUE_CAP;
-		tq_count--;
+		task = task_batch[my];
 		pthread_mutex_unlock(&work_mu);
 
+		tls_job_id = task.job_id;
+
 		if (bgce_debug) {
-			printf("[BGCE] worker %d: got task '%s'\n",
-			       id, task.tag ? task.tag : "?");
+			printf("[BGCE] worker %d: job=%llu got task '%s' "
+			       "(claim %d/%d)\n",
+			       id, (unsigned long long)task.job_id,
+			       task.tag ? task.tag : "?", my + 1, task_batch_n);
 			debug_fflush();
 		}
 
@@ -341,16 +371,21 @@ static void *worker_main(void *arg)
 			task.fn(task.arg);
 
 		if (bgce_debug) {
-			printf("[BGCE] worker %d: done task '%s'\n",
-			       id, task.tag ? task.tag : "?");
+			printf("[BGCE] worker %d: job=%llu done task '%s'\n",
+			       id, (unsigned long long)task.job_id,
+			       task.tag ? task.tag : "?");
 			debug_fflush();
 		}
+		tls_job_id = 0;
 
 		pthread_mutex_lock(&work_mu);
 		if (tasks_left > 0)
 			tasks_left--;
-		if (tasks_left == 0)
+		if (tasks_left == 0) {
+			task_batch_n = 0;
+			task_next = 0;
 			pthread_cond_signal(&work_done_cv);
+		}
 		pthread_mutex_unlock(&work_mu);
 	}
 
@@ -365,7 +400,6 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
 	int i;
 	void (*fns[3])(void *) = { f0, f1, f2 };
 	void *args[3] = { a0, a1, a2 };
-	/* Tags match MOVE slots: underlay0, underlay1, mover (any may be NULL). */
 	static const char *const tags[3] = { "underlay0", "underlay1", "mover" };
 
 	for (i = 0; i < 3; i++) {
@@ -378,15 +412,16 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
 	/* Sync mode or workers not up: serial on caller. */
 	if (comp_sync || !workers_running) {
 		if (bgce_debug) {
-			printf("[BGCE] comp: parallel3 serial n=%d\n", n);
+			printf("[BGCE] comp: job=%llu parallel3 serial n=%d\n",
+			       (unsigned long long)tls_job_id, n);
 			debug_fflush();
 		}
 		for (i = 0; i < 3; i++) {
 			if (!fns[i])
 				continue;
 			if (bgce_debug) {
-				printf("[BGCE] worker orch: got task '%s'\n",
-				       tags[i]);
+				printf("[BGCE] worker orch: job=%llu got task '%s'\n",
+				       (unsigned long long)tls_job_id, tags[i]);
 				debug_fflush();
 			}
 			fns[i](args[i]);
@@ -395,27 +430,31 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
 	}
 
 	/*
-	 * Orchestrator only enqueues and waits.  Blit workers alone pull tasks
-	 * FCFS — no work-stealing by the orchestrator (separation of concerns).
+	 * Build a fixed batch; workers claim indices 0..n-1 under the mutex
+	 * so three free workers each take one task and run in parallel.
+	 * (A plain FIFO queue let one worker finish and re-grab the rest
+	 * before siblings ran — looked like "only worker 2 works".)
 	 */
 	pthread_mutex_lock(&work_mu);
 	while (tasks_left > 0)
 		pthread_cond_wait(&work_done_cv, &work_mu);
 
-	tq_head = tq_tail = tq_count = 0;
+	task_batch_n = 0;
+	task_next = 0;
 	tasks_left = n;
-	if (bgce_debug) {
-		printf("[BGCE] comp: parallel3 enqueue n=%d → workers FCFS\n", n);
-		debug_fflush();
-	}
 	for (i = 0; i < 3; i++) {
 		if (!fns[i])
 			continue;
-		task_q[tq_tail].fn = fns[i];
-		task_q[tq_tail].arg = args[i];
-		task_q[tq_tail].tag = tags[i];
-		tq_tail = (tq_tail + 1) % TASK_QUEUE_CAP;
-		tq_count++;
+		task_batch[task_batch_n].fn = fns[i];
+		task_batch[task_batch_n].arg = args[i];
+		task_batch[task_batch_n].tag = tags[i];
+		task_batch[task_batch_n].job_id = tls_job_id;
+		task_batch_n++;
+	}
+	if (bgce_debug) {
+		printf("[BGCE] comp: job=%llu parallel3 batch n=%d → claim 0..%d\n",
+		       (unsigned long long)tls_job_id, n, n - 1);
+		debug_fflush();
 	}
 	pthread_cond_broadcast(&work_cv);
 	while (tasks_left > 0)
@@ -423,13 +462,23 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
 	pthread_mutex_unlock(&work_mu);
 }
 
+/* Assign monotonic job id before enqueue / sync run. */
+static void assign_job_id(struct comp_job *job)
+{
+	job->job_id = next_job_id++;
+	if (job->job_id == 0)
+		job->job_id = next_job_id++;
+}
+
 /*
  * Never block the producer (input) on a full queue — that freezes the mouse.
  * Drop the new job if the queue is saturated (paint may lag; input stays live).
  */
-static void enqueue(const struct comp_job *job)
+static void enqueue(struct comp_job *job)
 {
 	static int drop_log;
+
+	assign_job_id(job);
 
 	if (comp_sync) {
 		run_job(job);
@@ -441,8 +490,8 @@ static void enqueue(const struct comp_job *job)
 		pthread_mutex_unlock(&q_mu);
 		if ((drop_log++ % 64) == 0) {
 			fprintf(stderr,
-			        "[BGCE] compositor: queue full, dropping %s\n",
-			        op_name(job->op));
+			        "[BGCE] compositor: queue full, dropping job=%llu %s\n",
+			        (unsigned long long)job->job_id, op_name(job->op));
 			debug_fflush();
 		}
 		return;
@@ -467,23 +516,27 @@ static void enqueue(const struct comp_job *job)
 			wh = c->world_h ? c->world_h : c->height;
 		}
 		if (job->op == COMP_DRAW)
-			printf("[BGCE] comp: enqueue DRAW id=%u app='%s' "
-			       "world=(%u,%u) %ux%u q=%d\n",
+			printf("[BGCE] comp: enqueue job=%llu DRAW client=%u "
+			       "app='%s' world=(%u,%u) %ux%u q=%d\n",
+			       (unsigned long long)job->job_id,
 			       (unsigned)job->client_id, app, cx, cy, ww, wh,
 			       q_count);
 		else if (job->op == COMP_MOVE)
-			printf("[BGCE] comp: enqueue MOVE id=%u app='%s' "
-			       "(%d,%d)->(%d,%d) q=%d\n",
+			printf("[BGCE] comp: enqueue job=%llu MOVE client=%u "
+			       "app='%s' (%d,%d)->(%d,%d) q=%d\n",
+			       (unsigned long long)job->job_id,
 			       (unsigned)job->client_id, app,
 			       job->old_x, job->old_y, job->new_x, job->new_y,
 			       q_count);
 		else if (job->op == COMP_PAN)
-			printf("[BGCE] comp: enqueue PAN d=(%d,%d) q=%d\n",
+			printf("[BGCE] comp: enqueue job=%llu PAN d=(%d,%d) q=%d\n",
+			       (unsigned long long)job->job_id,
 			       job->sdx, job->sdy, q_count);
 		else
-			printf("[BGCE] comp: enqueue %s id=%u app='%s' q=%d\n",
-			       op_name(job->op), (unsigned)job->client_id, app,
-			       q_count);
+			printf("[BGCE] comp: enqueue job=%llu %s client=%u "
+			       "app='%s' q=%d\n",
+			       (unsigned long long)job->job_id, op_name(job->op),
+			       (unsigned)job->client_id, app, q_count);
 		debug_fflush();
 	}
 	pthread_cond_signal(&q_not_empty);
@@ -547,8 +600,9 @@ int bgce_comp_init(int sync_mode)
 	q_head = q_tail = q_count = 0;
 	job_in_flight = 0;
 	work_shutdown = 0;
-	tq_head = tq_tail = tq_count = 0;
 	tasks_left = 0;
+	task_next = 0;
+	task_batch_n = 0;
 	workers_running = 0;
 	orch_running = 0;
 
@@ -743,18 +797,17 @@ void bgce_comp_submit_cursor(int x, int y)
 	j.op = COMP_CURSOR;
 	j.cursor_x = x;
 	j.cursor_y = y;
-	if (bgce_debug) {
-		/*
-		 * Rate limit: pointer events can be hundreds/sec. Logging every
-		 * one drowns DRAW/MOVE. Print 1 of every 32 samples, with pos.
-		 */
+	/* job_id assigned in enqueue; rate-limit log after assign via flag */
+	{
 		static int n;
-		if ((n++ % 32) == 0) {
-			printf("[BGCE] comp: enqueue CURSOR screen=(%d,%d) "
+		int log_this = bgce_debug && ((n++ % 32) == 0);
+
+		enqueue(&j);
+		if (log_this) {
+			printf("[BGCE] comp: enqueue job=%llu CURSOR screen=(%d,%d) "
 			       "(1/32 samples)\n",
-			       x, y);
+			       (unsigned long long)j.job_id, x, y);
 			debug_fflush();
 		}
 	}
-	enqueue(&j);
 }

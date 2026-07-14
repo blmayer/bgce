@@ -239,7 +239,7 @@ void* client_thread(void* arg) {
 				                              : client->width;
 				uint32_t wh = client->world_h ? client->world_h
 				                              : client->height;
-				printf("[BGCE] client fd=%d id=%u app='%s': "
+				printf("[BGCE] client fd=%d client_id=%u app='%s': "
 				       "MSG_DRAW world=(%u,%u) %ux%u\n",
 				       client_fd, (unsigned)client->id,
 				       client->app_id[0] ? client->app_id : "?",

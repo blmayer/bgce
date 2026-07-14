@@ -1581,21 +1581,26 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	}
 
 	/*
-	 * 1. Exact expose = old \ new.  Inflate old by 1px before subtract to
-	 * catch residual hairs if bounds and samples disagree by a pixel.
+	 * 1. Exact expose = old screen rect \ new.
+	 * At zoom 100% a 1-world-pixel move is a 1-screen-pixel strip (e.g. pure
+	 * left move → thin vertical band on the old right edge).  Inflating old
+	 * by 1px before subtract was wrong: it invented full-width top/bottom
+	 * hairs (e.g. (1010,454)-(1416,455) for a horizontal nudge).
+	 * Only grow expose pieces when zoom ≠ 100% (integer mapping can leave
+	 * 1px rounding gaps).
 	 */
-	{
-		int ax0 = ox0 > 0 ? ox0 - 1 : ox0;
-		int ay0 = oy0 > 0 ? oy0 - 1 : oy0;
-		int ax1 = ox1 + 1;
-		int ay1 = oy1 + 1;
-
-		if (ax1 > (int)srv->display_w)
-			ax1 = (int)srv->display_w;
-		if (ay1 > (int)srv->display_h)
-			ay1 = (int)srv->display_h;
-		nexp = rect_subtract(ax0, ay0, ax1, ay1, nx0, ny0, nx1, ny1,
-		                     expose, 8);
+	nexp = rect_subtract(ox0, oy0, ox1, oy1, nx0, ny0, nx1, ny1, expose, 8);
+	if (zoom_pct_of(srv) != BGCE_ZOOM_PCT_1X) {
+		for (i = 0; i < nexp; i++) {
+			if (expose[i][0] > 0)
+				expose[i][0]--;
+			if (expose[i][1] > 0)
+				expose[i][1]--;
+			if (expose[i][2] < (int)srv->display_w)
+				expose[i][2]++;
+			if (expose[i][3] < (int)srv->display_h)
+				expose[i][3]++;
+		}
 	}
 
 	/* 3. Mover rect (computed before parallel section). */
@@ -1658,14 +1663,16 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	uy0 = oy0 < ny0 ? oy0 : ny0;
 	ux1 = ox1 > nx1 ? ox1 : nx1;
 	uy1 = oy1 > ny1 ? oy1 : ny1;
-	if (ux0 > 0)
-		ux0--;
-	if (uy0 > 0)
-		uy0--;
-	if (ux1 < (int)srv->display_w)
-		ux1++;
-	if (uy1 < (int)srv->display_h)
-		uy1++;
+	if (zoom_pct_of(srv) != BGCE_ZOOM_PCT_1X) {
+		if (ux0 > 0)
+			ux0--;
+		if (uy0 > 0)
+			uy0--;
+		if (ux1 < (int)srv->display_w)
+			ux1++;
+		if (uy1 < (int)srv->display_h)
+			uy1++;
+	}
 	if (clip_to_display(srv, &ux0, &uy0, &ux1, &uy1)) {
 		bgce_comp_damage_log("above", ux0, uy0, ux1, uy1, -1);
 		for (p = srv->clients; p && p != c; p = p->next)
