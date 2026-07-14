@@ -11,8 +11,9 @@ struct Client;
  * - Async mode: orchestrator pops jobs (DRAW/MOVE/PAN/CURSOR/…).
  *   A pool of 3 blit workers runs fine-grained MOVE tasks FCFS.
  *   Input never paints — it only enqueues (including mouse motion).
- * - Pending MOVE (same client), CURSOR, and PAN jobs coalesce so a fast
- *   drag paints one big step instead of flooding the queue.
+ * - Pending MOVE (same client), CURSOR, PAN, ZOOM, and FULL jobs coalesce
+ *   so a fast drag/zoom does not flood the queue.
+ * - Zoom in uses FB crop+scale (COMP_ZOOM); zoom out falls back to FULL.
  * - Sync mode (headless): submit runs on the caller; parallel tasks serial.
  *
  * Debug: BGCE_DEBUG=1 — op names, enqueue/run/done, which worker took each
@@ -48,8 +49,16 @@ void bgce_comp_submit_pan(int sdx, int sdy);
 void bgce_comp_submit_erase(uint32_t x, uint32_t y, uint32_t world_w,
                             uint32_t world_h);
 
-/** Full-scene recomposite (zoom, Alt+Tab viewport, hard invalidate). */
+/** Full-scene recomposite (Alt+Tab viewport, hard invalidate, zoom-out). */
 void bgce_comp_submit_full(void);
+
+/**
+ * Viewport zoom/pan change.  Zoom in: scale the old view’s crop from the FB.
+ * Zoom out or invalid crop: same as full recompose.  old_* is the viewport
+ * that is currently (or was last) painted in the FB.
+ */
+void bgce_comp_submit_zoom(int old_z, int old_pan_x, int old_pan_y,
+                           int new_z, int new_pan_x, int new_pan_y);
 
 /**
  * Software cursor move — input enqueues this; compositor paints the glyph.

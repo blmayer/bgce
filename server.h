@@ -252,6 +252,15 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
 void redraw_all(struct ServerState* srv);
 
 /**
+ * Viewport change from (old_z, old_pan) → (new_z, new_pan).
+ * Zoom in: crop the old view’s rect from the live FB and scale it to the
+ * full display (no client walk).  Zoom out or invalid crop: redraw_all().
+ */
+void redraw_zoom_viewport(struct ServerState *srv,
+                          int old_z, int old_pan_x, int old_pan_y,
+                          int new_z, int new_pan_x, int new_pan_y);
+
+/**
  * After a client is removed from the list: repaint only its former screen
  * footprint from the remaining stack (background + windows that were under
  * or overlapped that rect).  Does not touch the rest of the desktop.

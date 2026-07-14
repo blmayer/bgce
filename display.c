@@ -1224,6 +1224,112 @@ void redraw_all(struct ServerState* srv) {
 	cursor_fb_end(1);
 }
 
+/*
+ * Zoom-in path: the FB already holds the old picture.  Map the new viewport
+ * into that picture (screen rect), then NN-scale that rect to the full
+ * display.  No client iteration — only works when the new view is a subset
+ * of the old (zoom in).  Zoom out / bad crop → full recompose.
+ */
+void redraw_zoom_viewport(struct ServerState *srv,
+                          int old_z, int old_pan_x, int old_pan_y,
+                          int new_z, int new_pan_x, int new_pan_y)
+{
+	int W, H;
+	int64_t z0, z1;
+	int64_t sx0_64, sy0_64, sx1_64, sy1_64;
+	int sx0, sy0, sx1, sy1;
+	int src_w, src_h;
+	uint32_t stride;
+	uint32_t *fb;
+	uint32_t *src_copy;
+	int x, y;
+
+	if (!srv || !srv->framebuffer)
+		return;
+
+	W = (int)srv->display_w;
+	H = (int)srv->display_h;
+	if (W < 1 || H < 1)
+		return;
+
+	z0 = old_z > 0 ? old_z : BGCE_ZOOM_PCT_1X;
+	z1 = new_z > 0 ? new_z : BGCE_ZOOM_PCT_1X;
+
+	/* Zoom out or unchanged: need world outside the old frame. */
+	if (z1 <= z0) {
+		redraw_all(srv);
+		return;
+	}
+
+	/*
+	 * New screen pixel (sx,sy) samples the same world as old screen
+	 *   sx_old = (sx + new_pan) * old_z / new_z - old_pan
+	 * Full new viewport [0,W)×[0,H) → old rect [sx0,sx1)×[sy0,sy1).
+	 */
+	sx0_64 = ((int64_t)new_pan_x * z0) / z1 - old_pan_x;
+	sy0_64 = ((int64_t)new_pan_y * z0) / z1 - old_pan_y;
+	sx1_64 = (((int64_t)W + new_pan_x) * z0) / z1 - old_pan_x;
+	sy1_64 = (((int64_t)H + new_pan_y) * z0) / z1 - old_pan_y;
+
+	if (sx0_64 < 0 || sy0_64 < 0 || sx1_64 > W || sy1_64 > H ||
+	    sx1_64 <= sx0_64 || sy1_64 <= sy0_64) {
+		/* Crop not fully inside the old picture — recompose. */
+		redraw_all(srv);
+		return;
+	}
+
+	sx0 = (int)sx0_64;
+	sy0 = (int)sy0_64;
+	sx1 = (int)sx1_64;
+	sy1 = (int)sy1_64;
+	src_w = sx1 - sx0;
+	src_h = sy1 - sy0;
+	if (src_w < 1 || src_h < 1) {
+		redraw_all(srv);
+		return;
+	}
+
+	stride = display_stride_px(srv);
+	fb = (uint32_t *)srv->framebuffer;
+
+	/* Snapshot the crop; dest overlaps the live FB. */
+	src_copy = malloc((size_t)src_w * (size_t)src_h * sizeof(uint32_t));
+	if (!src_copy) {
+		redraw_all(srv);
+		return;
+	}
+	for (y = 0; y < src_h; y++) {
+		memcpy(src_copy + y * src_w,
+		       fb + (sy0 + y) * (int)stride + sx0,
+		       (size_t)src_w * sizeof(uint32_t));
+	}
+
+	cursor_fb_begin();
+	(void)cursor_lift_all_ret();
+
+	/* NN scale crop → full viewport. */
+	for (y = 0; y < H; y++) {
+		int sy = y * src_h / H;
+		const uint32_t *srow = src_copy + sy * src_w;
+		uint32_t *drow = fb + y * (int)stride;
+
+		for (x = 0; x < W; x++)
+			drow[x] = srow[x * src_w / W];
+	}
+
+	free(src_copy);
+
+	if (bgce_comp_debug()) {
+		printf("[BGCE] zoom-in FB scale: crop=[%d,%d)×[%d,%d) %dx%d → "
+		       "%dx%d  %d%%→%d%%\n",
+		       sx0, sx1, sy0, sy1, src_w, src_h, W, H,
+		       (int)z0, (int)z1);
+		fflush(stdout);
+	}
+
+	cursor_fb_end(1);
+}
+
 void erase_client(struct ServerState* srv, const struct Client* gone) {
 	int sx0, sy0, sx1, sy1;
 	int lifted;

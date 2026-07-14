@@ -29,6 +29,7 @@ enum comp_op {
 	COMP_PAN,
 	COMP_ERASE,
 	COMP_FULL,
+	COMP_ZOOM, /* viewport change: FB crop+scale when zooming in */
 	COMP_CURSOR,
 	COMP_QUIT
 };
@@ -41,6 +42,9 @@ struct comp_job {
 	int sdx, sdy;
 	int cursor_x, cursor_y;
 	uint32_t erase_x, erase_y, erase_ww, erase_wh;
+	/* COMP_ZOOM: old → new viewport (zoom percent + screen pan) */
+	int zoom_old, zoom_new;
+	int pan_old_x, pan_old_y, pan_new_x, pan_new_y;
 };
 
 struct paint_task {
@@ -92,6 +96,7 @@ static const char *op_name(enum comp_op op)
 	case COMP_PAN:    return "PAN";
 	case COMP_ERASE:  return "ERASE";
 	case COMP_FULL:   return "FULL";
+	case COMP_ZOOM:   return "ZOOM";
 	case COMP_CURSOR: return "CURSOR";
 	case COMP_QUIT:   return "QUIT";
 	default:          return "?";
@@ -242,6 +247,14 @@ static void run_job(const struct comp_job *job)
 			       server.zoom_pct, server.pan_x, server.pan_y,
 			       server.display_w, server.display_h);
 			break;
+		case COMP_ZOOM:
+			printf("[BGCE] comp: run job=%llu ZOOM %d%%→%d%% "
+			       "pan (%d,%d)->(%d,%d)\n",
+			       (unsigned long long)job->job_id,
+			       job->zoom_old, job->zoom_new,
+			       job->pan_old_x, job->pan_old_y,
+			       job->pan_new_x, job->pan_new_y);
+			break;
 		case COMP_CURSOR:
 			printf("[BGCE] comp: run job=%llu CURSOR screen=(%d,%d) "
 			       "zoom=%d%% pan=(%d,%d)\n",
@@ -295,6 +308,12 @@ static void run_job(const struct comp_job *job)
 
 	case COMP_FULL:
 		redraw_all(&server);
+		break;
+
+	case COMP_ZOOM:
+		redraw_zoom_viewport(&server,
+		                     job->zoom_old, job->pan_old_x, job->pan_old_y,
+		                     job->zoom_new, job->pan_new_x, job->pan_new_y);
 		break;
 
 	case COMP_CURSOR:
@@ -482,19 +501,37 @@ static int try_coalesce_locked(const struct comp_job *job)
 	struct comp_job *pending = NULL;
 
 	if (job->op != COMP_MOVE && job->op != COMP_CURSOR &&
-	    job->op != COMP_PAN)
+	    job->op != COMP_PAN && job->op != COMP_ZOOM &&
+	    job->op != COMP_FULL)
 		return 0;
 
 	n = q_count;
 	for (i = 0; i < n; i++) {
 		idx = (q_head + i) % COMP_QUEUE_CAP;
+		/*
+		 * FULL absorbs a later ZOOM (full recompose already correct).
+		 * ZOOM absorbs another ZOOM (earliest old → latest new).
+		 * A pending ZOOM is replaced by FULL.
+		 */
+		if (job->op == COMP_FULL) {
+			if (queue[idx].op == COMP_FULL ||
+			    queue[idx].op == COMP_ZOOM)
+				pending = &queue[idx];
+			continue;
+		}
+		if (job->op == COMP_ZOOM) {
+			if (queue[idx].op == COMP_FULL)
+				return 1; /* pending FULL already covers us */
+			if (queue[idx].op == COMP_ZOOM)
+				pending = &queue[idx];
+			continue;
+		}
 		if (queue[idx].op != job->op)
 			continue;
 		if (job->op == COMP_MOVE &&
 		    queue[idx].client_id != job->client_id)
 			continue;
 		pending = &queue[idx];
-		/* keep scanning so we fold into the newest match */
 	}
 	if (!pending)
 		return 0;
@@ -522,7 +559,7 @@ static int try_coalesce_locked(const struct comp_job *job)
 			       pending->cursor_x, pending->cursor_y, q_count);
 			debug_fflush();
 		}
-	} else { /* COMP_PAN */
+	} else if (job->op == COMP_PAN) {
 		pending->sdx += job->sdx;
 		pending->sdy += job->sdy;
 		if (bgce_debug) {
@@ -530,6 +567,29 @@ static int try_coalesce_locked(const struct comp_job *job)
 			       "q=%d\n",
 			       (unsigned long long)pending->job_id,
 			       pending->sdx, pending->sdy, q_count);
+			debug_fflush();
+		}
+	} else if (job->op == COMP_ZOOM) {
+		/* Keep earliest old viewport; take latest new. */
+		pending->zoom_new = job->zoom_new;
+		pending->pan_new_x = job->pan_new_x;
+		pending->pan_new_y = job->pan_new_y;
+		if (bgce_debug) {
+			printf("[BGCE] comp: coalesce ZOOM job=%llu "
+			       "%d%%→%d%% pan (%d,%d)->(%d,%d) q=%d\n",
+			       (unsigned long long)pending->job_id,
+			       pending->zoom_old, pending->zoom_new,
+			       pending->pan_old_x, pending->pan_old_y,
+			       pending->pan_new_x, pending->pan_new_y,
+			       q_count);
+			debug_fflush();
+		}
+	} else if (job->op == COMP_FULL) {
+		/* Upgrade ZOOM slot to FULL, or no-op on existing FULL. */
+		pending->op = COMP_FULL;
+		if (bgce_debug) {
+			printf("[BGCE] comp: coalesce FULL job=%llu q=%d\n",
+			       (unsigned long long)pending->job_id, q_count);
 			debug_fflush();
 		}
 	}
@@ -855,6 +915,27 @@ void bgce_comp_submit_full(void)
 	}
 	memset(&j, 0, sizeof(j));
 	j.op = COMP_FULL;
+	enqueue(&j);
+}
+
+void bgce_comp_submit_zoom(int old_z, int old_pan_x, int old_pan_y,
+                           int new_z, int new_pan_x, int new_pan_y)
+{
+	struct comp_job j;
+
+	if (!comp_inited) {
+		redraw_zoom_viewport(&server, old_z, old_pan_x, old_pan_y,
+		                     new_z, new_pan_x, new_pan_y);
+		return;
+	}
+	memset(&j, 0, sizeof(j));
+	j.op = COMP_ZOOM;
+	j.zoom_old = old_z;
+	j.zoom_new = new_z;
+	j.pan_old_x = old_pan_x;
+	j.pan_old_y = old_pan_y;
+	j.pan_new_x = new_pan_x;
+	j.pan_new_y = new_pan_y;
 	enqueue(&j);
 }
 
