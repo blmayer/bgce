@@ -167,8 +167,6 @@ static void run_job(const struct comp_job *job)
 {
 	struct Client *c;
 	struct Client gone;
-	int wdx, wdy;
-	uint32_t save_x, save_y;
 	const char *app = "";
 
 	tls_job_id = job->job_id;
@@ -244,27 +242,19 @@ static void run_job(const struct comp_job *job)
 			       server.zoom_pct, server.pan_x, server.pan_y,
 			       server.display_w, server.display_h);
 			break;
-		case COMP_CURSOR: {
-			/* Mouse moves constantly — log 1 in 32 so DRAW stays visible. */
-			static int cursor_run_n;
-			if ((cursor_run_n++ % 32) == 0) {
-				printf("[BGCE] comp: run job=%llu CURSOR screen=(%d,%d) "
-				       "(1/32) zoom=%d%% pan=(%d,%d)\n",
-				       (unsigned long long)job->job_id,
-				       job->cursor_x, job->cursor_y,
-				       server.zoom_pct, server.pan_x,
-				       server.pan_y);
-				debug_fflush();
-			}
+		case COMP_CURSOR:
+			printf("[BGCE] comp: run job=%llu CURSOR screen=(%d,%d) "
+			       "zoom=%d%% pan=(%d,%d)\n",
+			       (unsigned long long)job->job_id,
+			       job->cursor_x, job->cursor_y,
+			       server.zoom_pct, server.pan_x, server.pan_y);
 			break;
-		}
 		default:
 			printf("[BGCE] comp: run job=%llu %s\n",
 			       (unsigned long long)job->job_id, op_name(job->op));
 			break;
 		}
-		if (job->op != COMP_CURSOR)
-			debug_fflush();
+		debug_fflush();
 	}
 
 	switch (job->op) {
@@ -282,21 +272,9 @@ static void run_job(const struct comp_job *job)
 	case COMP_MOVE:
 		if (!c)
 			break;
-		wdx = job->new_x - job->old_x;
-		wdy = job->new_y - job->old_y;
-		if (wdx == 0 && wdy == 0)
-			break;
-		/*
-		 * Logical position may already be at new (or further ahead).
-		 * Paint from old → new, then restore whatever input set.
-		 */
-		save_x = c->x;
-		save_y = c->y;
-		c->x = (uint32_t)job->old_x;
-		c->y = (uint32_t)job->old_y;
-		redraw_region(&server, c, wdx, wdy);
-		c->x = save_x;
-		c->y = save_y;
+		/* Geometry from the job only — never poke c->x/y (input owns it). */
+		redraw_region(&server, c, job->old_x, job->old_y,
+		              job->new_x, job->new_y);
 		break;
 
 	case COMP_PAN:
@@ -328,7 +306,7 @@ static void run_job(const struct comp_job *job)
 		break;
 	}
 
-	if (bgce_debug && job->op != COMP_CURSOR) {
+	if (bgce_debug) {
 		printf("[BGCE] comp: done job=%llu op=%s\n",
 		       (unsigned long long)job->job_id, op_name(job->op));
 		debug_fflush();
@@ -517,8 +495,7 @@ static void enqueue(struct comp_job *job)
 	queue[q_tail] = *job;
 	q_tail = (q_tail + 1) % COMP_QUEUE_CAP;
 	q_count++;
-	if (bgce_debug && job->op != COMP_CURSOR) {
-		/* CURSOR is rate-limited in submit_cursor (see comment there). */
+	if (bgce_debug) {
 		struct Client *c = NULL;
 		const char *app = "";
 		uint32_t cx = 0, cy = 0, ww = 0, wh = 0;
@@ -550,6 +527,11 @@ static void enqueue(struct comp_job *job)
 			printf("[BGCE] comp: enqueue job=%llu PAN d=(%d,%d) q=%d\n",
 			       (unsigned long long)job->job_id,
 			       job->sdx, job->sdy, q_count);
+		else if (job->op == COMP_CURSOR)
+			printf("[BGCE] comp: enqueue job=%llu CURSOR screen=(%d,%d) "
+			       "q=%d\n",
+			       (unsigned long long)job->job_id,
+			       job->cursor_x, job->cursor_y, q_count);
 		else
 			printf("[BGCE] comp: enqueue job=%llu %s client=%u "
 			       "app='%s' q=%d\n",
@@ -721,20 +703,10 @@ void bgce_comp_submit_move(uint32_t client_id, int old_x, int old_y, int new_x,
 
 	if (!comp_inited) {
 		struct Client *c = bgce_comp_find_client(client_id);
-		int wdx, wdy;
-		uint32_t sx, sy;
 
 		if (!c)
 			return;
-		wdx = new_x - old_x;
-		wdy = new_y - old_y;
-		sx = c->x;
-		sy = c->y;
-		c->x = (uint32_t)old_x;
-		c->y = (uint32_t)old_y;
-		redraw_region(&server, c, wdx, wdy);
-		c->x = sx;
-		c->y = sy;
+		redraw_region(&server, c, old_x, old_y, new_x, new_y);
 		return;
 	}
 	memset(&j, 0, sizeof(j));
@@ -815,17 +787,5 @@ void bgce_comp_submit_cursor(int x, int y)
 	j.op = COMP_CURSOR;
 	j.cursor_x = x;
 	j.cursor_y = y;
-	/* job_id assigned in enqueue; rate-limit log after assign via flag */
-	{
-		static int n;
-		int log_this = bgce_debug && ((n++ % 32) == 0);
-
-		enqueue(&j);
-		if (log_this) {
-			printf("[BGCE] comp: enqueue job=%llu CURSOR screen=(%d,%d) "
-			       "(1/32 samples)\n",
-			       (unsigned long long)j.job_id, x, y);
-			debug_fflush();
-		}
-	}
+	enqueue(&j);
 }

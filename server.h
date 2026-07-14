@@ -238,12 +238,13 @@ void set_cursor_type(enum BGCECursorType type);
 void draw(struct ServerState *srv, struct Client *cli);
 
 /**
- * Move client by world delta (dx, dy).  `c` is still at the old position.
- * Design: L-shaped expose with underlay stack only; full blit of the mover
- * at the new place (no FB scroll, no underlay under the window body).
+ * Move paint: underlay trail (old screen rect \ new), blit mover at new,
+ * re-blit windows above over old∪new.  Geometry comes only from the
+ * coordinates — does not read or write c->x/y (input owns the live position).
  * See redraw_region() in display.c.
  */
-void redraw_region(struct ServerState *srv, struct Client *c, int dx, int dy);
+void redraw_region(struct ServerState *srv, struct Client *c,
+                   int old_x, int old_y, int new_x, int new_y);
 
 void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);
 

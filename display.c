@@ -1704,38 +1704,38 @@ static void move_paint_worker(void *arg)
 }
 
 /*
- * Window move.  `c` is still at the OLD world position.
+ * Window move paint.  Does not read or write c->x/y — only buffer/stack id.
  *
- *   trail  = old_world \ new_world     (L-shape on a pure translate)
- *   underlay each trail strip on screen (wallpaper + other windows)
+ *   trail_screen = old_screen \ new_screen   (what the FB must lose)
+ *   underlay each trail strip (wallpaper + every client except the mover)
  *   blit mover on new_screen only
- *   re-blit any windows above over old_screen ∪ new_screen
+ *   re-blit windows above over old_screen ∪ new_screen
  *
- * Example: (1000,500) 200×200, left 1 → (999,500):
- *   old_world  [1000,1200)×[500,700)
- *   new_world  [999,1199)×[500,700)
- *   trail      [1199,1200)×[500,700)   underlay 1×200
- *   mover      [999,1199)×[500,700)    200×200  (no shared column)
+ * Example: (1000,500) 200×200, left 1 → (999,500) at 100% zoom:
+ *   old_screen [1000,1200)×[500,700)
+ *   new_screen [999,1199)×[500,700)
+ *   trail      [1199,1200)×[500,700)  underlay 1×200
+ *   mover      [999,1199)×[500,700)   200×200
  */
-void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+void redraw_region(struct ServerState *srv, struct Client *c,
+                   int old_x, int old_y, int new_x, int new_y)
 {
 	struct Client at_new;
 	struct Client *above;
 	struct rect old_world, new_world;
 	struct rect old_screen, new_screen;
-	struct rect trail_world[MOVE_TRAIL_MAX];
-	struct rect trail_screen[MOVE_TRAIL_MAX];
+	struct rect trail[MOVE_TRAIL_MAX];
 	struct move_paint_job underlay_job[2];
 	struct move_paint_job mover_job;
 	int width, height;
-	int n_trail, n_screen, i, j;
+	int n_trail, i;
 	int z1x;
 
 	if (!srv || !srv->framebuffer || !c) {
 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
 		return;
 	}
-	if (wdx == 0 && wdy == 0)
+	if (old_x == new_x && old_y == new_y)
 		return;
 
 	width = (int)(c->world_w ? c->world_w : c->width);
@@ -1743,22 +1743,20 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	if (width < 1 || height < 1)
 		return;
 
-	old_world = rect_make((int)c->x, (int)c->y,
-	                      (int)c->x + width, (int)c->y + height);
-	new_world = rect_make(old_world.x0 + wdx, old_world.y0 + wdy,
-	                      old_world.x1 + wdx, old_world.y1 + wdy);
-
-	at_new = *c;
-	at_new.x = (uint32_t)new_world.x0;
-	at_new.y = (uint32_t)new_world.y0;
-
+	old_world = rect_make(old_x, old_y, old_x + width, old_y + height);
+	new_world = rect_make(new_x, new_y, new_x + width, new_y + height);
 	old_screen = rect_world_to_screen(srv, old_world);
 	new_screen = rect_world_to_screen(srv, new_world);
+
+	/* Snapshot for blit only — live c->x may already be further ahead. */
+	at_new = *c;
+	at_new.x = (uint32_t)new_x;
+	at_new.y = (uint32_t)new_y;
 
 	cursor_fb_begin();
 	(void)cursor_lift_all_ret();
 
-	/* Zoomed out: screen rect may not move; still re-sample the buffer. */
+	/* Zoomed out: integer screen rect may not move; still re-sample. */
 	if (old_screen.x0 == new_screen.x0 && old_screen.y0 == new_screen.y0 &&
 	    old_screen.x1 == new_screen.x1 && old_screen.y1 == new_screen.y1) {
 		struct rect area = rect_clip(srv, new_screen);
@@ -1778,78 +1776,78 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 		return;
 	}
 
-	/* Trail behind the window = old minus new (world pixels). */
-	n_trail = rect_minus(old_world, new_world, trail_world, MOVE_TRAIL_MAX);
-
 	/*
-	 * Map trail strips to screen.  At zoom ≠ 100%, pad 1px for ceil gaps
-	 * then cut new_screen back out so we never underlay the mover body.
+	 * Trail in screen space: pixels that were in the old footprint but
+	 * are not in the new one.  Same rule the previous frame used to paint.
 	 */
+	n_trail = rect_minus(old_screen, new_screen, trail, MOVE_TRAIL_MAX);
 	z1x = (zoom_pct_of(srv) == BGCE_ZOOM_PCT_1X);
-	n_screen = 0;
-	for (i = 0; i < n_trail && n_screen < MOVE_TRAIL_MAX; i++) {
-		struct rect s = rect_clip(srv,
-		                          rect_world_to_screen(srv, trail_world[i]));
 
-		if (rect_empty(s))
-			continue;
-		if (z1x) {
-			trail_screen[n_screen++] = s;
-			continue;
-		}
-		{
-			struct rect padded = rect_grow1(s, (int)srv->display_w,
-			                                (int)srv->display_h);
+	/* Non-1×: pad then cut new out to cover ceil/sample gaps. */
+	if (!z1x && n_trail > 0) {
+		struct rect padded_bits[MOVE_TRAIL_MAX];
+		int n_pad = 0;
+
+		for (i = 0; i < n_trail && n_pad < MOVE_TRAIL_MAX; i++) {
 			struct rect pieces[MOVE_TRAIL_MAX];
-			int np = rect_minus(padded, new_screen, pieces,
+			struct rect grown = rect_grow1(trail[i],
+			                               (int)srv->display_w,
+			                               (int)srv->display_h);
+			int np = rect_minus(grown, new_screen, pieces,
 			                    MOVE_TRAIL_MAX);
+			int j;
 
-			for (j = 0; j < np && n_screen < MOVE_TRAIL_MAX; j++) {
-				struct rect clipped = rect_clip(srv, pieces[j]);
+			for (j = 0; j < np && n_pad < MOVE_TRAIL_MAX; j++) {
+				struct rect cl = rect_clip(srv, pieces[j]);
 
-				if (!rect_empty(clipped))
-					trail_screen[n_screen++] = clipped;
+				if (!rect_empty(cl))
+					padded_bits[n_pad++] = cl;
 			}
 		}
+		for (i = 0; i < n_pad; i++)
+			trail[i] = padded_bits[i];
+		n_trail = n_pad;
 	}
+
+	for (i = 0; i < n_trail; i++)
+		trail[i] = rect_clip(srv, trail[i]);
 
 	if (bgce_comp_debug()) {
-		printf("[BGCE] move: delta=(%d,%d) size=%dx%d\n",
-		       wdx, wdy, width, height);
-		rect_log("old_world", old_world);
-		rect_log("new_world", new_world);
+		printf("[BGCE] move: (%d,%d)->(%d,%d) size=%dx%d\n",
+		       old_x, old_y, new_x, new_y, width, height);
+		rect_log("old_screen", old_screen);
+		rect_log("new_screen", new_screen);
 		for (i = 0; i < n_trail; i++)
-			rect_log("trail_world", trail_world[i]);
-		for (i = 0; i < n_screen; i++)
-			rect_log("trail_screen", trail_screen[i]);
-		rect_log("mover_screen", new_screen);
+			rect_log("trail", trail[i]);
 	}
 
-	/* Underlay trail first (up to 2 strips in parallel), then mover. */
+	/* Underlay trail (parallel strips), then mover — no shared column. */
 	{
 		void (*fn0)(void *) = NULL, (*fn1)(void *) = NULL;
 		void *arg0 = NULL, *arg1 = NULL;
 
-		if (n_screen > 0) {
+		if (n_trail > 0 && !rect_empty(trail[0])) {
 			underlay_job[0].srv = srv;
-			underlay_job[0].client = c;
-			underlay_job[0].area = trail_screen[0];
+			underlay_job[0].client = c; /* skip real list node */
+			underlay_job[0].area = trail[0];
 			underlay_job[0].is_underlay = 1;
 			fn0 = move_paint_worker;
 			arg0 = &underlay_job[0];
 		}
-		if (n_screen > 1) {
+		if (n_trail > 1 && !rect_empty(trail[1])) {
 			underlay_job[1].srv = srv;
 			underlay_job[1].client = c;
-			underlay_job[1].area = trail_screen[1];
+			underlay_job[1].area = trail[1];
 			underlay_job[1].is_underlay = 1;
 			fn1 = move_paint_worker;
 			arg1 = &underlay_job[1];
 		}
 		bgce_comp_parallel3(fn0, arg0, fn1, arg1, NULL, NULL);
 
-		for (i = 2; i < n_screen; i++) {
-			underlay_job[0].area = trail_screen[i];
+		for (i = 2; i < n_trail; i++) {
+			if (rect_empty(trail[i]))
+				continue;
+			underlay_job[0].area = trail[i];
 			move_paint_worker(&underlay_job[0]);
 		}
 	}
@@ -1866,7 +1864,7 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 		}
 	}
 
-	/* Windows above the mover cover old∪new (list is top → bottom). */
+	/* Windows above the mover (list is top → bottom). */
 	for (above = srv->clients; above && above != c; above = above->next) {
 		struct rect cover;
 
