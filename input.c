@@ -825,12 +825,13 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 				if (sp < 1)
 					sp = 256;
+				/* Cursor first so a busy compositor never freezes the pointer. */
+				set_cursor_pos(&server, mouse_x, mouse_y);
 				/* Integer screen pixels; pan paint is queued. */
 				sdx = dx * sp / 256;
 				sdy = dy * sp / 256;
 				if (sdx || sdy)
 					bgce_comp_submit_pan(sdx, sdy);
-				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			case DRAG_MOVE: {
@@ -840,6 +841,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 				if (!c)
 					return 1;
+				set_cursor_pos(&server, mouse_x, mouse_y);
 				screen_delta_to_world(dx, dy, config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
@@ -850,7 +852,6 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 					bgce_comp_submit_move(c->id, old_x, old_y,
 					                      (int)c->x, (int)c->y);
 				}
-				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			case DRAG_RESIZE: {
@@ -922,11 +923,11 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 				if (sp < 1)
 					sp = 256;
+				set_cursor_pos(&server, mouse_x, mouse_y);
 				sdx = dx * sp / 256;
 				sdy = dy * sp / 256;
 				if (sdx || sdy)
 					bgce_comp_submit_pan(sdx, sdy);
-				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			case DRAG_MOVE: {
@@ -936,6 +937,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 				if (!c)
 					return 1;
+				set_cursor_pos(&server, mouse_x, mouse_y);
 				screen_delta_to_world(dx, dy, config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
@@ -946,7 +948,6 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 					bgce_comp_submit_move(c->id, ox, oy,
 					                      (int)c->x, (int)c->y);
 				}
-				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			case DRAG_RESIZE: {

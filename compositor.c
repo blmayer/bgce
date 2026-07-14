@@ -3,10 +3,10 @@
  *
  * display.c owns paint algorithms; this file owns when they run and threading.
  *
- * Two levels:
- *   1) Job queue  — DRAW/MOVE/PAN/… consumed by the orchestrator (ordered).
- *   2) Task queue — fine-grained paint fns; 3 workers grab FCFS (any worker
- *                   can take underlay or mover work during a MOVE).
+ * Two levels (strict roles):
+ *   1) Job queue  — DRAW/MOVE/PAN/… consumed only by the orchestrator.
+ *   2) Task queue — fine-grained paint fns; only the 3 workers grab FCFS.
+ *      The orchestrator enqueues a batch and waits — it never runs tasks.
  */
 
 #include "compositor.h"
@@ -176,6 +176,13 @@ static void run_job(const struct comp_job *job)
 	default:
 		break;
 	}
+
+	/*
+	 * Paint the software cursor here so it is not stuck waiting for the
+	 * input thread to win a race with fb_writing (input only dirties the
+	 * hotspot while a job is in flight).
+	 */
+	display_cursor_present();
 }
 
 static void *worker_main(void *arg)
@@ -246,11 +253,10 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
 	}
 
 	/*
-	 * Push all tasks, then wait.  Workers race to grab them (FCFS);
-	 * which worker paints L0 vs mover is not fixed.
+	 * Orchestrator only enqueues and waits.  Blit workers alone pull tasks
+	 * FCFS — no work-stealing by the orchestrator (separation of concerns).
 	 */
 	pthread_mutex_lock(&work_mu);
-	/* Only one batch at a time (orchestrator is single-threaded). */
 	while (tasks_left > 0)
 		pthread_cond_wait(&work_done_cv, &work_mu);
 
@@ -259,15 +265,6 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
 	for (i = 0; i < 3; i++) {
 		if (!fns[i])
 			continue;
-		if (tq_count >= TASK_QUEUE_CAP) {
-			/* Should not happen with n <= 3; run overflow serial. */
-			pthread_mutex_unlock(&work_mu);
-			fns[i](args[i]);
-			pthread_mutex_lock(&work_mu);
-			if (tasks_left > 0)
-				tasks_left--;
-			continue;
-		}
 		task_q[tq_tail].fn = fns[i];
 		task_q[tq_tail].arg = args[i];
 		tq_tail = (tq_tail + 1) % TASK_QUEUE_CAP;
@@ -279,16 +276,28 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
 	pthread_mutex_unlock(&work_mu);
 }
 
+/*
+ * Never block the producer (input) on a full queue — that freezes the mouse.
+ * Drop the new job if the queue is saturated (paint may lag; input stays live).
+ */
 static void enqueue(const struct comp_job *job)
 {
+	static int drop_log;
+
 	if (comp_sync) {
 		run_job(job);
 		return;
 	}
 
 	pthread_mutex_lock(&q_mu);
-	while (q_count >= COMP_QUEUE_CAP)
-		pthread_cond_wait(&q_not_full, &q_mu);
+	if (q_count >= COMP_QUEUE_CAP) {
+		pthread_mutex_unlock(&q_mu);
+		if ((drop_log++ % 64) == 0)
+			fprintf(stderr,
+			        "[BGCE] compositor: queue full, dropping job op=%d\n",
+			        (int)job->op);
+		return;
+	}
 	queue[q_tail] = *job;
 	q_tail = (q_tail + 1) % COMP_QUEUE_CAP;
 	q_count++;
