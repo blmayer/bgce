@@ -129,21 +129,24 @@ void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
 	const char *op = tls_op_name ? tls_op_name : "?";
 	int w = x1 - x0;
 	int h = y1 - y0;
+	/* Logs use inclusive corners; internals stay half-open [x0,x1). */
+	int x_last = (x1 > x0) ? x1 - 1 : x0;
+	int y_last = (y1 > y0) ? y1 - 1 : y0;
 
 	if (!bgce_debug)
 		return;
 	if (worker < 0)
 		worker = tls_worker_id;
 	if (worker >= 0)
-		printf("[BGCE] damage job=%llu op=%s %s rect=(%d,%d)-(%d,%d) "
-		       "%dx%d worker=%d\n",
+		printf("[BGCE] damage job=%llu op=%s %s "
+		       "(%d,%d)-(%d,%d) %dx%d worker=%d\n",
 		       (unsigned long long)tls_job_id, op, tag ? tag : "?",
-		       x0, y0, x1, y1, w, h, worker);
+		       x0, y0, x_last, y_last, w, h, worker);
 	else
-		printf("[BGCE] damage job=%llu op=%s %s rect=(%d,%d)-(%d,%d) "
-		       "%dx%d worker=orch\n",
+		printf("[BGCE] damage job=%llu op=%s %s "
+		       "(%d,%d)-(%d,%d) %dx%d worker=orch\n",
 		       (unsigned long long)tls_job_id, op, tag ? tag : "?",
-		       x0, y0, x1, y1, w, h);
+		       x0, y0, x_last, y_last, w, h);
 	debug_fflush();
 }
 
@@ -198,12 +201,15 @@ static void run_job(const struct comp_job *job)
 		switch (job->op) {
 		case COMP_DRAW:
 			printf("[BGCE] comp: run job=%llu DRAW client=%u app='%s' "
-			       "world=(%u,%u) %ux%u screen=(%d,%d)-(%d,%d) "
+			       "world=(%u,%u) %ux%u screen=(%d,%d)-(%d,%d) %dx%d "
 			       "zoom=%d%% pan=(%d,%d)\n",
 			       (unsigned long long)job->job_id,
 			       (unsigned)job->client_id, app,
 			       c ? c->x : 0, c ? c->y : 0, ww, wh,
-			       sx0, sy0, sx1, sy1,
+			       sx0, sy0,
+			       sx1 > sx0 ? sx1 - 1 : sx0,
+			       sy1 > sy0 ? sy1 - 1 : sy0,
+			       sx1 - sx0, sy1 - sy0,
 			       server.zoom_pct, server.pan_x, server.pan_y);
 			break;
 		case COMP_MOVE:
