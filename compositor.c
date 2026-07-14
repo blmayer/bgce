@@ -467,21 +467,147 @@ static void assign_job_id(struct comp_job *job)
 }
 
 /*
+ * Fold high-frequency jobs into an already-queued peer so a fast drag does
+ * not enqueue hundreds of 1px MOVE + CURSOR steps (fills CAP → drops).
+ *
+ *   MOVE   same client → keep earliest old_*, set new_* to latest
+ *   CURSOR any         → latest screen position only
+ *   PAN    any         → accumulate sdx/sdy
+ *
+ * Must hold q_mu.  Returns 1 if absorbed (do not push a new slot).
+ */
+static int try_coalesce_locked(const struct comp_job *job)
+{
+	int i, n, idx;
+	struct comp_job *pending = NULL;
+
+	if (job->op != COMP_MOVE && job->op != COMP_CURSOR &&
+	    job->op != COMP_PAN)
+		return 0;
+
+	n = q_count;
+	for (i = 0; i < n; i++) {
+		idx = (q_head + i) % COMP_QUEUE_CAP;
+		if (queue[idx].op != job->op)
+			continue;
+		if (job->op == COMP_MOVE &&
+		    queue[idx].client_id != job->client_id)
+			continue;
+		pending = &queue[idx];
+		/* keep scanning so we fold into the newest match */
+	}
+	if (!pending)
+		return 0;
+
+	if (job->op == COMP_MOVE) {
+		/* pending: A→B, job: B→C (or further) → one paint A→C */
+		pending->new_x = job->new_x;
+		pending->new_y = job->new_y;
+		if (bgce_debug) {
+			printf("[BGCE] comp: coalesce MOVE job=%llu client=%u "
+			       "(%d,%d)->(%d,%d) q=%d\n",
+			       (unsigned long long)pending->job_id,
+			       (unsigned)pending->client_id,
+			       pending->old_x, pending->old_y,
+			       pending->new_x, pending->new_y, q_count);
+			debug_fflush();
+		}
+	} else if (job->op == COMP_CURSOR) {
+		pending->cursor_x = job->cursor_x;
+		pending->cursor_y = job->cursor_y;
+		if (bgce_debug) {
+			printf("[BGCE] comp: coalesce CURSOR job=%llu "
+			       "screen=(%d,%d) q=%d\n",
+			       (unsigned long long)pending->job_id,
+			       pending->cursor_x, pending->cursor_y, q_count);
+			debug_fflush();
+		}
+	} else { /* COMP_PAN */
+		pending->sdx += job->sdx;
+		pending->sdy += job->sdy;
+		if (bgce_debug) {
+			printf("[BGCE] comp: coalesce PAN job=%llu d=(%d,%d) "
+			       "q=%d\n",
+			       (unsigned long long)pending->job_id,
+			       pending->sdx, pending->sdy, q_count);
+			debug_fflush();
+		}
+	}
+	return 1;
+}
+
+static void log_enqueue(const struct comp_job *job)
+{
+	struct Client *c = NULL;
+	const char *app = "";
+	uint32_t cx = 0, cy = 0, ww = 0, wh = 0;
+
+	if (!bgce_debug)
+		return;
+
+	if (job->client_id)
+		c = bgce_comp_find_client(job->client_id);
+	if (c) {
+		if (c->app_id[0])
+			app = c->app_id;
+		cx = c->x;
+		cy = c->y;
+		ww = c->world_w ? c->world_w : c->width;
+		wh = c->world_h ? c->world_h : c->height;
+	}
+	if (job->op == COMP_DRAW)
+		printf("[BGCE] comp: enqueue job=%llu DRAW client=%u "
+		       "app='%s' world=(%u,%u) %ux%u q=%d\n",
+		       (unsigned long long)job->job_id,
+		       (unsigned)job->client_id, app, cx, cy, ww, wh,
+		       q_count);
+	else if (job->op == COMP_MOVE)
+		printf("[BGCE] comp: enqueue job=%llu MOVE client=%u "
+		       "app='%s' (%d,%d)->(%d,%d) q=%d\n",
+		       (unsigned long long)job->job_id,
+		       (unsigned)job->client_id, app,
+		       job->old_x, job->old_y, job->new_x, job->new_y,
+		       q_count);
+	else if (job->op == COMP_PAN)
+		printf("[BGCE] comp: enqueue job=%llu PAN d=(%d,%d) q=%d\n",
+		       (unsigned long long)job->job_id,
+		       job->sdx, job->sdy, q_count);
+	else if (job->op == COMP_CURSOR)
+		printf("[BGCE] comp: enqueue job=%llu CURSOR screen=(%d,%d) "
+		       "q=%d\n",
+		       (unsigned long long)job->job_id,
+		       job->cursor_x, job->cursor_y, q_count);
+	else
+		printf("[BGCE] comp: enqueue job=%llu %s client=%u "
+		       "app='%s' q=%d\n",
+		       (unsigned long long)job->job_id, op_name(job->op),
+		       (unsigned)job->client_id, app, q_count);
+	debug_fflush();
+}
+
+/*
  * Never block the producer (input) on a full queue — that freezes the mouse.
- * Drop the new job if the queue is saturated (paint may lag; input stays live).
+ * Prefer coalescing MOVE/CURSOR/PAN; only drop if the queue is full and the
+ * job cannot fold into a peer.
  */
 static void enqueue(struct comp_job *job)
 {
 	static int drop_log;
 
-	assign_job_id(job);
-
 	if (comp_sync) {
+		assign_job_id(job);
 		run_job(job);
 		return;
 	}
 
 	pthread_mutex_lock(&q_mu);
+	if (try_coalesce_locked(job)) {
+		pthread_mutex_unlock(&q_mu);
+		return;
+	}
+
+	assign_job_id(job);
+
 	if (q_count >= COMP_QUEUE_CAP) {
 		pthread_mutex_unlock(&q_mu);
 		if ((drop_log++ % 64) == 0) {
@@ -495,50 +621,7 @@ static void enqueue(struct comp_job *job)
 	queue[q_tail] = *job;
 	q_tail = (q_tail + 1) % COMP_QUEUE_CAP;
 	q_count++;
-	if (bgce_debug) {
-		struct Client *c = NULL;
-		const char *app = "";
-		uint32_t cx = 0, cy = 0, ww = 0, wh = 0;
-
-		if (job->client_id)
-			c = bgce_comp_find_client(job->client_id);
-		if (c) {
-			if (c->app_id[0])
-				app = c->app_id;
-			cx = c->x;
-			cy = c->y;
-			ww = c->world_w ? c->world_w : c->width;
-			wh = c->world_h ? c->world_h : c->height;
-		}
-		if (job->op == COMP_DRAW)
-			printf("[BGCE] comp: enqueue job=%llu DRAW client=%u "
-			       "app='%s' world=(%u,%u) %ux%u q=%d\n",
-			       (unsigned long long)job->job_id,
-			       (unsigned)job->client_id, app, cx, cy, ww, wh,
-			       q_count);
-		else if (job->op == COMP_MOVE)
-			printf("[BGCE] comp: enqueue job=%llu MOVE client=%u "
-			       "app='%s' (%d,%d)->(%d,%d) q=%d\n",
-			       (unsigned long long)job->job_id,
-			       (unsigned)job->client_id, app,
-			       job->old_x, job->old_y, job->new_x, job->new_y,
-			       q_count);
-		else if (job->op == COMP_PAN)
-			printf("[BGCE] comp: enqueue job=%llu PAN d=(%d,%d) q=%d\n",
-			       (unsigned long long)job->job_id,
-			       job->sdx, job->sdy, q_count);
-		else if (job->op == COMP_CURSOR)
-			printf("[BGCE] comp: enqueue job=%llu CURSOR screen=(%d,%d) "
-			       "q=%d\n",
-			       (unsigned long long)job->job_id,
-			       job->cursor_x, job->cursor_y, q_count);
-		else
-			printf("[BGCE] comp: enqueue job=%llu %s client=%u "
-			       "app='%s' q=%d\n",
-			       (unsigned long long)job->job_id, op_name(job->op),
-			       (unsigned)job->client_id, app, q_count);
-		debug_fflush();
-	}
+	log_enqueue(job);
 	pthread_cond_signal(&q_not_empty);
 	pthread_mutex_unlock(&q_mu);
 }

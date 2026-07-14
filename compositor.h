@@ -11,6 +11,8 @@ struct Client;
  * - Async mode: orchestrator pops jobs (DRAW/MOVE/PAN/CURSOR/…).
  *   A pool of 3 blit workers runs fine-grained MOVE tasks FCFS.
  *   Input never paints — it only enqueues (including mouse motion).
+ * - Pending MOVE (same client), CURSOR, and PAN jobs coalesce so a fast
+ *   drag paints one big step instead of flooding the queue.
  * - Sync mode (headless): submit runs on the caller; parallel tasks serial.
  *
  * Debug: BGCE_DEBUG=1 — op names, enqueue/run/done, which worker took each
