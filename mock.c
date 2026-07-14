@@ -94,7 +94,8 @@ int bgce_mock_init(uint32_t width, uint32_t height)
 		return -1;
 	}
 	bgce_comp_submit_full();
-	display_cursor_present();
+	bgce_comp_submit_cursor((int)server.display_w / 2,
+	                        (int)server.display_h / 2);
 	mock_active = 1;
 	printf("[BGCE] mock init %ux%u virtual %ux%u\n",
 	       server.display_w, server.display_h,
@@ -265,7 +266,7 @@ struct Client *bgce_mock_click(int screen_x, int screen_y)
 		bgce_mock_focus(c);
 	else
 		server.focused_client = NULL;
-	set_cursor_pos(&server, screen_x, screen_y);
+	bgce_comp_submit_cursor(screen_x, screen_y);
 	return c;
 }
 
@@ -309,7 +310,6 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 		server.pan_y = wy * z / 100 - sy;
 		clamp_viewport(&server);
 		bgce_comp_submit_full();
-		display_cursor_present();
 		return;
 	}
 	z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
@@ -318,7 +318,6 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 	server.pan_y = wy * z / 100 - sy;
 	clamp_viewport(&server);
 	bgce_comp_submit_full();
-	display_cursor_present();
 }
 
 void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y)
@@ -334,7 +333,6 @@ void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y)
 	server.pan_y = pan_y;
 	clamp_viewport(&server);
 	bgce_comp_submit_full();
-	display_cursor_present();
 }
 
 void bgce_mock_alt_tab(int reverse)
@@ -342,7 +340,6 @@ void bgce_mock_alt_tab(int reverse)
 	if (!mock_active)
 		return;
 	bgce_cycle_focus(&server, reverse ? 1 : 0);
-	display_cursor_present();
 }
 
 void bgce_mock_remember_focus(void)
@@ -387,8 +384,6 @@ void bgce_announce(const char *fmt, ...)
 {
 	(void)fmt;
 }
-
-volatile sig_atomic_t bgce_sigint_pending;
 
 void bgce_request_shutdown(void)
 {

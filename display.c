@@ -56,17 +56,10 @@ static int cur_saved_x;
 static int cur_saved_y;
 static int cur_underlay_valid; /* 1 = FB has glyph; underlay is live */
 /*
- * Input thread owns cursor paint.  Compositor threads only lift the glyph
- * (restore underlay) when they damage that tile, then set cursor_dirty so
- * the input thread re-presents.  Avoids restore/paint races that left a
- * 32×32 square of stale underlay (wallpaper under a redrawing window).
- *
- * fb_writing: compositor is mid-blit.  Input must not paint/restore then
- * (would sample or replay a half-updated tile and freeze the look of the
- * window under the pointer).  Only update cursor_x/y + dirty.
+ * Software cursor is painted only on the compositor (orchestrator) thread.
+ * Input enqueues COMP_CURSOR jobs; it never blits the glyph itself.
  */
-static volatile int cursor_dirty;
-static volatile int fb_writing;
+static int cursor_dirty;
 
 static enum BGCECursorType current_cursor = BGCE_CURSOR_DEFAULT;
 
@@ -451,7 +444,7 @@ static void cursor_restore(void)
 /*
  * Draw the glyph at cursor_x/y.  Always lifts any previous glyph first so
  * calling paint twice never bakes a pointer into the underlay.
- * Input thread only (via set_cursor_pos / display_cursor_present).
+ * Compositor thread only.
  */
 static void cursor_paint(void)
 {
@@ -504,17 +497,22 @@ static int cursor_lift_all_ret(void)
 	return 1;
 }
 
-/* Begin/end compositor FB writes (paired). */
+/*
+ * Begin/end scene paint on the compositor thread.  Glyph is lifted for the
+ * duration; restored at end if need_present (or left dirty for a later
+ * COMP_CURSOR).
+ */
 static void cursor_fb_begin(void)
 {
-	fb_writing = 1;
+	(void)cursor_lift_all_ret();
 }
 
 static void cursor_fb_end(int need_present)
 {
-	fb_writing = 0;
 	if (need_present)
 		cursor_dirty = 1;
+	if (server.framebuffer && (cursor_dirty || !cur_underlay_valid))
+		cursor_paint();
 }
 
 int display_cursor_pending(void)
@@ -524,38 +522,26 @@ int display_cursor_pending(void)
 
 void display_cursor_present(void)
 {
-	if (!server.framebuffer || fb_writing)
+	if (!server.framebuffer)
 		return;
-	if (!cursor_dirty && cur_underlay_valid)
-		return;
-	cursor_paint();
+	if (cursor_dirty || !cur_underlay_valid)
+		cursor_paint();
 }
 
 void display_cursor_refresh(void)
 {
-	if (fb_writing) {
-		cursor_dirty = 1;
-		return;
-	}
 	cursor_restore();
 	cursor_paint();
 }
 
+/*
+ * Move the software cursor and paint it.  Must run on the compositor
+ * thread (via COMP_CURSOR or after a scene job).  Input only enqueues.
+ */
 void set_cursor_pos(struct ServerState *srv, int x, int y)
 {
 	(void)srv;
 	clamp_cursor_pos(&x, &y);
-
-	/*
-	 * Compositor owns the FB right now: only remember the hotspot.
-	 * Painting would sample a half-drawn frame and leave a frozen tile.
-	 */
-	if (fb_writing) {
-		cursor_x = x;
-		cursor_y = y;
-		cursor_dirty = 1;
-		return;
-	}
 
 	if (x == cursor_x && y == cursor_y) {
 		if (cursor_dirty || !cur_underlay_valid)
@@ -572,18 +558,15 @@ void set_cursor_type(enum BGCECursorType type)
 {
 	if (type < 0 || type >= BGCE_CURSOR_COUNT)
 		type = BGCE_CURSOR_DEFAULT;
-	if (fb_writing) {
-		current_cursor = type;
-		render_cursor(cur_img, 32, 32, 32);
-		cursor_dirty = 1;
-		return;
-	}
 	if (type == current_cursor && cur_underlay_valid && !cursor_dirty)
 		return;
 	current_cursor = type;
-	cursor_restore();
+	/*
+	 * Rebuild glyph only.  Caller should enqueue COMP_CURSOR so the
+	 * compositor paints (safe for client threads).
+	 */
 	render_cursor(cur_img, 32, 32, 32);
-	cursor_paint();
+	cursor_dirty = 1;
 }
 
 

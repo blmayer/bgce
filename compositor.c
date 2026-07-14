@@ -30,6 +30,7 @@ enum comp_op {
 	COMP_PAN,
 	COMP_ERASE,
 	COMP_FULL,
+	COMP_CURSOR,
 	COMP_QUIT
 };
 
@@ -38,6 +39,7 @@ struct comp_job {
 	uint32_t client_id;
 	int old_x, old_y, new_x, new_y;
 	int sdx, sdy;
+	int cursor_x, cursor_y;
 	uint32_t erase_x, erase_y, erase_ww, erase_wh;
 };
 
@@ -61,7 +63,7 @@ static int comp_inited;
 static int comp_sync;
 static int orch_running;
 static int job_in_flight;
-static int damage_debug;
+static int bgce_debug;
 
 /* ---- Free FCFS task queue for blit workers ---- */
 static pthread_mutex_t work_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -75,13 +77,18 @@ static int work_shutdown;
 
 static __thread int tls_worker_id = -1;
 
-static void damage_init(void)
+static void debug_init(void)
 {
-	const char *e = getenv("BGCE_DEBUG_DAMAGE");
+	const char *e = getenv("BGCE_DEBUG");
 
-	damage_debug = (e && e[0] && e[0] != '0');
-	if (damage_debug)
-		printf("[BGCE] compositor: BGCE_DEBUG_DAMAGE on\n");
+	bgce_debug = (e && e[0] && e[0] != '0');
+	if (bgce_debug)
+		printf("[BGCE] debug: BGCE_DEBUG on\n");
+}
+
+int bgce_comp_debug(void)
+{
+	return bgce_debug;
 }
 
 int bgce_comp_worker_id(void)
@@ -92,7 +99,7 @@ int bgce_comp_worker_id(void)
 void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
                           int worker)
 {
-	if (!damage_debug)
+	if (!bgce_debug)
 		return;
 	if (worker < 0)
 		worker = tls_worker_id;
@@ -123,6 +130,11 @@ static void run_job(const struct comp_job *job)
 	struct Client gone;
 	int wdx, wdy;
 	uint32_t save_x, save_y;
+
+	if (bgce_debug)
+		printf("[BGCE] comp: run op=%d id=%u cursor=(%d,%d)\n",
+		       (int)job->op, (unsigned)job->client_id,
+		       job->cursor_x, job->cursor_y);
 
 	switch (job->op) {
 	case COMP_DRAW:
@@ -172,17 +184,17 @@ static void run_job(const struct comp_job *job)
 		redraw_all(&server);
 		break;
 
+	case COMP_CURSOR:
+		set_cursor_pos(&server, job->cursor_x, job->cursor_y);
+		break;
+
 	case COMP_QUIT:
 	default:
 		break;
 	}
 
-	/*
-	 * Paint the software cursor here so it is not stuck waiting for the
-	 * input thread to win a race with fb_writing (input only dirties the
-	 * hotspot while a job is in flight).
-	 */
-	display_cursor_present();
+	if (bgce_debug)
+		printf("[BGCE] comp: done op=%d\n", (int)job->op);
 }
 
 static void *worker_main(void *arg)
@@ -357,7 +369,7 @@ int bgce_comp_init(int sync_mode)
 	if (comp_inited)
 		bgce_comp_shutdown();
 
-	damage_init();
+	debug_init();
 	comp_sync = sync_mode ? 1 : 0;
 	q_head = q_tail = q_count = 0;
 	job_in_flight = 0;
@@ -382,18 +394,18 @@ int bgce_comp_init(int sync_mode)
 		return -1;
 	}
 
+	/* Default: 3 FCFS blit workers for MOVE underlay/mover tasks. */
 	for (i = 0; i < COMP_NWORKERS; i++) {
 		if (pthread_create(&workers[i], NULL, worker_main,
 		                   (void *)(intptr_t)i) != 0) {
 			perror("[BGCE] compositor worker");
-			/* Fall back: parallel3 will run serial. */
 			break;
 		}
 		workers_running++;
 	}
 
 	comp_inited = 1;
-	printf("[BGCE] compositor: async job queue, %d FCFS blit worker(s)\n",
+	printf("[BGCE] compositor: async queue, %d FCFS blit worker(s)\n",
 	       workers_running);
 	return 0;
 }
@@ -543,5 +555,25 @@ void bgce_comp_submit_full(void)
 	}
 	memset(&j, 0, sizeof(j));
 	j.op = COMP_FULL;
+	enqueue(&j);
+}
+
+void bgce_comp_submit_cursor(int x, int y)
+{
+	struct comp_job j;
+
+	if (!comp_inited) {
+		set_cursor_pos(&server, x, y);
+		return;
+	}
+	memset(&j, 0, sizeof(j));
+	j.op = COMP_CURSOR;
+	j.cursor_x = x;
+	j.cursor_y = y;
+	if (bgce_debug) {
+		static int n;
+		if ((n++ % 32) == 0)
+			printf("[BGCE] comp: enqueue cursor (%d,%d)\n", x, y);
+	}
 	enqueue(&j);
 }

@@ -16,10 +16,10 @@ Implement a minimal Linux graphical environment that runs without root, manages 
 - **IPC:** UNIX domain sockets for commands, FIFO for input events.
 - **Buffers:** Each client has an off-screen buffer; server composites into real framebuffer.
 - **Rendering:** CPU-based memory blitting only (no OpenGL/DRI accel for now).
-- **Compositor:** `compositor.c` owns a job queue + orchestrator thread; paint
-  algorithms stay in `display.c`. MOVE enqueues underlay/mover as free tasks;
-  3 blit workers grab FCFS (not pinned to L0/L1/mover). No coalescing yet.
-  Headless uses sync (inline) mode. Debug damage: `BGCE_DEBUG_DAMAGE=1`.
+- **Compositor:** `compositor.c` owns the job queue + orchestrator; paint code
+  stays in `display.c`. Input never blits: it enqueues DRAW/MOVE/PAN/**CURSOR**.
+  MOVE uses 3 FCFS blit workers for underlay/mover tasks. Headless = sync mode.
+  Debug: `BGCE_DEBUG=1` (jobs, damage rects, cursor enqueues).
 - **MSG_DRAW:** Blit only the client that asked, clipped by opaque windows
   above (subtract their rects). Do **not** full-stack recompose wallpaper /
   clients below on ordinary draw — that was a regression (blink/refill).

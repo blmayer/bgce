@@ -36,10 +36,6 @@ void client_disconnected(struct Client *c)
 	(void)c;
 }
 
-void deliver_interrupt_to_focus(void)
-{
-}
-
 int resize_buffer(struct Client *c, int dx, int dy)
 {
 	(void)c;

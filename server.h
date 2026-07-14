@@ -5,7 +5,6 @@
 #include "bgce.h"
 
 #include <pthread.h>
-#include <signal.h>
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -206,12 +205,6 @@ int apply_background(struct config* config, uint32_t* buffer,
  * original terminal (e.g. cannot open /dev/fb0).
  */
 void bgce_announce(const char *fmt, ...);
-
-/** Set by SIGINT handler; input thread clears it (server stays up). */
-extern volatile sig_atomic_t bgce_sigint_pending;
-
-/** Historical hook; SIGINT is swallowed — clients use keyboard input only. */
-void deliver_interrupt_to_focus(void);
 
 /** Clean shutdown (restore VT, unlink socket). Safe from the input thread. */
 void bgce_request_shutdown(void);

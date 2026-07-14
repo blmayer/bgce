@@ -193,7 +193,7 @@ static void apply_zoom_at_cursor(int dir)
 	server.pan_y = wy * z / 100 - mouse_y;
 	clamp_viewport(&server);
 	bgce_comp_submit_full();
-	display_cursor_present();
+	bgce_comp_submit_cursor(mouse_x, mouse_y);
 	printf("[BGCE] Zoom: %d%%  pan=(%d, %d)  was %d%%\n",
 	       server.zoom_pct, server.pan_x, server.pan_y, old_pct);
 }
@@ -482,7 +482,6 @@ static void run_alttab(int reverse)
 			(void)bgce_send_msg(now->fd, &got);
 		}
 	}
-	display_cursor_present();
 }
 
 /*
@@ -825,9 +824,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 				if (sp < 1)
 					sp = 256;
-				/* Cursor first so a busy compositor never freezes the pointer. */
-				set_cursor_pos(&server, mouse_x, mouse_y);
-				/* Integer screen pixels; pan paint is queued. */
+				/* Cursor + pan paint both go through the compositor. */
+				bgce_comp_submit_cursor(mouse_x, mouse_y);
 				sdx = dx * sp / 256;
 				sdy = dy * sp / 256;
 				if (sdx || sdy)
@@ -841,7 +839,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 				if (!c)
 					return 1;
-				set_cursor_pos(&server, mouse_x, mouse_y);
+				bgce_comp_submit_cursor(mouse_x, mouse_y);
 				screen_delta_to_world(dx, dy, config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
@@ -860,15 +858,15 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				drag.dx += wdx;
 				drag.dy += wdy;
-				set_cursor_pos(&server, mouse_x, mouse_y);
+				bgce_comp_submit_cursor(mouse_x, mouse_y);
 				break;
 			}
 			}
 			return 1;
 		}
 
-		/* Normal move: update software cursor on every axis event. */
-		set_cursor_pos(&server, mouse_x, mouse_y);
+		/* Normal move: enqueue cursor for the compositor to paint. */
+		bgce_comp_submit_cursor(mouse_x, mouse_y);
 		return 0;
 	}
 
@@ -923,7 +921,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 				if (sp < 1)
 					sp = 256;
-				set_cursor_pos(&server, mouse_x, mouse_y);
+				bgce_comp_submit_cursor(mouse_x, mouse_y);
 				sdx = dx * sp / 256;
 				sdy = dy * sp / 256;
 				if (sdx || sdy)
@@ -937,7 +935,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 				if (!c)
 					return 1;
-				set_cursor_pos(&server, mouse_x, mouse_y);
+				bgce_comp_submit_cursor(mouse_x, mouse_y);
 				screen_delta_to_world(dx, dy, config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
@@ -956,14 +954,14 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				drag.dx += wdx;
 				drag.dy += wdy;
-				set_cursor_pos(&server, mouse_x, mouse_y);
+				bgce_comp_submit_cursor(mouse_x, mouse_y);
 				break;
 			}
 			}
 			return 1;
 		}
 
-		set_cursor_pos(&server, mouse_x, mouse_y);
+		bgce_comp_submit_cursor(mouse_x, mouse_y);
 		return 0;
 	}
 
@@ -971,47 +969,20 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 	return 0;
 }
 
-/*
- * Tty Ctrl+C → SIGINT on the process group.  We only swallow it so the
- * compositor does not exit.  Clients get Ctrl+C solely from /dev/input
- * (keys to the focused client).  Synthesizing a chord here double-fired.
- */
-void deliver_interrupt_to_focus(void)
-{
-	/* No-op for clients; retained for API stability. */
-}
-
-static void poll_sigint(void)
-{
-	if (!bgce_sigint_pending)
-		return;
-	bgce_sigint_pending = 0;
-}
-
 void* input_loop(void* arg) {
 	(void)arg;
 
 	if (count == 0) {
 		printf("[BGCE] Input: no devices, input thread parked\n");
-		while (1) {
-			poll_sigint();
+		while (1)
 			sleep(1);
-		}
 		return NULL;
 	}
 
 	printf("[BGCE] Input: polling %zu device(s)\n", count);
 
 	while (1) {
-		/*
-		 * Finite timeout: SIGINT handling + re-present software cursor
-		 * after client redraws (compositor sets dirty, input paints).
-		 */
-		int timeout_ms = display_cursor_pending() ? 8 : 200;
-		int ret = poll(fds, count, timeout_ms);
-		poll_sigint();
-		/* Always ok to call; no-op if cursor is already valid. */
-		display_cursor_present();
+		int ret = poll(fds, count, -1);
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;

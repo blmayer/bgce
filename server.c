@@ -21,16 +21,6 @@
 struct ServerState server = {}; /* Global server state */
 struct config config = {};            /* Global config (background + shortcuts) */
 
-/* SIGINT (Ctrl+C on the controlling tty) — swallow only; do not exit.
- * Client Ctrl+C comes from /dev/input as normal keys to the focused client. */
-volatile sig_atomic_t bgce_sigint_pending = 0;
-
-static void on_sigint(int sig)
-{
-	(void)sig;
-	bgce_sigint_pending = 1;
-}
-
 static void ensure_dir(const char *path) {
 	struct stat st;
 	if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
@@ -246,7 +236,8 @@ int main(void) {
 	signal(SIGPIPE, SIG_IGN);
 
 	/* Ctrl+C on the tty must not kill the compositor (trap & ignore). */
-	signal(SIGINT, on_sigint);
+	/* Tty Ctrl+C must not kill the compositor; apps get Ctrl+C via /dev/input. */
+	signal(SIGINT, SIG_IGN);
 	/* Real shutdown: kill/SIGTERM or configured exit shortcut (e.g. ctrl+alt+q) */
 	signal(SIGTERM, cleanup_and_exit);
 
@@ -365,8 +356,9 @@ int main(void) {
 	/* Full recomposite so the wallpaper fills the screen even if draw()
 	 * bounds are edge-clamped oddly on the first paint. */
 	bgce_comp_submit_full();
+	bgce_comp_submit_cursor((int)server.display_w / 2,
+	                        (int)server.display_h / 2);
 	bgce_comp_flush();
-	display_cursor_present();
 
 	if (init_input() != 0) {
 		perror("[BGCE] Failed to start input thread");

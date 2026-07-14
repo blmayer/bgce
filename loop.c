@@ -252,8 +252,12 @@ void* client_thread(void* arg) {
 			int ctype = msg.data.cursor_request.cursor_type;
 			printf("[BGCE] Client requested cursor type %d\n", ctype);
 			/* Only the focused client may change the cursor */
-			if (server.focused_client == client)
+			if (server.focused_client == client) {
+				extern int mouse_x, mouse_y;
 				set_cursor_type((enum BGCECursorType)ctype);
+				/* Re-paint glyph via compositor at current hotspot. */
+				bgce_comp_submit_cursor(mouse_x, mouse_y);
+			}
 			break;
 		}
 		default:
