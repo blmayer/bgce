@@ -1,5 +1,6 @@
 #include "server.h"
 #include "bgce.h"
+#include "compositor.h"
 #include "location_cache.h"
 
 #include <errno.h>
@@ -114,6 +115,7 @@ static void *log_timestamp_thread(void *arg)
 
 static void cleanup_and_exit(int sig) {
 	(void)sig;
+	bgce_comp_shutdown();
 	if (listen_sock_path[0])
 		unlink(listen_sock_path);
 	if (server.server_fd >= 0) {
@@ -357,9 +359,13 @@ int main(void) {
 	                 server.virtual_w, server.virtual_h);
 
 	puts("[BGCE] Drawing background");
+	/* Async compositor owns FB writes after this. */
+	if (bgce_comp_init(0) != 0)
+		fprintf(stderr, "[BGCE] compositor init failed; using sync fallback\n");
 	/* Full recomposite so the wallpaper fills the screen even if draw()
 	 * bounds are edge-clamped oddly on the first paint. */
-	redraw_all(&server);
+	bgce_comp_submit_full();
+	bgce_comp_flush();
 	display_cursor_present();
 
 	if (init_input() != 0) {

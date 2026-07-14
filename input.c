@@ -1,4 +1,5 @@
 #include "bgce.h"   /* for access to global server state */
+#include "compositor.h"
 #include "location_cache.h"
 #include "server.h" /* for access to global server state */
 
@@ -191,7 +192,7 @@ static void apply_zoom_at_cursor(int dir)
 	server.pan_x = wx * z / 100 - mouse_x;
 	server.pan_y = wy * z / 100 - mouse_y;
 	clamp_viewport(&server);
-	redraw_all(&server);
+	bgce_comp_submit_full();
 	display_cursor_present();
 	printf("[BGCE] Zoom: %d%%  pan=(%d, %d)  was %d%%\n",
 	       server.zoom_pct, server.pan_x, server.pan_y, old_pct);
@@ -439,28 +440,49 @@ int init_input(void) {
 
 /*
  * Check if current modifier+key state matches a configured shortcut.
- * Required modifiers on the binding must be held; bare keys (no mods in the
- * binding) only match when no mods are held.
+ * Modifiers must match exactly (so alt+tab does not also fire on
+ * alt+shift+tab, and bare keys never fire with mods held).
  */
 static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t key) {
 	for (int i = 0; i < config.shortcut_count; i++) {
-		struct shortcut* sc = &config.shortcuts[i];
-		int bare;
+		struct shortcut *sc = &config.shortcuts[i];
 
 		if (sc->combo.key != key)
 			continue;
-		if (sc->combo.ctrl && !ctrl)
+		if (!!sc->combo.ctrl != !!ctrl)
 			continue;
-		if (sc->combo.alt && !alt)
+		if (!!sc->combo.alt != !!alt)
 			continue;
-		if (sc->combo.shift && !shift)
-			continue;
-		bare = !sc->combo.ctrl && !sc->combo.alt && !sc->combo.shift;
-		if (bare && (ctrl || alt || shift))
+		if (!!sc->combo.shift != !!shift)
 			continue;
 		return sc;
 	}
 	return NULL;
+}
+
+/* Run focus cycle (Alt+Tab family). reverse=1 → previous window. */
+static void run_alttab(int reverse)
+{
+	struct Client *old_focus = server.focused_client;
+	struct Client *now;
+
+	bgce_cycle_focus(&server, reverse ? 1 : 0);
+	now = server.focused_client;
+	if (old_focus != now) {
+		if (old_focus && old_focus->fd >= 0) {
+			struct BGCEMessage lost = {0};
+			lost.type = MSG_FOCUS_CHANGE;
+			lost.data.focus_event.state = 0;
+			(void)bgce_send_msg(old_focus->fd, &lost);
+		}
+		if (now && now->fd >= 0) {
+			struct BGCEMessage got = {0};
+			got.type = MSG_FOCUS_CHANGE;
+			got.data.focus_event.state = 1;
+			(void)bgce_send_msg(now->fd, &got);
+		}
+	}
+	display_cursor_present();
 }
 
 /*
@@ -470,7 +492,7 @@ static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t ke
  *  ALT + RIGHT_CLICK + DRAG on a client: resize window
  *  ALT + LEFT_CLICK + DRAG on empty space: pan the desktop
  *  ALT + SCROLL: zoom in/out (centered on cursor)
- *  ALT + TAB / ALT + SHIFT + TAB: cycle focus and restore that app's viewport
+ *  Config builtins (defaults): alt+tab / alt+shift+tab → cycle focus
  *
  *  Returns if shortcut was handled
  */
@@ -496,31 +518,6 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 		if (ev.value != 1)
 			return 0;
 
-		/* Alt+Tab / Alt+Shift+Tab: cycle windows (hardwired, not config). */
-		if (alt_down && !ctrl_down && ev.code == KEY_TAB) {
-			struct Client *old_focus = server.focused_client;
-			struct Client *now;
-
-			bgce_cycle_focus(&server, shift_down ? 1 : 0);
-			now = server.focused_client;
-			if (old_focus != now) {
-				if (old_focus && old_focus->fd >= 0) {
-					struct BGCEMessage lost = {0};
-					lost.type = MSG_FOCUS_CHANGE;
-					lost.data.focus_event.state = 0;
-					(void)bgce_send_msg(old_focus->fd, &lost);
-				}
-				if (now && now->fd >= 0) {
-					struct BGCEMessage got = {0};
-					got.type = MSG_FOCUS_CHANGE;
-					got.data.focus_event.state = 1;
-					(void)bgce_send_msg(now->fd, &got);
-				}
-			}
-			display_cursor_present();
-			return 1;
-		}
-
 		struct shortcut *sc =
 		        match_shortcut(ctrl_down, alt_down, shift_down, ev.code);
 		if (sc) {
@@ -543,6 +540,14 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 					}
 					printf("[BGCE] Shortcut: builtin screenshot\n");
 					take_screenshot("screenshot.png");
+					return 1;
+				} else if (strcmp(sc->value, "alttab") == 0) {
+					printf("[BGCE] Shortcut: builtin alttab\n");
+					run_alttab(0);
+					return 1;
+				} else if (strcmp(sc->value, "alttab_prev") == 0) {
+					printf("[BGCE] Shortcut: builtin alttab_prev\n");
+					run_alttab(1);
 					return 1;
 				}
 				printf("[BGCE] Shortcut: unknown builtin '%s'\n",
@@ -644,10 +649,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			struct Client* c = drag.target;
 			if (c && resize_buffer(c, drag.dx, drag.dy)) {
 				printf("[BGCE] Redrawing dx=%d dy=%d.\n", drag.dx, drag.dy);
-				if (drag.dx < 0 || drag.dy < 0) {
-					redraw_from_resize(&server, *c, drag.dx, drag.dy);
-				}
-				draw(&server, c);
+				/* Full recompose is rare (resize end only). */
+				bgce_comp_submit_full();
 
 				struct BGCEMessage msg;
 				msg.type = MSG_BUFFER_CHANGE;
@@ -739,11 +742,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 			(void)bgce_send_msg(c->fd, &got);
 
 			/*
-			 * Raise only: blit this client on top.  Do not wait for the
-			 * app to finish a heavy redraw — that runs on the client
-			 * thread when it posts MSG_DRAW.  Never do client work here.
+			 * Raise only: blit this client on top.  Paint is queued; the
+			 * app's heavy redraw still arrives later via MSG_DRAW.
 			 */
-			draw(&server, c);
+			bgce_comp_submit_draw(c->id);
 			printf("[BGCE] Client focused (fd=%d).\n", c->fd);
 		}
 
@@ -823,25 +825,30 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 
 				if (sp < 1)
 					sp = 256;
-				/* Integer screen pixels; redraw_pan copies the FB. */
+				/* Integer screen pixels; pan paint is queued. */
 				sdx = dx * sp / 256;
 				sdy = dy * sp / 256;
 				if (sdx || sdy)
-					redraw_pan(&server, sdx, sdy);
+					bgce_comp_submit_pan(sdx, sdy);
 				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			case DRAG_MOVE: {
 				struct Client* c = drag.target;
+				int old_x, old_y;
+				int wdx, wdy;
+
 				if (!c)
 					return 1;
-				int wdx, wdy;
 				screen_delta_to_world(dx, dy, config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
-					redraw_region(&server, c, wdx, wdy);
-					c->x = (uint32_t)((int)c->x + wdx);
-					c->y = (uint32_t)((int)c->y + wdy);
+					old_x = (int)c->x;
+					old_y = (int)c->y;
+					c->x = (uint32_t)(old_x + wdx);
+					c->y = (uint32_t)(old_y + wdy);
+					bgce_comp_submit_move(c->id, old_x, old_y,
+					                      (int)c->x, (int)c->y);
 				}
 				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
@@ -918,21 +925,26 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
 				sdx = dx * sp / 256;
 				sdy = dy * sp / 256;
 				if (sdx || sdy)
-					redraw_pan(&server, sdx, sdy);
+					bgce_comp_submit_pan(sdx, sdy);
 				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;
 			}
 			case DRAG_MOVE: {
 				struct Client* c = drag.target;
+				int ox, oy;
+				int wdx, wdy;
+
 				if (!c)
 					return 1;
-				int wdx, wdy;
 				screen_delta_to_world(dx, dy, config.move_speed,
 				                     &drag.acc_x, &drag.acc_y, &wdx, &wdy);
 				if (wdx || wdy) {
-					redraw_region(&server, c, wdx, wdy);
-					c->x = (uint32_t)((int)c->x + wdx);
-					c->y = (uint32_t)((int)c->y + wdy);
+					ox = (int)c->x;
+					oy = (int)c->y;
+					c->x = (uint32_t)(ox + wdx);
+					c->y = (uint32_t)(oy + wdy);
+					bgce_comp_submit_move(c->id, ox, oy,
+					                      (int)c->x, (int)c->y);
 				}
 				set_cursor_pos(&server, mouse_x, mouse_y);
 				break;

@@ -16,6 +16,10 @@ Implement a minimal Linux graphical environment that runs without root, manages 
 - **IPC:** UNIX domain sockets for commands, FIFO for input events.
 - **Buffers:** Each client has an off-screen buffer; server composites into real framebuffer.
 - **Rendering:** CPU-based memory blitting only (no OpenGL/DRI accel for now).
+- **Compositor:** `compositor.c` owns a job queue + orchestrator thread; paint
+  algorithms stay in `display.c`. MOVE enqueues underlay/mover as free tasks;
+  3 blit workers grab FCFS (not pinned to L0/L1/mover). No coalescing yet.
+  Headless uses sync (inline) mode. Debug damage: `BGCE_DEBUG_DAMAGE=1`.
 - **MSG_DRAW:** Blit only the client that asked, clipped by opaque windows
   above (subtract their rects). Do **not** full-stack recompose wallpaper /
   clients below on ordinary draw — that was a regression (blink/refill).
@@ -89,7 +93,8 @@ kernel headers. Real `bgce` still requires Linux.
 - **Alt + right-drag on a client**: resize window (existing)
 - **Alt + Tab** / **Alt + Shift + Tab**: cycle focus (raise app); pan + zoom to
   that app’s last viewport so it appears where it was left (does not move the
-  window rect). Shift reverses the cycle.
+  window rect). Shift reverses the cycle. Defaults are config builtins
+  `alttab` / `alttab_prev` under `[shortcuts]` (overrideable).
 - Virtual desktop is 2× the physical resolution in each axis (4× area). Client
   positions and buffer sizes are in world pixels; the compositor scales to the
   screen using the current zoom and pan.

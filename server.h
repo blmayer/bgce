@@ -27,6 +27,8 @@
 struct Client {
 	int fd;
 	pid_t pid;
+	/* Stable id for compositor jobs (never 0 when live). */
+	uint32_t id;
 	/* Stable app key for location cache (e.g. /proc/pid/comm). */
 	char app_id[64];
 	char shm_name[64];

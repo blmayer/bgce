@@ -212,6 +212,12 @@ static enum shortcut_parse_result parse_shortcut_rhs(const char* rhs, struct sho
 		} else if (strcmp(valstr, "screenshot") == 0) {
 			strcpy(out->value, "screenshot");
 			return SHORTCUT_PARSE_OK;
+		} else if (strcmp(valstr, "alttab") == 0) {
+			strcpy(out->value, "alttab");
+			return SHORTCUT_PARSE_OK;
+		} else if (strcmp(valstr, "alttab_prev") == 0) {
+			strcpy(out->value, "alttab_prev");
+			return SHORTCUT_PARSE_OK;
 		}
 		return SHORTCUT_PARSE_UNSUPPORTED_BUILTIN;
 	} else if (strcmp(typestr, "command") == 0) {
@@ -226,11 +232,12 @@ static enum shortcut_parse_result parse_shortcut_rhs(const char* rhs, struct sho
 	return SHORTCUT_PARSE_BAD_FORMAT;
 }
 
-// Ensure the default exit and screenshot shortcuts exist unless the user
-// has explicitly provided their own binding for those actions.
+// Ensure default builtins exist unless the user bound those actions already.
 static void set_default_shortcuts(struct config* config) {
 	bool has_exit = false;
 	bool has_screenshot = false;
+	bool has_alttab = false;
+	bool has_alttab_prev = false;
 
 	for (int i = 0; i < config->shortcut_count; i++) {
 		if (config->shortcuts[i].type == SHORTCUT_BUILTIN) {
@@ -238,6 +245,10 @@ static void set_default_shortcuts(struct config* config) {
 				has_exit = true;
 			else if (strcmp(config->shortcuts[i].value, "screenshot") == 0)
 				has_screenshot = true;
+			else if (strcmp(config->shortcuts[i].value, "alttab") == 0)
+				has_alttab = true;
+			else if (strcmp(config->shortcuts[i].value, "alttab_prev") == 0)
+				has_alttab_prev = true;
 		}
 	}
 
@@ -258,6 +269,28 @@ static void set_default_shortcuts(struct config* config) {
 		config->shortcuts[idx].combo.key = KEY_SYSRQ;
 		config->shortcuts[idx].type = SHORTCUT_BUILTIN;
 		strcpy(config->shortcuts[idx].value, "screenshot");
+		config->shortcut_count++;
+	}
+
+	/* Alt+Tab / Alt+Shift+Tab — window cycle + viewport restore */
+	if (!has_alttab && config->shortcut_count < MAX_SHORTCUTS) {
+		int idx = config->shortcut_count;
+		memset(&config->shortcuts[idx], 0, sizeof(config->shortcuts[0]));
+		config->shortcuts[idx].combo.alt = 1;
+		config->shortcuts[idx].combo.key = KEY_TAB;
+		config->shortcuts[idx].type = SHORTCUT_BUILTIN;
+		strcpy(config->shortcuts[idx].value, "alttab");
+		config->shortcut_count++;
+	}
+
+	if (!has_alttab_prev && config->shortcut_count < MAX_SHORTCUTS) {
+		int idx = config->shortcut_count;
+		memset(&config->shortcuts[idx], 0, sizeof(config->shortcuts[0]));
+		config->shortcuts[idx].combo.alt = 1;
+		config->shortcuts[idx].combo.shift = 1;
+		config->shortcuts[idx].combo.key = KEY_TAB;
+		config->shortcuts[idx].type = SHORTCUT_BUILTIN;
+		strcpy(config->shortcuts[idx].value, "alttab_prev");
 		config->shortcut_count++;
 	}
 }

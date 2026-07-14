@@ -3,6 +3,7 @@
  */
 
 #include "mock.h"
+#include "compositor.h"
 #include "location_cache.h"
 
 #include <stdio.h>
@@ -18,6 +19,7 @@ struct Client *pick_client(int x, int y);
 
 static struct Client *bg_client;
 static int mock_active;
+static uint32_t mock_next_id = 1;
 
 static void fill_u32(uint32_t *buf, size_t n, uint32_t v)
 {
@@ -86,7 +88,12 @@ int bgce_mock_init(uint32_t width, uint32_t height)
 
 	init_input();
 	location_cache_load();
-	redraw_all(&server);
+	/* Sync compositor: paint inline so headless tests need no flush. */
+	if (bgce_comp_init(1) != 0) {
+		release_display();
+		return -1;
+	}
+	bgce_comp_submit_full();
 	display_cursor_present();
 	mock_active = 1;
 	printf("[BGCE] mock init %ux%u virtual %ux%u\n",
@@ -101,6 +108,8 @@ void bgce_mock_fini(void)
 
 	if (!mock_active)
 		return;
+
+	bgce_comp_shutdown();
 
 	c = server.clients;
 	while (c) {
@@ -148,6 +157,9 @@ struct Client *bgce_mock_add_client(uint32_t x, uint32_t y,
 	c->x = x;
 	c->y = y;
 	c->fd = -1;
+	c->id = mock_next_id++;
+	if (c->id == 0)
+		c->id = mock_next_id++;
 	snprintf(c->app_id, sizeof(c->app_id), "mock_%u",
 	         (unsigned)server.client_count + 1);
 	/* Restore last place if this app_id was cached (tests can set app_id). */
@@ -178,7 +190,7 @@ void bgce_mock_draw(struct Client *c)
 {
 	if (!c)
 		return;
-	draw(&server, c);
+	bgce_comp_submit_draw(c->id);
 }
 
 void bgce_mock_remove_client(struct Client *c)
@@ -205,7 +217,12 @@ void bgce_mock_remove_client(struct Client *c)
 		server.focused_client = NULL;
 
 	location_cache_remember_client(c);
-	erase_client(&server, c);
+	{
+		uint32_t ww = c->world_w ? c->world_w : c->width;
+		uint32_t wh = c->world_h ? c->world_h : c->height;
+
+		bgce_comp_submit_erase(c->x, c->y, ww, wh);
+	}
 	if (c->buffer)
 		free(c->buffer);
 	free(c);
@@ -238,7 +255,7 @@ void bgce_mock_focus(struct Client *c)
 	if (server.focused_client)
 		c->z = server.focused_client->z + 1;
 	server.focused_client = c;
-	draw(&server, c);
+	bgce_comp_submit_draw(c->id);
 }
 
 struct Client *bgce_mock_click(int screen_x, int screen_y)
@@ -254,11 +271,15 @@ struct Client *bgce_mock_click(int screen_x, int screen_y)
 
 void bgce_mock_move(struct Client *c, int wdx, int wdy)
 {
+	int old_x, old_y;
+
 	if (!c || (wdx == 0 && wdy == 0))
 		return;
-	redraw_region(&server, c, wdx, wdy);
-	c->x = (uint32_t)((int)c->x + wdx);
-	c->y = (uint32_t)((int)c->y + wdy);
+	old_x = (int)c->x;
+	old_y = (int)c->y;
+	c->x = (uint32_t)(old_x + wdx);
+	c->y = (uint32_t)(old_y + wdy);
+	bgce_comp_submit_move(c->id, old_x, old_y, (int)c->x, (int)c->y);
 	location_cache_remember_client(c);
 }
 
@@ -272,7 +293,7 @@ void bgce_mock_pan_screen(int sdx, int sdy)
 	scx = sdx * sp / 256;
 	scy = sdy * sp / 256;
 	if (scx || scy)
-		redraw_pan(&server, scx, scy);
+		bgce_comp_submit_pan(scx, scy);
 }
 
 void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
@@ -287,7 +308,7 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 		server.pan_x = wx * z / 100 - sx;
 		server.pan_y = wy * z / 100 - sy;
 		clamp_viewport(&server);
-		redraw_all(&server);
+		bgce_comp_submit_full();
 		display_cursor_present();
 		return;
 	}
@@ -296,7 +317,7 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 	server.pan_x = wx * z / 100 - sx;
 	server.pan_y = wy * z / 100 - sy;
 	clamp_viewport(&server);
-	redraw_all(&server);
+	bgce_comp_submit_full();
 	display_cursor_present();
 }
 
@@ -312,7 +333,7 @@ void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y)
 	server.pan_x = pan_x;
 	server.pan_y = pan_y;
 	clamp_viewport(&server);
-	redraw_all(&server);
+	bgce_comp_submit_full();
 	display_cursor_present();
 }
 
@@ -338,7 +359,7 @@ int bgce_mock_screenshot(const char *path)
 
 void bgce_mock_redraw_all(void)
 {
-	redraw_all(&server);
+	bgce_comp_submit_full();
 }
 
 int bgce_mock_fb_matches_full_redraw(void)
@@ -355,7 +376,7 @@ int bgce_mock_fb_matches_full_redraw(void)
 	if (!snap)
 		return -1;
 	memcpy(snap, server.framebuffer, nbytes);
-	redraw_all(&server);
+	bgce_comp_submit_full();
 	match = (memcmp(snap, server.framebuffer, nbytes) == 0);
 	free(snap);
 	return match ? 0 : -1;

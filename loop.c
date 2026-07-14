@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 700
 
 #include "bgce.h"
+#include "compositor.h"
 #include "location_cache.h"
 #include "server.h"
 
@@ -13,6 +14,8 @@
 
 /* Externs from server.c */
 extern struct ServerState server;
+
+static uint32_t next_client_id = 1;
 
 void* client_thread(void* arg) {
 	int client_fd = *(int*)arg;
@@ -27,6 +30,9 @@ void* client_thread(void* arg) {
 	}
 
 	client->fd = client_fd;
+	client->id = next_client_id++;
+	if (client->id == 0)
+		client->id = next_client_id++;
 	location_cache_identify_client(client, client_fd);
 
 	/* Background client is always first; keep the list non-empty. */
@@ -225,10 +231,10 @@ void* client_thread(void* arg) {
 
 		case MSG_DRAW: {
 			/*
-			 * Blit this client only (clipped by windows above).
-			 * On this client thread only — never on the input thread.
+			 * Queue a blit of this client (clipped by windows above).
+			 * Paint runs on the compositor thread, not here.
 			 */
-			draw(&server, client);
+			bgce_comp_submit_draw(client->id);
 			break;
 		}
 		case MSG_MOVE: {
@@ -292,11 +298,17 @@ void* client_thread(void* arg) {
 
 	/*
 	 * Only repaint the closed window's screen rect from whatever is still
-	 * in the stack (background + windows that sat under / overlapped it).
-	 * Other on-screen clients outside that rect are left alone.
+	 * in the stack.  Snapshot geometry into the job so paint is safe after
+	 * free; flush so no in-flight DRAW still references this client.
 	 */
 	location_cache_remember_client(client);
-	erase_client(&server, client);
+	{
+		uint32_t ww = client->world_w ? client->world_w : client->width;
+		uint32_t wh = client->world_h ? client->world_h : client->height;
+
+		bgce_comp_submit_erase(client->x, client->y, ww, wh);
+		bgce_comp_flush();
+	}
 
 	printf("[BGCE] Client thread finished (fd=%d); server still running\n", client_fd);
 	free(client);

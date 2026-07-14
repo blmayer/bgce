@@ -13,6 +13,7 @@
  */
 
 #define _GNU_SOURCE
+#include "compositor.h"
 #include "location_cache.h"
 #include "server.h"
 
@@ -407,9 +408,9 @@ void bgce_cycle_focus(struct ServerState *srv, int reverse)
 		srv->pan_x = pan_x;
 		srv->pan_y = pan_y;
 		clamp_viewport(srv);
-		redraw_all(srv);
+		bgce_comp_submit_full();
 	} else {
-		draw(srv, target);
+		bgce_comp_submit_draw(target->id);
 	}
 
 	printf("[BGCE] Alt+%sTab → '%s' zoom=%d%% pan=(%d,%d)\n",

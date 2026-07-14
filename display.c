@@ -5,6 +5,7 @@
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 
+#include "compositor.h"
 #include "server.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -1510,6 +1511,36 @@ static void composite_all_except(struct ServerState *srv,
  *   - Expose underlay that skips the wallpaper (c->next-only when the
  *     chain is wrong) — leaves “L of old window” on the desktop.
  */
+/* Args for parallel MOVE underlay / mover blit (stack-local, join before return). */
+struct move_underlay_args {
+	struct ServerState *srv;
+	const struct Client *skip;
+	int x0, y0, x1, y1;
+};
+
+struct move_blit_args {
+	struct ServerState *srv;
+	const struct Client *cli;
+	int x0, y0, x1, y1;
+};
+
+static void move_underlay_task(void *arg)
+{
+	struct move_underlay_args *a = arg;
+
+	/* worker id comes from FCFS thread that grabbed this task */
+	bgce_comp_damage_log("underlay", a->x0, a->y0, a->x1, a->y1, -1);
+	composite_all_except(a->srv, a->skip, a->x0, a->y0, a->x1, a->y1);
+}
+
+static void move_blit_task(void *arg)
+{
+	struct move_blit_args *a = arg;
+
+	bgce_comp_damage_log("mover", a->x0, a->y0, a->x1, a->y1, -1);
+	blit_client_overlap(a->srv, a->cli, a->x0, a->y0, a->x1, a->y1);
+}
+
 void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 {
 	struct Client moved;
@@ -1522,6 +1553,10 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	int nexp;
 	int i;
 	int same_bounds;
+	struct move_underlay_args uargs[2];
+	struct move_blit_args bargs;
+	void (*f0)(void *) = NULL, (*f1)(void *) = NULL, (*f2)(void *) = NULL;
+	void *a0 = NULL, *a1 = NULL, *a2 = NULL;
 
 	if (!srv || !srv->framebuffer || !c) {
 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
@@ -1553,6 +1588,7 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 		bx1 = nx1;
 		by1 = ny1;
 		if (clip_to_display(srv, &bx0, &by0, &bx1, &by1)) {
+			bgce_comp_damage_log("mover-same", bx0, by0, bx1, by1, -1);
 			blit_client_overlap(srv, &moved, bx0, by0, bx1, by1);
 			for (p = srv->clients; p && p != c; p = p->next)
 				blit_client_overlap(srv, p, bx0, by0, bx1, by1);
@@ -1579,21 +1615,62 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 		                     expose, 8);
 	}
 
-	/* 2. Underlay each expose piece (everyone but the mover). */
-	for (i = 0; i < nexp; i++)
-		composite_all_except(srv, c,
-		                     expose[i][0], expose[i][1],
-		                     expose[i][2], expose[i][3]);
-
-	/* 3. Moving client: full buffer blit at new place only. */
+	/* 3. Mover rect (computed before parallel section). */
 	bx0 = nx0;
 	by0 = ny0;
 	bx1 = nx1;
 	by1 = ny1;
-	if (clip_to_display(srv, &bx0, &by0, &bx1, &by1))
-		blit_client_overlap(srv, &moved, bx0, by0, bx1, by1);
+	if (!clip_to_display(srv, &bx0, &by0, &bx1, &by1)) {
+		bx0 = by0 = bx1 = by1 = 0;
+	}
 
-	/* 4. Windows above: redraw over old∪new. */
+	/*
+	 * 2+3. Enqueue up to two expose underlays + mover blit as free tasks;
+	 * 3 workers grab FCFS (not pinned to L0/L1/mover).  Remaining expose
+	 * strips (rare) run serial after the join.  Expose ∩ new is empty.
+	 */
+	if (nexp > 0) {
+		uargs[0].srv = srv;
+		uargs[0].skip = c;
+		uargs[0].x0 = expose[0][0];
+		uargs[0].y0 = expose[0][1];
+		uargs[0].x1 = expose[0][2];
+		uargs[0].y1 = expose[0][3];
+		f0 = move_underlay_task;
+		a0 = &uargs[0];
+	}
+	if (nexp > 1) {
+		uargs[1].srv = srv;
+		uargs[1].skip = c;
+		uargs[1].x0 = expose[1][0];
+		uargs[1].y0 = expose[1][1];
+		uargs[1].x1 = expose[1][2];
+		uargs[1].y1 = expose[1][3];
+		f1 = move_underlay_task;
+		a1 = &uargs[1];
+	}
+	if (bx1 > bx0 && by1 > by0) {
+		bargs.srv = srv;
+		bargs.cli = &moved;
+		bargs.x0 = bx0;
+		bargs.y0 = by0;
+		bargs.x1 = bx1;
+		bargs.y1 = by1;
+		f2 = move_blit_task;
+		a2 = &bargs;
+	}
+
+	bgce_comp_parallel3(f0, a0, f1, a1, f2, a2);
+
+	/* Extra expose pieces beyond the first two (uncommon). */
+	for (i = 2; i < nexp; i++) {
+		bgce_comp_damage_log("underlay", expose[i][0], expose[i][1],
+		                     expose[i][2], expose[i][3], -1);
+		composite_all_except(srv, c, expose[i][0], expose[i][1],
+		                     expose[i][2], expose[i][3]);
+	}
+
+	/* 4. Windows above: redraw over old∪new (serial, z-order). */
 	ux0 = ox0 < nx0 ? ox0 : nx0;
 	uy0 = oy0 < ny0 ? oy0 : ny0;
 	ux1 = ox1 > nx1 ? ox1 : nx1;
@@ -1607,6 +1684,7 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	if (uy1 < (int)srv->display_h)
 		uy1++;
 	if (clip_to_display(srv, &ux0, &uy0, &ux1, &uy1)) {
+		bgce_comp_damage_log("above", ux0, uy0, ux1, uy1, -1);
 		for (p = srv->clients; p && p != c; p = p->next)
 			blit_client_overlap(srv, p, ux0, uy0, ux1, uy1);
 	}
