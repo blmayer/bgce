@@ -1019,6 +1019,25 @@ static void blit_client_overlap(struct ServerState *srv, const struct Client *cl
 	wh = (int)(cli->world_h ? cli->world_h : cli->height);
 	z = zoom_pct_of(srv);
 
+	/*
+	 * Shared by MSG_DRAW, MOVE underlay/mover/above, pan edges, etc.
+	 * Logs every actual FB blit so MOVE is visible even though it never
+	 * calls draw().
+	 */
+	if (bgce_comp_debug()) {
+		const char *app = cli->app_id[0] ? cli->app_id : "?";
+		const char *path = (z == BGCE_ZOOM_PCT_1X && bw == ww && bh == wh)
+		                           ? "1to1"
+		                           : "scaled";
+
+		printf("[BGCE] blit: id=%u app='%s' z=%d world=(%u,%u) %dx%d "
+		       "clip=(%d,%d)-(%d,%d) %dx%d path=%s\n",
+		       (unsigned)cli->id, app, (int)cli->z,
+		       cli->x, cli->y, ww, wh,
+		       ox0, oy0, ox1, oy1, ox1 - ox0, oy1 - oy0, path);
+		fflush(stdout);
+	}
+
 	if (z == BGCE_ZOOM_PCT_1X && bw == ww && bh == wh) {
 		blit_client_1to1(dst, screen_w, src, bw, bh,
 		                 (int)cli->x, (int)cli->y,
@@ -1518,6 +1537,20 @@ static void composite_all_except(struct ServerState *srv,
 			continue;
 		stack[i++] = c;
 	}
+	if (bgce_comp_debug()) {
+		printf("[BGCE] underlay-stack: %d layer(s) into "
+		       "screen=(%d,%d)-(%d,%d) %dx%d skip_id=%u\n",
+		       n, x0, y0, x1, y1, x1 - x0, y1 - y0,
+		       skip ? (unsigned)skip->id : 0);
+		for (i = n - 1; i >= 0; i--) {
+			printf("[BGCE] underlay-stack:   [%d] id=%u app='%s' "
+			       "z=%d world=(%u,%u)\n",
+			       n - 1 - i, (unsigned)stack[i]->id,
+			       stack[i]->app_id[0] ? stack[i]->app_id : "?",
+			       (int)stack[i]->z, stack[i]->x, stack[i]->y);
+		}
+		fflush(stdout);
+	}
 	/* stack[0] is topmost among remaining; paint bottom → top. */
 	for (i = n - 1; i >= 0; i--)
 		blit_client_overlap(srv, stack[i], x0, y0, x1, y1);
@@ -1760,6 +1793,17 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	}
 	if (clip_to_display(srv, &ux0, &uy0, &ux1, &uy1)) {
 		bgce_comp_damage_log("above", ux0, uy0, ux1, uy1, -1);
+		if (bgce_comp_debug()) {
+			int nabove = 0;
+			for (p = srv->clients; p && p != c; p = p->next)
+				if (p->buffer)
+					nabove++;
+			printf("[BGCE] above: re-blit %d window(s) over "
+			       "screen=(%d,%d)-(%d,%d) %dx%d (mover id=%u)\n",
+			       nabove, ux0, uy0, ux1, uy1, ux1 - ux0, uy1 - uy0,
+			       (unsigned)c->id);
+			fflush(stdout);
+		}
 		for (p = srv->clients; p && p != c; p = p->next)
 			blit_client_overlap(srv, p, ux0, uy0, ux1, uy1);
 	}
