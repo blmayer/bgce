@@ -353,6 +353,82 @@ int main(void)
 		}
 	}
 
+	/*
+	 * 1px left at 100% zoom (user example shape: (x,y) 200×200 → left 1):
+	 *   old [100,300), new [99,299)
+	 *   underlay column 299 only (1×200); mover exactly 200×200
+	 *   not 201-wide (that is only old∪new for windows above)
+	 */
+	{
+		const uint32_t win = 0xFF112233u;
+		const uint32_t bg = 0xFF336699u; /* mock.c config.color */
+		uint32_t *fb;
+		uint32_t stride;
+		const int x0 = 100, y0 = 80, w = 200;
+		int fails = 0;
+
+		bgce_mock_fini();
+		if (bgce_mock_init(640, 480) != 0) {
+			fprintf(stderr, "headless: 1px-left re-init failed\n");
+			return 1;
+		}
+		a = bgce_mock_add_client((uint32_t)x0, (uint32_t)y0,
+		                         (uint32_t)w, 200, win);
+		if (!a) {
+			fprintf(stderr, "headless: 1px-left client failed\n");
+			bgce_mock_fini();
+			return 1;
+		}
+		/* No cache restore / remember — pin world pos. */
+		a->app_id[0] = '\0';
+		a->x = (uint32_t)x0;
+		a->y = (uint32_t)y0;
+		bgce_mock_set_viewport(100, 0, 0);
+		bgce_mock_draw(a);
+		bgce_mock_move(a, -1, 0);
+
+		fb = (uint32_t *)server.framebuffer;
+		stride = server.display_w;
+		if (a->x != (uint32_t)(x0 - 1) || a->y != (uint32_t)y0) {
+			fprintf(stderr, "headless: 1px-left pos got %u,%u\n",
+			        a->x, a->y);
+			fails++;
+		}
+		/* trail: last column of old window → background */
+		if (fb[y0 * (int)stride + (x0 + w - 1)] != bg) {
+			fprintf(stderr,
+			        "headless: trail col %d not bg (0x%08x)\n",
+			        x0 + w - 1,
+			        fb[y0 * (int)stride + (x0 + w - 1)]);
+			fails++;
+		}
+		if (fb[y0 * (int)stride + (x0 + w)] != bg) {
+			fprintf(stderr, "headless: col %d past old end not bg\n",
+			        x0 + w);
+			fails++;
+		}
+		if (fb[y0 * (int)stride + (x0 - 1)] != win) {
+			fprintf(stderr, "headless: new left col %d not win\n",
+			        x0 - 1);
+			fails++;
+		}
+		if (fb[y0 * (int)stride + (x0 + w - 2)] != win) {
+			fprintf(stderr, "headless: new right col %d not win\n",
+			        x0 + w - 2);
+			fails++;
+		}
+		if (bgce_mock_fb_matches_full_redraw() != 0) {
+			fprintf(stderr, "headless: 1px-left full-redraw mismatch\n");
+			fails++;
+		}
+		if (bgce_mock_screenshot("headless_16_1px_left.png") != 0)
+			return 1;
+		if (fails) {
+			bgce_mock_fini();
+			return 1;
+		}
+	}
+
 	printf("headless complete. PNG frames written.\n");
 	bgce_mock_fini();
 	return 0;

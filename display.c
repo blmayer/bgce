@@ -1577,107 +1577,159 @@ static void composite_all_except(struct ServerState *srv,
 }
 
 /*
- * Window move — design (initial BGCE model; do not “optimize” with FB scroll
- * of the whole window or full-stack recompose of old∪new):
- *
- * Caller: `c` is still at the OLD world position; apply (wdx,wdy) after.
- *
- *   1. Expose = old screen rect minus new screen rect (L-shape when the
- *      box only translates; general difference if size changes).  Exact
- *      rect_subtract — not ad-hoc strips (strips can miss pixels when
- *      integer world→screen bounds shift, leaving old window content on
- *      the wallpaper).
- *   2. For each expose piece only: composite bottom → top every client
- *      *except* the mover (wallpaper + windows under + windows above that
- *      cover the hole).  Overwrites the trail; never leaves mover pixels.
- *   3. Blit the mover FULL from its buffer at the NEW position only —
- *      do not re-stack under that body.
- *   4. Re-blit windows stacked above the mover over old∪new (mover blit
- *      may have covered them).
- *
- * Forbidden regressions:
- *   - fb_copy_rect_delta / FB scroll of the window body.
- *   - composite_chain over the entire union of old and new for a move.
- *   - Expose underlay that skips the wallpaper (c->next-only when the
- *     chain is wrong) — leaves “L of old window” on the desktop.
+ * Half-open rectangle: pixels x in [x0, x1), y in [y0, y1).
+ * Used for move damage (world and screen space).
  */
-/* Args for parallel MOVE underlay / mover blit (stack-local, join before return). */
-struct move_underlay_args {
-	struct ServerState *srv;
-	const struct Client *skip;
+struct rect {
 	int x0, y0, x1, y1;
 };
 
-struct move_blit_args {
+#define MOVE_TRAIL_MAX 4
+
+static struct rect rect_make(int x0, int y0, int x1, int y1)
+{
+	struct rect r = { x0, y0, x1, y1 };
+	return r;
+}
+
+static int rect_empty(struct rect r)
+{
+	return r.x0 >= r.x1 || r.y0 >= r.y1;
+}
+
+static struct rect rect_union(struct rect a, struct rect b)
+{
+	return rect_make(a.x0 < b.x0 ? a.x0 : b.x0,
+	                 a.y0 < b.y0 ? a.y0 : b.y0,
+	                 a.x1 > b.x1 ? a.x1 : b.x1,
+	                 a.y1 > b.y1 ? a.y1 : b.y1);
+}
+
+static struct rect rect_grow1(struct rect r, int max_x, int max_y)
+{
+	if (r.x0 > 0)
+		r.x0--;
+	if (r.y0 > 0)
+		r.y0--;
+	if (r.x1 < max_x)
+		r.x1++;
+	if (r.y1 < max_y)
+		r.y1++;
+	return r;
+}
+
+/* Clip to display; returns empty rect if nothing remains. */
+static struct rect rect_clip(const struct ServerState *srv, struct rect r)
+{
+	if (r.x0 < 0)
+		r.x0 = 0;
+	if (r.y0 < 0)
+		r.y0 = 0;
+	if (r.x1 > (int)srv->display_w)
+		r.x1 = (int)srv->display_w;
+	if (r.y1 > (int)srv->display_h)
+		r.y1 = (int)srv->display_h;
+	if (rect_empty(r))
+		return rect_make(0, 0, 0, 0);
+	return r;
+}
+
+/* Same ceil mapping as client_screen_bounds. */
+static struct rect rect_world_to_screen(const struct ServerState *srv,
+                                       struct rect world)
+{
+	int z = zoom_pct_of(srv);
+	struct rect s;
+
+	s.x0 = (world.x0 * z + 99) / 100 - srv->pan_x;
+	s.y0 = (world.y0 * z + 99) / 100 - srv->pan_y;
+	s.x1 = (world.x1 * z + 99) / 100 - srv->pan_x;
+	s.y1 = (world.y1 * z + 99) / 100 - srv->pan_y;
+	if (s.x1 <= s.x0)
+		s.x1 = s.x0 + 1;
+	if (s.y1 <= s.y0)
+		s.y1 = s.y0 + 1;
+	return s;
+}
+
+/* a \ b → up to 4 pieces in out[]; returns count. */
+static int rect_minus(struct rect a, struct rect b,
+                      struct rect *out, int out_max)
+{
+	int raw[4][4];
+	int n, i;
+
+	n = rect_subtract(a.x0, a.y0, a.x1, a.y1,
+	                  b.x0, b.y0, b.x1, b.y1, raw, out_max < 4 ? out_max : 4);
+	for (i = 0; i < n; i++)
+		out[i] = rect_make(raw[i][0], raw[i][1], raw[i][2], raw[i][3]);
+	return n;
+}
+
+static void rect_log(const char *tag, struct rect r)
+{
+	if (!bgce_comp_debug() || rect_empty(r))
+		return;
+	printf("[BGCE] move: %s [%d,%d)×[%d,%d) %dx%d\n",
+	       tag, r.x0, r.x1, r.y0, r.y1, r.x1 - r.x0, r.y1 - r.y0);
+	fflush(stdout);
+}
+
+/*
+ * Worker args: paint one screen rect (underlay stack or mover blit).
+ * Lifetime: stack of redraw_region until parallel join returns.
+ */
+struct move_paint_job {
 	struct ServerState *srv;
-	const struct Client *cli;
-	int x0, y0, x1, y1;
+	const struct Client *client; /* mover, or skip-id for underlay */
+	struct rect area;
+	int is_underlay; /* 1 = composite everyone except client */
 };
 
-static void move_underlay_task(void *arg)
+static void move_paint_worker(void *arg)
 {
-	struct move_underlay_args *a = arg;
-	struct Client *stack_dbg;
-	int nstack = 0;
+	struct move_paint_job *job = arg;
 
-	/* worker id comes from claim hand-out TLS */
-	bgce_comp_damage_log("underlay", a->x0, a->y0, a->x1, a->y1, -1);
-	if (bgce_comp_debug()) {
-		for (stack_dbg = a->srv->clients; stack_dbg; stack_dbg = stack_dbg->next) {
-			if (stack_dbg == a->skip || !stack_dbg->buffer)
-				continue;
-			nstack++;
-		}
-		printf("[BGCE] underlay: composite %d layer(s) except skip "
-		       "id=%u into %dx%d\n",
-		       nstack,
-		       a->skip ? (unsigned)a->skip->id : 0,
-		       a->x1 - a->x0, a->y1 - a->y0);
-		fflush(stdout);
-	}
-	composite_all_except(a->srv, a->skip, a->x0, a->y0, a->x1, a->y1);
+	bgce_comp_damage_log(job->is_underlay ? "underlay" : "mover",
+	                     job->area.x0, job->area.y0,
+	                     job->area.x1, job->area.y1, -1);
+	if (job->is_underlay)
+		composite_all_except(job->srv, job->client,
+		                     job->area.x0, job->area.y0,
+		                     job->area.x1, job->area.y1);
+	else
+		blit_client_overlap(job->srv, job->client,
+		                    job->area.x0, job->area.y0,
+		                    job->area.x1, job->area.y1);
 }
 
-static void move_blit_task(void *arg)
-{
-	struct move_blit_args *a = arg;
-	const struct Client *cli = a->cli;
-
-	bgce_comp_damage_log("mover", a->x0, a->y0, a->x1, a->y1, -1);
-	if (bgce_comp_debug() && cli) {
-		uint32_t ww = cli->world_w ? cli->world_w : cli->width;
-		uint32_t wh = cli->world_h ? cli->world_h : cli->height;
-
-		printf("[BGCE] mover: blit id=%u app='%s' world=(%u,%u) %ux%u "
-		       "screen=(%d,%d)-(%d,%d) %dx%d\n",
-		       (unsigned)cli->id,
-		       cli->app_id[0] ? cli->app_id : "?",
-		       cli->x, cli->y, ww, wh,
-		       a->x0, a->y0,
-		       a->x1 > a->x0 ? a->x1 - 1 : a->x0,
-		       a->y1 > a->y0 ? a->y1 - 1 : a->y0,
-		       a->x1 - a->x0, a->y1 - a->y0);
-		fflush(stdout);
-	}
-	blit_client_overlap(a->srv, a->cli, a->x0, a->y0, a->x1, a->y1);
-}
-
+/*
+ * Window move.  `c` is still at the OLD world position.
+ *
+ *   trail  = old_world \ new_world     (L-shape on a pure translate)
+ *   underlay each trail strip on screen (wallpaper + other windows)
+ *   blit mover on new_screen only
+ *   re-blit any windows above over old_screen ∪ new_screen
+ *
+ * Example: (1000,500) 200×200, left 1 → (999,500):
+ *   old_world  [1000,1200)×[500,700)
+ *   new_world  [999,1199)×[500,700)
+ *   trail      [1199,1200)×[500,700)   underlay 1×200
+ *   mover      [999,1199)×[500,700)    200×200  (no shared column)
+ */
 void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 {
-	struct Client moved;
-	struct Client *p;
-	int ox0, oy0, ox1, oy1;
-	int nx0, ny0, nx1, ny1;
-	int ux0, uy0, ux1, uy1;
-	int bx0, by0, bx1, by1;
-	int expose[8][4];
-	int nexp;
-	int i;
-	int same_bounds;
-	struct move_underlay_args uargs[2];
-	struct move_blit_args bargs;
-	void (*f0)(void *) = NULL, (*f1)(void *) = NULL, (*f2)(void *) = NULL;
-	void *a0 = NULL, *a1 = NULL, *a2 = NULL;
+	struct Client at_new;
+	struct Client *above;
+	struct rect old_world, new_world;
+	struct rect old_screen, new_screen;
+	struct rect trail_world[MOVE_TRAIL_MAX];
+	struct rect trail_screen[MOVE_TRAIL_MAX];
+	struct move_paint_job underlay_job[2];
+	struct move_paint_job mover_job;
+	int width, height;
+	int n_trail, n_screen, i, j;
+	int z1x;
 
 	if (!srv || !srv->framebuffer || !c) {
 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
@@ -1686,206 +1738,154 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
 	if (wdx == 0 && wdy == 0)
 		return;
 
-	client_screen_bounds(srv, c, &ox0, &oy0, &ox1, &oy1);
-	moved = *c;
-	moved.x = (uint32_t)((int)c->x + wdx);
-	moved.y = (uint32_t)((int)c->y + wdy);
-	client_screen_bounds(srv, &moved, &nx0, &ny0, &nx1, &ny1);
+	width = (int)(c->world_w ? c->world_w : c->width);
+	height = (int)(c->world_h ? c->world_h : c->height);
+	if (width < 1 || height < 1)
+		return;
 
-	same_bounds = (ox0 == nx0 && oy0 == ny0 && ox1 == nx1 && oy1 == ny1);
+	old_world = rect_make((int)c->x, (int)c->y,
+	                      (int)c->x + width, (int)c->y + height);
+	new_world = rect_make(old_world.x0 + wdx, old_world.y0 + wdy,
+	                      old_world.x1 + wdx, old_world.y1 + wdy);
+
+	at_new = *c;
+	at_new.x = (uint32_t)new_world.x0;
+	at_new.y = (uint32_t)new_world.y0;
+
+	old_screen = rect_world_to_screen(srv, old_world);
+	new_screen = rect_world_to_screen(srv, new_world);
 
 	cursor_fb_begin();
 	(void)cursor_lift_all_ret();
 
-	/*
-	 * When zoomed out (or at awkward zoom percents), a 1-world-pixel move
-	 * often leaves the integer screen rect unchanged.  The buffer mapping
-	 * still shifts, so we must re-blit the mover — skipping here left
-	 * stale edge samples that looked like soft / missing borders.
-	 */
-	if (same_bounds) {
-		bx0 = nx0;
-		by0 = ny0;
-		bx1 = nx1;
-		by1 = ny1;
-		if (clip_to_display(srv, &bx0, &by0, &bx1, &by1)) {
-			bgce_comp_damage_log("mover-same", bx0, by0, bx1, by1, -1);
-			blit_client_overlap(srv, &moved, bx0, by0, bx1, by1);
-			for (p = srv->clients; p && p != c; p = p->next)
-				blit_client_overlap(srv, p, bx0, by0, bx1, by1);
+	/* Zoomed out: screen rect may not move; still re-sample the buffer. */
+	if (old_screen.x0 == new_screen.x0 && old_screen.y0 == new_screen.y0 &&
+	    old_screen.x1 == new_screen.x1 && old_screen.y1 == new_screen.y1) {
+		struct rect area = rect_clip(srv, new_screen);
+
+		if (!rect_empty(area)) {
+			bgce_comp_damage_log("mover-same", area.x0, area.y0,
+			                     area.x1, area.y1, -1);
+			blit_client_overlap(srv, &at_new,
+			                    area.x0, area.y0, area.x1, area.y1);
+			for (above = srv->clients; above && above != c;
+			     above = above->next)
+				blit_client_overlap(srv, above,
+				                    area.x0, area.y0,
+				                    area.x1, area.y1);
 		}
 		cursor_fb_end(1);
 		return;
 	}
 
+	/* Trail behind the window = old minus new (world pixels). */
+	n_trail = rect_minus(old_world, new_world, trail_world, MOVE_TRAIL_MAX);
+
 	/*
-	 * 1. Exact expose = old \ new (half-open screen rects).
-	 *
-	 * Example at zoom 100%, size 800×600, move (1044,594)→(1043,594):
-	 *   old = [1044,1844)×[594,1194), new = [1043,1843)×[594,1194)
-	 *   expose = [1843,1844)×[594,1194)  — one column, the old right edge
-	 * Mover paints only `new`.  Those sets are adjacent, not overlapping;
-	 * a shared column would mean both underlay and mover write the same
-	 * pixels (tear).  Never inflate old before subtract at 1×.
-	 *
-	 * At zoom ≠ 100%, grow each expose piece by 1px for rounding gaps.
+	 * Map trail strips to screen.  At zoom ≠ 100%, pad 1px for ceil gaps
+	 * then cut new_screen back out so we never underlay the mover body.
 	 */
+	z1x = (zoom_pct_of(srv) == BGCE_ZOOM_PCT_1X);
+	n_screen = 0;
+	for (i = 0; i < n_trail && n_screen < MOVE_TRAIL_MAX; i++) {
+		struct rect s = rect_clip(srv,
+		                          rect_world_to_screen(srv, trail_world[i]));
+
+		if (rect_empty(s))
+			continue;
+		if (z1x) {
+			trail_screen[n_screen++] = s;
+			continue;
+		}
+		{
+			struct rect padded = rect_grow1(s, (int)srv->display_w,
+			                                (int)srv->display_h);
+			struct rect pieces[MOVE_TRAIL_MAX];
+			int np = rect_minus(padded, new_screen, pieces,
+			                    MOVE_TRAIL_MAX);
+
+			for (j = 0; j < np && n_screen < MOVE_TRAIL_MAX; j++) {
+				struct rect clipped = rect_clip(srv, pieces[j]);
+
+				if (!rect_empty(clipped))
+					trail_screen[n_screen++] = clipped;
+			}
+		}
+	}
+
+	if (bgce_comp_debug()) {
+		printf("[BGCE] move: delta=(%d,%d) size=%dx%d\n",
+		       wdx, wdy, width, height);
+		rect_log("old_world", old_world);
+		rect_log("new_world", new_world);
+		for (i = 0; i < n_trail; i++)
+			rect_log("trail_world", trail_world[i]);
+		for (i = 0; i < n_screen; i++)
+			rect_log("trail_screen", trail_screen[i]);
+		rect_log("mover_screen", new_screen);
+	}
+
+	/* Underlay trail first (up to 2 strips in parallel), then mover. */
 	{
-		int raw[8][4];
-		int nraw;
-		int e2[8][4];
-		int ne2;
-		int j;
+		void (*fn0)(void *) = NULL, (*fn1)(void *) = NULL;
+		void *arg0 = NULL, *arg1 = NULL;
 
-		nraw = rect_subtract(ox0, oy0, ox1, oy1, nx0, ny0, nx1, ny1,
-		                     raw, 8);
-		nexp = 0;
-		for (i = 0; i < nraw; i++) {
-			/*
-			 * Belt-and-suspenders: keep only (old\new) \ new so
-			 * expose never intersects the mover’s new footprint.
-			 */
-			ne2 = rect_subtract(raw[i][0], raw[i][1], raw[i][2],
-			                    raw[i][3], nx0, ny0, nx1, ny1, e2, 8);
-			for (j = 0; j < ne2 && nexp < 8; j++) {
-				expose[nexp][0] = e2[j][0];
-				expose[nexp][1] = e2[j][1];
-				expose[nexp][2] = e2[j][2];
-				expose[nexp][3] = e2[j][3];
-				nexp++;
-			}
+		if (n_screen > 0) {
+			underlay_job[0].srv = srv;
+			underlay_job[0].client = c;
+			underlay_job[0].area = trail_screen[0];
+			underlay_job[0].is_underlay = 1;
+			fn0 = move_paint_worker;
+			arg0 = &underlay_job[0];
 		}
-		if (zoom_pct_of(srv) != BGCE_ZOOM_PCT_1X) {
-			for (i = 0; i < nexp; i++) {
-				if (expose[i][0] > 0)
-					expose[i][0]--;
-				if (expose[i][1] > 0)
-					expose[i][1]--;
-				if (expose[i][2] < (int)srv->display_w)
-					expose[i][2]++;
-				if (expose[i][3] < (int)srv->display_h)
-					expose[i][3]++;
-			}
-			/*
-			 * After inflate, clip away new again so we still do not
-			 * underlay under the mover body.
-			 */
-			nraw = nexp;
-			for (i = 0; i < nraw; i++) {
-				raw[i][0] = expose[i][0];
-				raw[i][1] = expose[i][1];
-				raw[i][2] = expose[i][2];
-				raw[i][3] = expose[i][3];
-			}
-			nexp = 0;
-			for (i = 0; i < nraw; i++) {
-				ne2 = rect_subtract(raw[i][0], raw[i][1],
-				                    raw[i][2], raw[i][3],
-				                    nx0, ny0, nx1, ny1, e2, 8);
-				for (j = 0; j < ne2 && nexp < 8; j++) {
-					expose[nexp][0] = e2[j][0];
-					expose[nexp][1] = e2[j][1];
-					expose[nexp][2] = e2[j][2];
-					expose[nexp][3] = e2[j][3];
-					nexp++;
-				}
-			}
+		if (n_screen > 1) {
+			underlay_job[1].srv = srv;
+			underlay_job[1].client = c;
+			underlay_job[1].area = trail_screen[1];
+			underlay_job[1].is_underlay = 1;
+			fn1 = move_paint_worker;
+			arg1 = &underlay_job[1];
+		}
+		bgce_comp_parallel3(fn0, arg0, fn1, arg1, NULL, NULL);
+
+		for (i = 2; i < n_screen; i++) {
+			underlay_job[0].area = trail_screen[i];
+			move_paint_worker(&underlay_job[0]);
 		}
 	}
 
-	/* Mover paints only the new footprint. */
-	bx0 = nx0;
-	by0 = ny0;
-	bx1 = nx1;
-	by1 = ny1;
-	if (!clip_to_display(srv, &bx0, &by0, &bx1, &by1)) {
-		bx0 = by0 = bx1 = by1 = 0;
-	}
+	{
+		struct rect mover_area = rect_clip(srv, new_screen);
 
-	/*
-	 * Phase A — underlay expose strips only (parallel among strips).
-	 * Phase B — mover at new (after underlays join).
-	 *
-	 * Do NOT run underlay ∥ mover: a 1px shared column (off-by-one or
-	 * race) makes two workers write the same pixels and tear.
-	 */
-	f0 = f1 = f2 = NULL;
-	a0 = a1 = a2 = NULL;
-	if (nexp > 0) {
-		uargs[0].srv = srv;
-		uargs[0].skip = c;
-		uargs[0].x0 = expose[0][0];
-		uargs[0].y0 = expose[0][1];
-		uargs[0].x1 = expose[0][2];
-		uargs[0].y1 = expose[0][3];
-		f0 = move_underlay_task;
-		a0 = &uargs[0];
-	}
-	if (nexp > 1) {
-		uargs[1].srv = srv;
-		uargs[1].skip = c;
-		uargs[1].x0 = expose[1][0];
-		uargs[1].y0 = expose[1][1];
-		uargs[1].x1 = expose[1][2];
-		uargs[1].y1 = expose[1][3];
-		f1 = move_underlay_task;
-		a1 = &uargs[1];
-	}
-	/* Only underlay slots in this batch (tags underlay0/underlay1). */
-	bgce_comp_parallel3(f0, a0, f1, a1, NULL, NULL);
-
-	/* Extra expose pieces beyond the first two. */
-	for (i = 2; i < nexp; i++) {
-		bgce_comp_damage_log("underlay", expose[i][0], expose[i][1],
-		                     expose[i][2], expose[i][3], -1);
-		composite_all_except(srv, c, expose[i][0], expose[i][1],
-		                     expose[i][2], expose[i][3]);
-	}
-
-	/* Phase B: full blit of mover at new place only. */
-	if (bx1 > bx0 && by1 > by0) {
-		bargs.srv = srv;
-		bargs.cli = &moved;
-		bargs.x0 = bx0;
-		bargs.y0 = by0;
-		bargs.x1 = bx1;
-		bargs.y1 = by1;
-		move_blit_task(&bargs);
-	}
-
-	/* 4. Windows above: redraw over old∪new (serial, z-order). */
-	ux0 = ox0 < nx0 ? ox0 : nx0;
-	uy0 = oy0 < ny0 ? oy0 : ny0;
-	ux1 = ox1 > nx1 ? ox1 : nx1;
-	uy1 = oy1 > ny1 ? oy1 : ny1;
-	if (zoom_pct_of(srv) != BGCE_ZOOM_PCT_1X) {
-		if (ux0 > 0)
-			ux0--;
-		if (uy0 > 0)
-			uy0--;
-		if (ux1 < (int)srv->display_w)
-			ux1++;
-		if (uy1 < (int)srv->display_h)
-			uy1++;
-	}
-	if (clip_to_display(srv, &ux0, &uy0, &ux1, &uy1)) {
-		bgce_comp_damage_log("above", ux0, uy0, ux1, uy1, -1);
-		if (bgce_comp_debug()) {
-			int nabove = 0;
-			for (p = srv->clients; p && p != c; p = p->next)
-				if (p->buffer)
-					nabove++;
-			printf("[BGCE] above: re-blit %d window(s) over "
-			       "screen=(%d,%d)-(%d,%d) %dx%d (mover id=%u)\n",
-			       nabove, ux0, uy0,
-			       ux1 > ux0 ? ux1 - 1 : ux0,
-			       uy1 > uy0 ? uy1 - 1 : uy0,
-			       ux1 - ux0, uy1 - uy0,
-			       (unsigned)c->id);
-			fflush(stdout);
+		if (!rect_empty(mover_area)) {
+			mover_job.srv = srv;
+			mover_job.client = &at_new;
+			mover_job.area = mover_area;
+			mover_job.is_underlay = 0;
+			move_paint_worker(&mover_job);
 		}
-		for (p = srv->clients; p && p != c; p = p->next)
-			blit_client_overlap(srv, p, ux0, uy0, ux1, uy1);
+	}
+
+	/* Windows above the mover cover old∪new (list is top → bottom). */
+	for (above = srv->clients; above && above != c; above = above->next) {
+		struct rect cover;
+
+		if (!above->buffer)
+			continue;
+		cover = rect_clip(srv, rect_union(old_screen, new_screen));
+		if (!z1x)
+			cover = rect_clip(srv,
+			                  rect_grow1(cover, (int)srv->display_w,
+			                             (int)srv->display_h));
+		if (rect_empty(cover))
+			break;
+		bgce_comp_damage_log("above", cover.x0, cover.y0,
+		                     cover.x1, cover.y1, -1);
+		for (; above && above != c; above = above->next)
+			blit_client_overlap(srv, above,
+			                    cover.x0, cover.y0,
+			                    cover.x1, cover.y1);
+		break;
 	}
 
 	cursor_fb_end(1);
