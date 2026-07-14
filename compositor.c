@@ -46,6 +46,7 @@ struct comp_job {
 struct paint_task {
 	void (*fn)(void *);
 	void *arg;
+	const char *tag; /* for debug: "underlay", "mover", … */
 };
 
 static struct comp_job queue[COMP_QUEUE_CAP];
@@ -77,6 +78,20 @@ static int work_shutdown;
 
 static __thread int tls_worker_id = -1;
 
+static const char *op_name(enum comp_op op)
+{
+	switch (op) {
+	case COMP_DRAW:   return "DRAW";
+	case COMP_MOVE:   return "MOVE";
+	case COMP_PAN:    return "PAN";
+	case COMP_ERASE:  return "ERASE";
+	case COMP_FULL:   return "FULL";
+	case COMP_CURSOR: return "CURSOR";
+	case COMP_QUIT:   return "QUIT";
+	default:          return "?";
+	}
+}
+
 static void debug_init(void)
 {
 	const char *e = getenv("BGCE_DEBUG");
@@ -96,6 +111,12 @@ int bgce_comp_worker_id(void)
 	return tls_worker_id;
 }
 
+static void debug_fflush(void)
+{
+	fflush(stdout);
+	fflush(stderr);
+}
+
 void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
                           int worker)
 {
@@ -107,8 +128,9 @@ void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
 		printf("[BGCE] damage %s rect=(%d,%d)-(%d,%d) worker=%d\n",
 		       tag ? tag : "?", x0, y0, x1, y1, worker);
 	else
-		printf("[BGCE] damage %s rect=(%d,%d)-(%d,%d)\n",
+		printf("[BGCE] damage %s rect=(%d,%d)-(%d,%d) worker=orch\n",
 		       tag ? tag : "?", x0, y0, x1, y1);
+	debug_fflush();
 }
 
 struct Client *bgce_comp_find_client(uint32_t client_id)
@@ -130,21 +152,103 @@ static void run_job(const struct comp_job *job)
 	struct Client gone;
 	int wdx, wdy;
 	uint32_t save_x, save_y;
+	const char *app = "";
 
-	if (bgce_debug)
-		printf("[BGCE] comp: run op=%d id=%u cursor=(%d,%d)\n",
-		       (int)job->op, (unsigned)job->client_id,
-		       job->cursor_x, job->cursor_y);
+	c = (job->client_id != 0) ? bgce_comp_find_client(job->client_id) : NULL;
+	if (c && c->app_id[0])
+		app = c->app_id;
+
+	if (bgce_debug) {
+		uint32_t ww = 0, wh = 0;
+		int sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0;
+
+		if (c) {
+			ww = c->world_w ? c->world_w : c->width;
+			wh = c->world_h ? c->world_h : c->height;
+			/* Approximate screen footprint at current zoom/pan. */
+			{
+				int z = server.zoom_pct > 0 ? server.zoom_pct
+				                            : BGCE_ZOOM_PCT_1X;
+				sx0 = ((int)c->x * z + 99) / 100 - server.pan_x;
+				sy0 = ((int)c->y * z + 99) / 100 - server.pan_y;
+				sx1 = ((int)(c->x + ww) * z + 99) / 100 -
+				      server.pan_x;
+				sy1 = ((int)(c->y + wh) * z + 99) / 100 -
+				      server.pan_y;
+			}
+		}
+
+		switch (job->op) {
+		case COMP_DRAW:
+			printf("[BGCE] comp: run DRAW id=%u app='%s' "
+			       "world=(%u,%u) %ux%u screen=(%d,%d)-(%d,%d) "
+			       "zoom=%d%% pan=(%d,%d)\n",
+			       (unsigned)job->client_id, app,
+			       c ? c->x : 0, c ? c->y : 0, ww, wh,
+			       sx0, sy0, sx1, sy1,
+			       server.zoom_pct, server.pan_x, server.pan_y);
+			break;
+		case COMP_MOVE:
+			printf("[BGCE] comp: run MOVE id=%u app='%s' "
+			       "world (%d,%d)->(%d,%d) size=%ux%u "
+			       "zoom=%d%% pan=(%d,%d)\n",
+			       (unsigned)job->client_id, app,
+			       job->old_x, job->old_y, job->new_x, job->new_y,
+			       ww, wh, server.zoom_pct, server.pan_x,
+			       server.pan_y);
+			break;
+		case COMP_PAN:
+			printf("[BGCE] comp: run PAN d=(%d,%d) "
+			       "(pan was %d,%d zoom=%d%%)\n",
+			       job->sdx, job->sdy,
+			       server.pan_x, server.pan_y, server.zoom_pct);
+			break;
+		case COMP_ERASE:
+			printf("[BGCE] comp: run ERASE world=(%u,%u) %ux%u "
+			       "zoom=%d%% pan=(%d,%d)\n",
+			       job->erase_x, job->erase_y,
+			       job->erase_ww, job->erase_wh,
+			       server.zoom_pct, server.pan_x, server.pan_y);
+			break;
+		case COMP_FULL:
+			printf("[BGCE] comp: run FULL zoom=%d%% pan=(%d,%d) "
+			       "display=%ux%u\n",
+			       server.zoom_pct, server.pan_x, server.pan_y,
+			       server.display_w, server.display_h);
+			break;
+		case COMP_CURSOR: {
+			/* Mouse moves constantly — log 1 in 32 so DRAW stays visible. */
+			static int cursor_run_n;
+			if ((cursor_run_n++ % 32) == 0) {
+				printf("[BGCE] comp: run CURSOR screen=(%d,%d) "
+				       "(1/32) zoom=%d%% pan=(%d,%d)\n",
+				       job->cursor_x, job->cursor_y,
+				       server.zoom_pct, server.pan_x,
+				       server.pan_y);
+				debug_fflush();
+			}
+			break;
+		}
+		default:
+			printf("[BGCE] comp: run %s\n", op_name(job->op));
+			break;
+		}
+		if (job->op != COMP_CURSOR)
+			debug_fflush();
+	}
 
 	switch (job->op) {
 	case COMP_DRAW:
-		c = bgce_comp_find_client(job->client_id);
 		if (c)
 			draw(&server, c);
+		else if (bgce_debug) {
+			printf("[BGCE] comp: DRAW id=%u — client gone\n",
+			       (unsigned)job->client_id);
+			debug_fflush();
+		}
 		break;
 
 	case COMP_MOVE:
-		c = bgce_comp_find_client(job->client_id);
 		if (!c)
 			break;
 		wdx = job->new_x - job->old_x;
@@ -193,8 +297,10 @@ static void run_job(const struct comp_job *job)
 		break;
 	}
 
-	if (bgce_debug)
-		printf("[BGCE] comp: done op=%d\n", (int)job->op);
+	if (bgce_debug && job->op != COMP_CURSOR) {
+		printf("[BGCE] comp: done %s\n", op_name(job->op));
+		debug_fflush();
+	}
 }
 
 static void *worker_main(void *arg)
@@ -225,8 +331,20 @@ static void *worker_main(void *arg)
 		tq_count--;
 		pthread_mutex_unlock(&work_mu);
 
+		if (bgce_debug) {
+			printf("[BGCE] worker %d: got task '%s'\n",
+			       id, task.tag ? task.tag : "?");
+			debug_fflush();
+		}
+
 		if (task.fn)
 			task.fn(task.arg);
+
+		if (bgce_debug) {
+			printf("[BGCE] worker %d: done task '%s'\n",
+			       id, task.tag ? task.tag : "?");
+			debug_fflush();
+		}
 
 		pthread_mutex_lock(&work_mu);
 		if (tasks_left > 0)
@@ -247,6 +365,8 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
 	int i;
 	void (*fns[3])(void *) = { f0, f1, f2 };
 	void *args[3] = { a0, a1, a2 };
+	/* Tags match MOVE slots: underlay0, underlay1, mover (any may be NULL). */
+	static const char *const tags[3] = { "underlay0", "underlay1", "mover" };
 
 	for (i = 0; i < 3; i++) {
 		if (fns[i])
@@ -257,9 +377,19 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
 
 	/* Sync mode or workers not up: serial on caller. */
 	if (comp_sync || !workers_running) {
+		if (bgce_debug) {
+			printf("[BGCE] comp: parallel3 serial n=%d\n", n);
+			debug_fflush();
+		}
 		for (i = 0; i < 3; i++) {
-			if (fns[i])
-				fns[i](args[i]);
+			if (!fns[i])
+				continue;
+			if (bgce_debug) {
+				printf("[BGCE] worker orch: got task '%s'\n",
+				       tags[i]);
+				debug_fflush();
+			}
+			fns[i](args[i]);
 		}
 		return;
 	}
@@ -274,11 +404,16 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
 
 	tq_head = tq_tail = tq_count = 0;
 	tasks_left = n;
+	if (bgce_debug) {
+		printf("[BGCE] comp: parallel3 enqueue n=%d → workers FCFS\n", n);
+		debug_fflush();
+	}
 	for (i = 0; i < 3; i++) {
 		if (!fns[i])
 			continue;
 		task_q[tq_tail].fn = fns[i];
 		task_q[tq_tail].arg = args[i];
+		task_q[tq_tail].tag = tags[i];
 		tq_tail = (tq_tail + 1) % TASK_QUEUE_CAP;
 		tq_count++;
 	}
@@ -304,15 +439,53 @@ static void enqueue(const struct comp_job *job)
 	pthread_mutex_lock(&q_mu);
 	if (q_count >= COMP_QUEUE_CAP) {
 		pthread_mutex_unlock(&q_mu);
-		if ((drop_log++ % 64) == 0)
+		if ((drop_log++ % 64) == 0) {
 			fprintf(stderr,
-			        "[BGCE] compositor: queue full, dropping job op=%d\n",
-			        (int)job->op);
+			        "[BGCE] compositor: queue full, dropping %s\n",
+			        op_name(job->op));
+			debug_fflush();
+		}
 		return;
 	}
 	queue[q_tail] = *job;
 	q_tail = (q_tail + 1) % COMP_QUEUE_CAP;
 	q_count++;
+	if (bgce_debug && job->op != COMP_CURSOR) {
+		/* CURSOR is rate-limited in submit_cursor (see comment there). */
+		struct Client *c = NULL;
+		const char *app = "";
+		uint32_t cx = 0, cy = 0, ww = 0, wh = 0;
+
+		if (job->client_id)
+			c = bgce_comp_find_client(job->client_id);
+		if (c) {
+			if (c->app_id[0])
+				app = c->app_id;
+			cx = c->x;
+			cy = c->y;
+			ww = c->world_w ? c->world_w : c->width;
+			wh = c->world_h ? c->world_h : c->height;
+		}
+		if (job->op == COMP_DRAW)
+			printf("[BGCE] comp: enqueue DRAW id=%u app='%s' "
+			       "world=(%u,%u) %ux%u q=%d\n",
+			       (unsigned)job->client_id, app, cx, cy, ww, wh,
+			       q_count);
+		else if (job->op == COMP_MOVE)
+			printf("[BGCE] comp: enqueue MOVE id=%u app='%s' "
+			       "(%d,%d)->(%d,%d) q=%d\n",
+			       (unsigned)job->client_id, app,
+			       job->old_x, job->old_y, job->new_x, job->new_y,
+			       q_count);
+		else if (job->op == COMP_PAN)
+			printf("[BGCE] comp: enqueue PAN d=(%d,%d) q=%d\n",
+			       job->sdx, job->sdy, q_count);
+		else
+			printf("[BGCE] comp: enqueue %s id=%u app='%s' q=%d\n",
+			       op_name(job->op), (unsigned)job->client_id, app,
+			       q_count);
+		debug_fflush();
+	}
 	pthread_cond_signal(&q_not_empty);
 	pthread_mutex_unlock(&q_mu);
 }
@@ -571,9 +744,17 @@ void bgce_comp_submit_cursor(int x, int y)
 	j.cursor_x = x;
 	j.cursor_y = y;
 	if (bgce_debug) {
+		/*
+		 * Rate limit: pointer events can be hundreds/sec. Logging every
+		 * one drowns DRAW/MOVE. Print 1 of every 32 samples, with pos.
+		 */
 		static int n;
-		if ((n++ % 32) == 0)
-			printf("[BGCE] comp: enqueue cursor (%d,%d)\n", x, y);
+		if ((n++ % 32) == 0) {
+			printf("[BGCE] comp: enqueue CURSOR screen=(%d,%d) "
+			       "(1/32 samples)\n",
+			       x, y);
+			debug_fflush();
+		}
 	}
 	enqueue(&j);
 }

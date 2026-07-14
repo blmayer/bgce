@@ -13,7 +13,8 @@ struct Client;
  *   Input never paints — it only enqueues (including mouse motion).
  * - Sync mode (headless): submit runs on the caller; parallel tasks serial.
  *
- * Debug: BGCE_DEBUG=1  (damage rects, jobs, cursor submits — one switch)
+ * Debug: BGCE_DEBUG=1 — op names, enqueue/run/done, which worker took each
+ *   MOVE task, client DRAW, damage rects (one switch; fflush'd for log pipe).
  */
 
 /** Start compositor. sync_mode != 0 → no background threads (inline paint). */

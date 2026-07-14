@@ -234,6 +234,17 @@ void* client_thread(void* arg) {
 			 * Queue a blit of this client (clipped by windows above).
 			 * Paint runs on the compositor thread, not here.
 			 */
+			if (bgce_comp_debug()) {
+				uint32_t ww = client->world_w ? client->world_w
+				                              : client->width;
+				uint32_t wh = client->world_h ? client->world_h
+				                              : client->height;
+				printf("[BGCE] client fd=%d id=%u app='%s': "
+				       "MSG_DRAW world=(%u,%u) %ux%u\n",
+				       client_fd, (unsigned)client->id,
+				       client->app_id[0] ? client->app_id : "?",
+				       client->x, client->y, ww, wh);
+			}
 			bgce_comp_submit_draw(client->id);
 			break;
 		}
