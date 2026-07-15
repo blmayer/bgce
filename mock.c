@@ -301,9 +301,6 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 {
 	int wx, wy;
 	int z;
-	int old_z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
-	int old_px = server.pan_x;
-	int old_py = server.pan_y;
 
 	screen_to_world(&server, sx, sy, &wx, &wy);
 	if (!bgce_zoom_set(&server, zoom_pct)) {
@@ -312,8 +309,7 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 		server.pan_x = wx * z / 100 - sx;
 		server.pan_y = wy * z / 100 - sy;
 		clamp_viewport(&server);
-		bgce_comp_submit_zoom(old_z, old_px, old_py, z, server.pan_x,
-		                      server.pan_y);
+		bgce_comp_submit_full();
 		return;
 	}
 	z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
@@ -321,8 +317,7 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
 	server.pan_x = wx * z / 100 - sx;
 	server.pan_y = wy * z / 100 - sy;
 	clamp_viewport(&server);
-	bgce_comp_submit_zoom(old_z, old_px, old_py, z, server.pan_x,
-	                      server.pan_y);
+	bgce_comp_submit_full();
 }
 
 void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y)

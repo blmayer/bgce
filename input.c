@@ -177,9 +177,7 @@ static void screen_delta_to_world(int sdx, int sdy, float speed,
 
 static void apply_zoom_at_cursor(int dir)
 {
-	int old_pct = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
-	int old_pan_x = server.pan_x;
-	int old_pan_y = server.pan_y;
+	int old_pct = server.zoom_pct;
 	int wx, wy;
 	int z;
 
@@ -194,12 +192,7 @@ static void apply_zoom_at_cursor(int dir)
 	server.pan_x = wx * z / 100 - mouse_x;
 	server.pan_y = wy * z / 100 - mouse_y;
 	clamp_viewport(&server);
-	/*
-	 * Zoom in: crop+scale the already-composited FB (no client walk).
-	 * Zoom out: COMP_ZOOM falls back to full recompose inside display.
-	 */
-	bgce_comp_submit_zoom(old_pct, old_pan_x, old_pan_y,
-	                      z, server.pan_x, server.pan_y);
+	bgce_comp_submit_full();
 	bgce_comp_submit_cursor(mouse_x, mouse_y);
 	printf("[BGCE] Zoom: %d%%  pan=(%d, %d)  was %d%%\n",
 	       server.zoom_pct, server.pan_x, server.pan_y, old_pct);
