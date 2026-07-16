@@ -35,17 +35,9 @@ void* client_thread(void* arg) {
 		client->id = next_client_id++;
 	location_cache_identify_client(client, client_fd);
 
-	/* Background client is always first; keep the list non-empty. */
-	if (!server.clients) {
-		fprintf(stderr, "[BGCE] no client list (missing background); dropping connection\n");
-		close(client_fd);
-		free(client);
-		return NULL;
-	}
-
-	// Add client to the linked list
+	/* Add client to the linked list (wallpaper is not a client). */
 	client->next = server.clients;
-	client->z = server.clients->z + 1;
+	client->z = server.clients ? server.clients->z + 1 : 1;
 	server.clients = client;
 
 	/* last connected client gets focus (notify old focus only; don't notify the new client yet) */
@@ -286,17 +278,15 @@ void* client_thread(void* arg) {
 		client->shm_name[0] = '\0';
 	}
 
-	// Remove client from the linked list (never drop the background client)
+	/* Remove client from the linked list. */
 	struct Client* prev = NULL;
 	struct Client* curr = server.clients;
 	while (curr) {
 		if (curr == client) {
-			if (prev) {
+			if (prev)
 				prev->next = curr->next;
-			} else {
-				/* Head is a real client; next should be background or another. */
+			else
 				server.clients = curr->next;
-			}
 			break;
 		}
 		prev = curr;

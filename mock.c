@@ -17,7 +17,6 @@ struct config config;
 /* From input_headless / input */
 struct Client *pick_client(int x, int y);
 
-static struct Client *bg_client;
 static int mock_active;
 static uint32_t mock_next_id = 1;
 
@@ -62,34 +61,19 @@ int bgce_mock_init(uint32_t width, uint32_t height)
 	server.pan_y = 0;
 	server.client_count = 0;
 	server.focused_client = NULL;
+	server.clients = NULL;
 
-	bg_client = calloc(1, sizeof(*bg_client));
-	if (!bg_client) {
+	/* Procedural wallpaper — solid color source only (no world-sized buffer). */
+	if (wallpaper_load(&config) != 0) {
 		release_display();
 		return -1;
 	}
-	bg_client->z = 0;
-	bg_client->fd = -1;
-	bg_client->width = server.virtual_w;
-	bg_client->height = server.virtual_h;
-	bg_client->world_w = server.virtual_w;
-	bg_client->world_h = server.virtual_h;
-	bg_client->buffer = malloc((size_t)server.virtual_w * server.virtual_h * 4);
-	if (!bg_client->buffer) {
-		free(bg_client);
-		bg_client = NULL;
-		release_display();
-		return -1;
-	}
-	apply_background(&config, bg_client->buffer,
-	                 server.virtual_w, server.virtual_h,
-	                 server.virtual_w, server.virtual_h);
-	server.clients = bg_client;
 
 	init_input();
 	location_cache_load();
 	/* Sync compositor: paint inline so headless tests need no flush. */
 	if (bgce_comp_init(1) != 0) {
+		wallpaper_free();
 		release_display();
 		return -1;
 	}
@@ -117,17 +101,12 @@ void bgce_mock_fini(void)
 		struct Client *n = c->next;
 		if (c->buffer)
 			free(c->buffer);
-		if (c != bg_client)
-			free(c);
+		free(c);
 		c = n;
-	}
-	if (bg_client) {
-		/* buffer already freed in loop if bg was in list */
-		free(bg_client);
-		bg_client = NULL;
 	}
 	server.clients = NULL;
 	server.focused_client = NULL;
+	wallpaper_free();
 	release_display();
 	mock_active = 0;
 }
@@ -199,7 +178,7 @@ void bgce_mock_remove_client(struct Client *c)
 	struct Client *prev = NULL;
 	struct Client *curr;
 
-	if (!c || c == bg_client)
+	if (!c)
 		return;
 
 	curr = server.clients;
@@ -236,7 +215,7 @@ void bgce_mock_focus(struct Client *c)
 	struct Client *prev;
 	struct Client *curr;
 
-	if (!c || c == bg_client)
+	if (!c)
 		return;
 
 	/* Raise to head of list (top). */

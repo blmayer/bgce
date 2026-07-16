@@ -827,6 +827,151 @@ static inline void fill_u32(uint32_t *p, int n, uint32_t v)
 		p[i] = v;
 }
 
+/* Forward decl — used by wallpaper_fill before its definition. */
+static int clip_to_display(const struct ServerState *srv,
+                           int *x0, int *y0, int *x1, int *y1);
+
+/* Positive modulo for world coords that can go slightly negative. */
+static int wallpaper_mod(int a, int m)
+{
+	int r;
+
+	if (m <= 0)
+		return 0;
+	r = a % m;
+	if (r < 0)
+		r += m;
+	return r;
+}
+
+/*
+ * Procedural wallpaper into a screen damage rect.  Samples solid color or
+ * a small source image (tiled / scaled over the virtual desktop).  No
+ * full-world buffer — only the damage rect is written.
+ */
+void wallpaper_fill_screen_rect(struct ServerState *srv,
+                                int sx0, int sy0, int sx1, int sy1)
+{
+	uint32_t *dst;
+	uint32_t stride;
+	int z, pan_x, pan_y;
+	uint32_t color;
+	int y, x;
+	int vw, vh;
+
+	if (!srv || !srv->framebuffer)
+		return;
+	if (!clip_to_display(srv, &sx0, &sy0, &sx1, &sy1))
+		return;
+
+	dst = (uint32_t *)srv->framebuffer;
+	stride = display_stride_px(srv);
+	z = zoom_pct_of(srv);
+	pan_x = srv->pan_x;
+	pan_y = srv->pan_y;
+	color = wallpaper.color;
+	vw = srv->virtual_w > 0 ? (int)srv->virtual_w : 1;
+	vh = srv->virtual_h > 0 ? (int)srv->virtual_h : 1;
+
+	/* Fast path: solid color (default and image-load fallback). */
+	if (wallpaper.type != BG_IMAGE || !wallpaper.src ||
+	    wallpaper.src_w == 0 || wallpaper.src_h == 0) {
+		for (y = sy0; y < sy1; y++)
+			fill_u32(dst + y * (int)stride + sx0, sx1 - sx0, color);
+		return;
+	}
+
+	{
+		const uint32_t *src = wallpaper.src;
+		int sw = (int)wallpaper.src_w;
+		int sh = (int)wallpaper.src_h;
+
+		if (wallpaper.mode == IMAGE_TILED) {
+			/*
+			 * Tile in world space: (wx,wy) → src[wy % sh][wx % sw].
+			 * At zoom 100%: wx = sx + pan (same as old full canvas).
+			 */
+			if (z == BGCE_ZOOM_PCT_1X) {
+				for (y = sy0; y < sy1; y++) {
+					int wy = y + pan_y;
+					int ty = wallpaper_mod(wy, sh);
+					const uint32_t *srow = src + ty * sw;
+					uint32_t *drow = dst + y * (int)stride;
+
+					for (x = sx0; x < sx1; x++) {
+						int wx = x + pan_x;
+						drow[x] = srow[wallpaper_mod(wx, sw)];
+					}
+				}
+			} else {
+				for (y = sy0; y < sy1; y++) {
+					int wy = (y + pan_y) * 100 / z;
+					int ty = wallpaper_mod(wy, sh);
+					const uint32_t *srow = src + ty * sw;
+					uint32_t *drow = dst + y * (int)stride;
+
+					for (x = sx0; x < sx1; x++) {
+						int wx = (x + pan_x) * 100 / z;
+						drow[x] = srow[wallpaper_mod(wx, sw)];
+					}
+				}
+			}
+			return;
+		}
+
+		/*
+		 * Scaled: stretch source over the full virtual desktop.
+		 *   ix = wx * sw / virtual_w
+		 *   iy = wy * sh / virtual_h
+		 */
+		if (z == BGCE_ZOOM_PCT_1X) {
+			for (y = sy0; y < sy1; y++) {
+				int wy = y + pan_y;
+				int iy = wy * sh / vh;
+				uint32_t *drow = dst + y * (int)stride;
+				const uint32_t *srow;
+
+				if (iy < 0)
+					iy = 0;
+				if (iy >= sh)
+					iy = sh - 1;
+				srow = src + iy * sw;
+				for (x = sx0; x < sx1; x++) {
+					int wx = x + pan_x;
+					int ix = wx * sw / vw;
+					if (ix < 0)
+						ix = 0;
+					if (ix >= sw)
+						ix = sw - 1;
+					drow[x] = srow[ix];
+				}
+			}
+		} else {
+			for (y = sy0; y < sy1; y++) {
+				int wy = (y + pan_y) * 100 / z;
+				int iy = wy * sh / vh;
+				uint32_t *drow = dst + y * (int)stride;
+				const uint32_t *srow;
+
+				if (iy < 0)
+					iy = 0;
+				if (iy >= sh)
+					iy = sh - 1;
+				srow = src + iy * sw;
+				for (x = sx0; x < sx1; x++) {
+					int wx = (x + pan_x) * 100 / z;
+					int ix = wx * sw / vw;
+					if (ix < 0)
+						ix = 0;
+					if (ix >= sw)
+						ix = sw - 1;
+					drow[x] = srow[ix];
+				}
+			}
+		}
+	}
+}
+
 /*
  * 1:1 blit when zoom_pct == 100 and buffer size == world size.
  *   pan is screen-pixel pan: world = screen + pan
@@ -1060,6 +1205,9 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
 	if (rx0 >= rx1 || ry0 >= ry1)
 		return;
 
+	/* Bottom layer: procedural wallpaper (not a client buffer). */
+	wallpaper_fill_screen_rect(srv, rx0, ry0, rx1, ry1);
+
 	int n = 0;
 	for (struct Client* c = first; c; c = c->next)
 		n++;
@@ -1083,8 +1231,7 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
 		stack[i++] = c;
 
 	/* The linked-list is ordered top->bottom.
-	 * For correct composition we must draw bottom->top so that higher windows
-	 * overwrite lower ones (background is typically last in the chain).
+	 * Draw bottom->top so higher windows overwrite lower ones.
 	 */
 	for (i = n - 1; i >= 0; i--) {
 		blit_client_overlap(srv, stack[i], rx0, ry0, rx1, ry1);
@@ -1517,9 +1664,9 @@ void draw(struct ServerState *srv, struct Client *cli)
 }
 
 /*
- * Paint every client except `skip` into a screen rect, bottom → top.
- * Used for move expose so wallpaper (and true underlay) always runs even
- * if list topology is odd — never leave the mover’s old pixels in the trail.
+ * Paint wallpaper + every client except `skip` into a screen rect, bottom → top.
+ * Used for move expose so wallpaper always runs even if the client list is empty
+ * — never leave the mover’s old pixels in the trail.
  */
 static void composite_all_except(struct ServerState *srv,
                                  const struct Client *skip,
@@ -1532,6 +1679,8 @@ static void composite_all_except(struct ServerState *srv,
 
 	if (!clip_to_display(srv, &x0, &y0, &x1, &y1))
 		return;
+
+	wallpaper_fill_screen_rect(srv, x0, y0, x1, y1);
 
 	for (c = srv->clients; c; c = c->next) {
 		if (c == skip || !c->buffer)
@@ -1553,7 +1702,7 @@ static void composite_all_except(struct ServerState *srv,
 		stack[i++] = c;
 	}
 	if (bgce_comp_debug()) {
-		printf("[BGCE] underlay-stack: %d layer(s) into "
+		printf("[BGCE] underlay-stack: wallpaper + %d layer(s) into "
 		       "screen=(%d,%d)-(%d,%d) %dx%d skip_id=%u\n",
 		       n, x0, y0,
 		       x1 > x0 ? x1 - 1 : x0,

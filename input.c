@@ -130,7 +130,7 @@ int resize_buffer(struct Client* c, int dx, int dy) {
 	return 1;
 }
 
-/* Pick topmost non-background client under screen-space (x, y). */
+/* Pick topmost client under screen-space (x, y). Wallpaper is not a client. */
 struct Client* pick_client(int x, int y) {
 	int wx, wy;
 	screen_to_world(&server, x, y, &wx, &wy);
@@ -147,7 +147,7 @@ struct Client* pick_client(int x, int y) {
 		}
 		c = c->next;
 	}
-	return (picked && picked->z > 0) ? picked : NULL; /* skip background */
+	return picked;
 }
 
 /*

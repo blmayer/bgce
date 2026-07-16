@@ -62,5 +62,5 @@ struct Client *pick_client(int x, int y)
 		}
 		c = c->next;
 	}
-	return (picked && picked->z > 0) ? picked : NULL;
+	return picked;
 }

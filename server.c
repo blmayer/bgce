@@ -323,33 +323,15 @@ int main(void) {
 	       server.virtual_w, server.virtual_h,
 	       (double)(BGCE_WORLD_SCALE * BGCE_WORLD_SCALE), server.zoom_pct);
 
-	/* Background covers the entire virtual desktop */
-	struct Client background_client;
-	memset(&background_client, 0, sizeof(background_client));
-	background_client.x = 0;
-	background_client.y = 0;
-	background_client.z = 0; /* special: never focusable */
-	background_client.width = server.virtual_w;
-	background_client.height = server.virtual_h;
-	/* 1:1 world ↔ buffer for the desktop surface */
-	background_client.world_w = server.virtual_w;
-	background_client.world_h = server.virtual_h;
-	background_client.buffer = malloc((size_t)server.virtual_w * server.virtual_h * 4);
-	if (!background_client.buffer) {
-		perror("[BGCE] malloc background");
+	/* Wallpaper is procedural (color or small source image) — no world-sized buffer. */
+	server.clients = NULL;
+	if (wallpaper_load(&config) != 0) {
+		fprintf(stderr, "[BGCE] wallpaper_load failed\n");
 		release_display();
 		return 1;
 	}
-	background_client.next = NULL;
-	background_client.fd = -1;
-	server.clients = &background_client;
 
-	/* Wallpaper covers the full virtual desktop (scaled mode stretches). */
-	apply_background(&config, background_client.buffer,
-	                 server.virtual_w, server.virtual_h,
-	                 server.virtual_w, server.virtual_h);
-
-	puts("[BGCE] Drawing background");
+	puts("[BGCE] Drawing wallpaper");
 	/* Async compositor owns FB writes after this. */
 	if (bgce_comp_init(0) != 0)
 		fprintf(stderr, "[BGCE] compositor init failed; using sync fallback\n");

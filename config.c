@@ -750,79 +750,82 @@ static inline uint32_t rgba_to_u32(const unsigned char *p)
 	       ((uint32_t)p[1] << 8) | (uint32_t)p[2];
 }
 
-// Apply background to a buffer (typically the full virtual desktop).
-int apply_background(struct config* config, uint32_t* buffer,
-                     uint32_t width, uint32_t height,
-                     uint32_t tile_w, uint32_t tile_h) {
-	if (!config || !buffer || width == 0 || height == 0)
-		return -1;
+/* Procedural wallpaper source (no full virtual-desktop raster). */
+struct Wallpaper wallpaper;
 
-	if (tile_w == 0)
-		tile_w = width;
-	if (tile_h == 0)
-		tile_h = height;
+void wallpaper_free(void)
+{
+	free(wallpaper.src);
+	wallpaper.src = NULL;
+	wallpaper.src_w = 0;
+	wallpaper.src_h = 0;
+	wallpaper.type = BG_COLOR;
+	wallpaper.mode = IMAGE_SCALED;
+	wallpaper.color = 0xFF333333;
+}
 
-	if (config->type == BG_COLOR) {
-		for (uint32_t i = 0; i < width * height; i++)
-			buffer[i] = config->color;
-		return 0;
-	}
-
-	if (config->type != BG_IMAGE)
-		return -1;
-
+int wallpaper_load(const struct config *config)
+{
 	int img_width, img_height, img_channels;
-	unsigned char *img_data =
-	        stbi_load(config->path, &img_width, &img_height, &img_channels, 4);
-	if (!img_data) {
-		fprintf(stderr, "[BGCE] Failed to load background image: %s\n",
-		        config->path[0] ? config->path : "(empty path)");
-		fprintf(stderr, "[BGCE] Falling back to default color #333333\n");
-		for (uint32_t i = 0; i < width * height; i++)
-			buffer[i] = 0xFF333333;
+	unsigned char *img_data;
+	uint32_t *argb;
+	size_t n, i;
+
+	wallpaper_free();
+	if (!config)
+		return -1;
+
+	wallpaper.color = config->color;
+	wallpaper.mode = config->mode;
+	wallpaper.type = BG_COLOR;
+
+	if (config->type != BG_IMAGE) {
+		wallpaper.type = BG_COLOR;
+		printf("[BGCE] wallpaper: solid color #%08X (no full-desktop buffer)\n",
+		       wallpaper.color);
 		return 0;
 	}
 
-	printf("[BGCE] Background image %s (%dx%d) mode=%s → canvas %ux%u\n",
-	       config->path, img_width, img_height,
-	       config->mode == IMAGE_TILED ? "tiled" : "scaled",
-	       width, height);
-
-	if (config->mode == IMAGE_TILED) {
-		/* Repeat source texels over the whole canvas. */
-		for (uint32_t y = 0; y < height; y++) {
-			uint32_t img_y = y % (uint32_t)img_height;
-			for (uint32_t x = 0; x < width; x++) {
-				uint32_t img_x = x % (uint32_t)img_width;
-				uint32_t img_idx = (img_y * (uint32_t)img_width + img_x) * 4;
-				buffer[y * width + x] = rgba_to_u32(img_data + img_idx);
-			}
-		}
-	} else {
-		/*
-		 * Scaled: stretch the image over the full canvas (virtual desktop).
-		 * tile_w/tile_h are unused for this mode (kept for API stability).
-		 */
-		(void)tile_w;
-		(void)tile_h;
-		float x_ratio = (float)img_width / (float)width;
-		float y_ratio = (float)img_height / (float)height;
-
-		for (uint32_t y = 0; y < height; y++) {
-			uint32_t img_y = (uint32_t)(y * y_ratio);
-			if (img_y >= (uint32_t)img_height)
-				img_y = (uint32_t)img_height - 1;
-			for (uint32_t x = 0; x < width; x++) {
-				uint32_t img_x = (uint32_t)(x * x_ratio);
-				if (img_x >= (uint32_t)img_width)
-					img_x = (uint32_t)img_width - 1;
-				uint32_t img_idx =
-				        (img_y * (uint32_t)img_width + img_x) * 4;
-				buffer[y * width + x] = rgba_to_u32(img_data + img_idx);
-			}
-		}
+	if (!config->path[0]) {
+		fprintf(stderr, "[BGCE] wallpaper image path empty; using color\n");
+		printf("[BGCE] wallpaper: solid color #%08X\n", wallpaper.color);
+		return 0;
 	}
 
+	img_data = stbi_load(config->path, &img_width, &img_height, &img_channels, 4);
+	if (!img_data || img_width <= 0 || img_height <= 0) {
+		fprintf(stderr, "[BGCE] Failed to load background image: %s\n",
+		        config->path);
+		fprintf(stderr, "[BGCE] Falling back to solid color #%08X\n",
+		        wallpaper.color);
+		if (img_data)
+			stbi_image_free(img_data);
+		return 0;
+	}
+
+	n = (size_t)img_width * (size_t)img_height;
+	argb = malloc(n * sizeof(uint32_t));
+	if (!argb) {
+		perror("[BGCE] wallpaper source");
+		stbi_image_free(img_data);
+		fprintf(stderr, "[BGCE] Falling back to solid color #%08X\n",
+		        wallpaper.color);
+		return 0;
+	}
+
+	for (i = 0; i < n; i++)
+		argb[i] = rgba_to_u32(img_data + i * 4);
 	stbi_image_free(img_data);
+
+	wallpaper.src = argb;
+	wallpaper.src_w = (uint32_t)img_width;
+	wallpaper.src_h = (uint32_t)img_height;
+	wallpaper.type = BG_IMAGE;
+	wallpaper.mode = config->mode;
+
+	printf("[BGCE] wallpaper: image %s (%dx%d) mode=%s "
+	       "(source only; paint samples into damage rects)\n",
+	       config->path, img_width, img_height,
+	       config->mode == IMAGE_TILED ? "tiled" : "scaled");
 	return 0;
 }

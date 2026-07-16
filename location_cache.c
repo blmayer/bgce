@@ -318,7 +318,7 @@ void location_cache_remember_client(const struct Client *client)
 
 	if (!client || !client->app_id[0])
 		return;
-	/* Skip placeholder background client */
+	/* Skip non-app placeholders (legacy z==0 background had no app_id). */
 	if (client->z == 0 && client->fd < 0)
 		return;
 	z = server.zoom_pct > 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;

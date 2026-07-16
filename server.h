@@ -177,14 +177,33 @@ struct config {
 int load_config(struct config* config);
 /** Log the full effective configuration (background, shortcuts, cursors). */
 void print_config(const struct config* config);
-/**
- * Paint background into a width×height buffer (usually the full virtual desktop).
- * IMAGE_SCALED stretches the image over the whole buffer; IMAGE_TILED repeats
- * source texels. tile_w/tile_h are reserved (pass display size; unused for scaled).
+
+/*
+ * Procedural wallpaper: solid color, or a small source image (tiled / scaled
+ * over the virtual desktop).  No full-world pixel buffer — paint samples into
+ * screen damage rects only (see wallpaper_fill_screen_rect).
  */
-int apply_background(struct config* config, uint32_t* buffer,
-                     uint32_t width, uint32_t height,
-                     uint32_t tile_w, uint32_t tile_h);
+struct Wallpaper {
+	BackgroundType type; /* BG_COLOR or BG_IMAGE */
+	ImageMode mode;
+	uint32_t color;      /* used for BG_COLOR or image load failure */
+	uint32_t *src;       /* ARGB row-major; NULL if color-only */
+	uint32_t src_w;
+	uint32_t src_h;
+};
+
+extern struct Wallpaper wallpaper;
+
+/** Load color / decode image from config. Frees any previous source. */
+int wallpaper_load(const struct config *config);
+/** Free decoded image pixels (safe if never loaded). */
+void wallpaper_free(void);
+/**
+ * Paint wallpaper into a half-open screen rect [sx0,sx1)×[sy0,sy1).
+ * Uses live zoom/pan and virtual desktop size. Clips to the display.
+ */
+void wallpaper_fill_screen_rect(struct ServerState *srv,
+                                int sx0, int sy0, int sx1, int sy1);
 
 /* ----------------------------
  * Cursor

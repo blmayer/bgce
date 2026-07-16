@@ -15,7 +15,7 @@
 
 #include <stdint.h>
 
-/** Start mock server: malloc FB, virtual desktop, solid background. */
+/** Start mock server: malloc FB, virtual desktop, solid procedural wallpaper. */
 int bgce_mock_init(uint32_t width, uint32_t height);
 
 /** Tear down mock (frees clients and FB). */
