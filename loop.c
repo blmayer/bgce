@@ -268,54 +268,86 @@ void* client_thread(void* arg) {
 		}
 	}
 
-	/* Stop any in-progress drag that targets this client (UAF otherwise). */
+	/*
+	 * Teardown order matters (async compositor):
+	 *
+	 *   1. Cancel drag targeting this client.
+	 *   2. Snapshot geometry / buffer for later munmap + erase.
+	 *   3. Unlink from the client list and clear focus so *new* jobs
+	 *      cannot find this client.
+	 *   4. Close the socket (no more MSG_DRAW from the peer).
+	 *   5. bgce_comp_flush() — wait until any in-flight DRAW/MOVE that
+	 *      already holds Client* + buffer finishes.  Munmap *before*
+	 *      this flush races the paint path and can SEGV the orchestrator
+	 *      (looks like a hard freeze: last frame stuck, no input).
+	 *   6. munmap / unlink shm / erase footprint / free.
+	 *
+	 * Terminals that exit the shell (e.g. `exit 1`) often disconnect with
+	 * DRAW jobs still queued — this race was easy to hit there.
+	 */
 	client_disconnected(client);
 
-	if (client->buffer) {
-		munmap(client->buffer, client->width * client->height * 4);
-		client->buffer = NULL;
-		bgce_buf_unlink(client->shm_name);
-		client->shm_name[0] = '\0';
-	}
-
-	/* Remove client from the linked list. */
-	struct Client* prev = NULL;
-	struct Client* curr = server.clients;
-	while (curr) {
-		if (curr == client) {
-			if (prev)
-				prev->next = curr->next;
-			else
-				server.clients = curr->next;
-			break;
-		}
-		prev = curr;
-		curr = curr->next;
-	}
-
-	if (server.focused_client == client) {
-		/* Socket is already dead — do not write a focus-lost message. */
-		server.focused_client = NULL;
-	}
-
-	close(client_fd);
-	client->fd = -1;
-
-	/*
-	 * Only repaint the closed window's screen rect from whatever is still
-	 * in the stack.  Snapshot geometry into the job so paint is safe after
-	 * free; flush so no in-flight DRAW still references this client.
-	 */
-	location_cache_remember_client(client);
 	{
 		uint32_t ww = client->world_w ? client->world_w : client->width;
 		uint32_t wh = client->world_h ? client->world_h : client->height;
+		uint32_t erase_x = client->x;
+		uint32_t erase_y = client->y;
+		void *buf = client->buffer;
+		size_t buf_bytes = 0;
+		char shm_name[64];
+		struct Client *prev = NULL;
+		struct Client *curr = server.clients;
 
-		bgce_comp_submit_erase(client->x, client->y, ww, wh);
+		if (buf && client->width > 0 && client->height > 0)
+			buf_bytes = (size_t)client->width * client->height * 4;
+		shm_name[0] = '\0';
+		if (client->shm_name[0]) {
+			strncpy(shm_name, client->shm_name, sizeof(shm_name) - 1);
+			shm_name[sizeof(shm_name) - 1] = '\0';
+		}
+
+		/* Unlink so find_client / pick_client stop seeing this node. */
+		while (curr) {
+			if (curr == client) {
+				if (prev)
+					prev->next = curr->next;
+				else
+					server.clients = curr->next;
+				break;
+			}
+			prev = curr;
+			curr = curr->next;
+		}
+		client->next = NULL;
+
+		if (server.focused_client == client) {
+			/* Socket is already dead — do not write focus-lost. */
+			server.focused_client = NULL;
+		}
+
+		close(client_fd);
+		client->fd = -1;
+
+		/* Drain paint that still references this Client and its buffer. */
+		bgce_comp_flush();
+
+		if (buf) {
+			munmap(buf, buf_bytes);
+			client->buffer = NULL;
+		}
+		if (shm_name[0]) {
+			bgce_buf_unlink(shm_name);
+			client->shm_name[0] = '\0';
+		}
+
+		location_cache_remember_client(client);
+		/* Only the closed window's screen rect from remaining stack. */
+		bgce_comp_submit_erase(erase_x, erase_y, ww, wh);
 		bgce_comp_flush();
 	}
 
-	printf("[BGCE] Client thread finished (fd=%d); server still running\n", client_fd);
+	printf("[BGCE] Client thread finished (fd=%d); server still running\n",
+	       client_fd);
 	free(client);
 	return NULL;
 }
