@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 855d10e</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 855d10e
+parent <a href=commit-6d12519.html>6d12519</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-08T19:39:34-03:00
+
+    L-shaped window move again; pan/move speed scaled by zoom.
+
+    Restore FB scroll + L expose strips using screen-bound deltas for
+    clean edges; union recompose only if bounds size changes. Add
+    [input] move_speed/pan_speed so on-screen drag ≈ mouse×speed/zoom.
+
+<a href=tree-855d10e.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/README.md b/README.md
+index 96c4723..46a7b1b 100644
+--- a/README.md
++++ b/README.md
+@@ -215,6 +215,15 @@ super+r = command:rofi -show drun
+ f12 = command:import -window root /tmp/screenshot.png
+ ```
+ 
++Pointer feel (optional `[input]` section):
++
++```ini
++[input]
++# On-screen drag speed ≈ mouse × speed / zoom (same relative feel at any zoom)
++move_speed = 1.0
++pan_speed = 1.0
++```
++
+ 
+ ### Notes
+ 
+diff --git a/config.c b/config.c
+index 0a4e7d6..5a7af6f 100644
+--- a/config.c
++++ b/config.c
+@@ -443,6 +443,8 @@ int load_config(struct config* config) {
+ 	config-&gt;path[0] = '\0';
+ 	config-&gt;shortcut_count = 0;
+ 	memset(&amp;config-&gt;cursors, 0, sizeof(config-&gt;cursors));
++	config-&gt;move_speed = 1.0f;
++	config-&gt;pan_speed = 1.0f;
+ 
+ 	if (!home) {
+ 		set_default_shortcuts(config);
+@@ -518,6 +520,19 @@ int load_config(struct config* config) {
+ 					config-&gt;mode = IMAGE_SCALED;
+ 				}
+ 			}
++		} else if (strcmp(current_section, "input") == 0) {
++			if (strcmp(key, "move_speed") == 0) {
++				config-&gt;move_speed = strtof(valp, NULL);
++				if (config-&gt;move_speed &lt;= 0.0f)
++					config-&gt;move_speed = 1.0f;
++			} else if (strcmp(key, "pan_speed") == 0) {
++				config-&gt;pan_speed = strtof(valp, NULL);
++				if (config-&gt;pan_speed &lt;= 0.0f)
++					config-&gt;pan_speed = 1.0f;
++			} else {
++				fprintf(stderr, "[BGCE] Unknown input config key: %s "
++				        "(expected move_speed or pan_speed)\n", key);
++			}
+ 		} else if (strcmp(current_section, "cursors") == 0) {
+ 			if (strcmp(key, "theme") == 0) {
+ 				load_cursor_theme(valp, &amp;config-&gt;cursors);
+@@ -667,6 +682,9 @@ void print_config(const struct config* config)
+ 	}
+ 	printf("[BGCE] cursors: %d theme image(s) loaded (of %d types)\n",
+ 	       cursor_loaded, BGCE_CURSOR_COUNT);
++	printf("[BGCE] input: move_speed=%.2f pan_speed=%.2f "
++	       "(on-screen speed ≈ mouse × speed / zoom)\n",
++	       (double)config-&gt;move_speed, (double)config-&gt;pan_speed);
+ 	printf("[BGCE] === end config ===\n");
+ }
+ 
+diff --git a/display.c b/display.c
+index 426680b..8ca2c1c 100644
+--- a/display.c
++++ b/display.c
+@@ -927,9 +927,17 @@ static int clip_to_display(const struct ServerState *srv,
+ 	return *x0 &lt; *x1 &amp;&amp; *y0 &lt; *y1;
+ }
+ 
++/* Composite everything from `behind` into a rect, clipped to the display. */
++static void composite_behind_rect(struct ServerState *srv, struct Client *behind,
++                                  int x0, int y0, int x1, int y1)
++{
++	if (!clip_to_display(srv, &amp;x0, &amp;y0, &amp;x1, &amp;y1))
++		return;
++	composite_chain_to_rect(srv, behind, x0, y0, x1, y1);
++}
++
+ /*
+- * Copy a rectangular block of framebuffer pixels by (sdx, sdy), clipped to
+- * the display.  Overlap-safe (same idea as memmove).
++ * Slide a screen rect by (sdx,sdy). Overlap-safe. Source is [x0,x1)×[y0,y1).
+  */
+ static void fb_copy_rect_delta(struct ServerState *srv,
+                                int x0, int y0, int x1, int y1,
+@@ -937,14 +945,11 @@ static void fb_copy_rect_delta(struct ServerState *srv,
+ {
+ 	uint32_t *fb;
+ 	uint32_t sp;
+-	int sx0, sy0, sx1, sy1;
+-	int dx0, dy0, dx1, dy1;
+-	int w, h, y;
++	int sx0, sy0, sx1, sy1, dx0, dy0, w, h, y;
+ 
+ 	if (!srv || !srv-&gt;framebuffer || (sdx == 0 &amp;&amp; sdy == 0))
+ 		return;
+ 
+-	/* Source rect on screen, then destination = source + delta. */
+ 	sx0 = x0;
+ 	sy0 = y0;
+ 	sx1 = x1;
+@@ -954,18 +959,10 @@ static void fb_copy_rect_delta(struct ServerState *srv,
+ 
+ 	dx0 = sx0 + sdx;
+ 	dy0 = sy0 + sdy;
+-	dx1 = sx1 + sdx;
+-	dy1 = sy1 + sdy;
+-	if (!clip_to_display(srv, &amp;dx0, &amp;dy0, &amp;dx1, &amp;dy1))
+-		return;
+-
+-	/* Intersect by size after independent clips: align to the overlapping
+-	 * translation that still fits both rects. */
+ 	{
+-		int max_sx0 = sx0;
+-		int max_sy0 = sy0;
+-		int min_sx1 = sx1;
+-		int min_sy1 = sy1;
++		int dx1 = sx1 + sdx, dy1 = sy1 + sdy;
++		int max_sx0 = sx0, max_sy0 = sy0, min_sx1 = sx1, min_sy1 = sy1;
++		if (dx0 &gt; max_sx0 + sdx) { /* keep for clarity */ }
+ 		if (dx0 - sdx &gt; max_sx0)
+ 			max_sx0 = dx0 - sdx;
+ 		if (dy0 - sdy &gt; max_sy0)
+@@ -974,6 +971,19 @@ static void fb_copy_rect_delta(struct ServerState *srv,
+ 			min_sx1 = dx1 - sdx;
+ 		if (dy1 - sdy &lt; min_sy1)
+ 			min_sy1 = dy1 - sdy;
++		/* Also clip dest into display */
++		if (dx0 &lt; 0) {
++			max_sx0 += -dx0;
++			dx0 = 0;
++		}
++		if (dy0 &lt; 0) {
++			max_sy0 += -dy0;
++			dy0 = 0;
++		}
++		if (dx0 + (min_sx1 - max_sx0) &gt; (int)srv-&gt;display_w)
++			min_sx1 = max_sx0 + ((int)srv-&gt;display_w - dx0);
++		if (dy0 + (min_sy1 - max_sy0) &gt; (int)srv-&gt;display_h)
++			min_sy1 = max_sy0 + ((int)srv-&gt;display_h - dy0);
+ 		sx0 = max_sx0;
+ 		sy0 = max_sy0;
+ 		sx1 = min_sx1;
+@@ -990,7 +1000,6 @@ static void fb_copy_rect_delta(struct ServerState *srv,
+ 	sp = display_stride_px(srv);
+ 
+ 	if (sdy &gt; 0 || (sdy == 0 &amp;&amp; sdx &gt; 0)) {
+-		/* Copy bottom→top / right→left so we do not overwrite source. */
+ 		for (y = h - 1; y &gt;= 0; y--) {
+ 			uint32_t *src = fb + (sy0 + y) * (int)sp + sx0;
+ 			uint32_t *dst = fb + (dy0 + y) * (int)sp + dx0;
+@@ -1005,15 +1014,6 @@ static void fb_copy_rect_delta(struct ServerState *srv,
+ 	}
+ }
+ 
+-/* Composite everything from `behind` into a rect, clipped to the display. */
+-static void composite_behind_rect(struct ServerState *srv, struct Client *behind,
+-                                  int x0, int y0, int x1, int y1)
+-{
+-	if (!clip_to_display(srv, &amp;x0, &amp;y0, &amp;x1, &amp;y1))
+-		return;
+-	composite_chain_to_rect(srv, behind, x0, y0, x1, y1);
+-}
+-
+ void redraw_all(struct ServerState* srv) {
+ 	if (!srv || !srv-&gt;framebuffer)
+ 		return;
+@@ -1165,90 +1165,96 @@ void draw(struct ServerState* srv, struct Client cli) {
+ 
+ /*
+  * Move a client on screen by (wdx, wdy) world pixels.
+- * `c` is still at the old position when this is called.
++ * `c` is still at the old position; caller updates x/y after.
+  *
+- * Same strategy as pan: reposition pixels already on the framebuffer,
+- * then only composite what was revealed (old rect minus new).  Clients
+- * behind (c.next) are redrawn only in those exposed strips.  Finally the
+- * window is blitted at the new position so partial off-screen / zoom cases
+- * stay correct.  Caller updates c-&gt;x/y afterward (and should not draw()).
++ * Fast path: FB scroll + L-shaped expose (classic).  sdx/sdy from actual
++ * screen bounds so strips match.  Then blit window from buffer at new pos.
++ * If screen size changed (odd zoom), fall back to union recompose.
+  */
+-void redraw_region(struct ServerState* srv, struct Client c, int wdx, int wdy) {
++void redraw_region(struct ServerState* srv, struct Client* c, int wdx, int wdy) {
+ 	struct Client moved;
++	struct Client* p;
+ 	int ox0, oy0, ox1, oy1;
+ 	int nx0, ny0, nx1, ny1;
+ 	int sdx, sdy;
+-	float z;
++	int ow, oh, nw, nh;
++	int ux0, uy0, ux1, uy1;
+ 
+-	if (!srv || !srv-&gt;framebuffer) {
++	if (!srv || !srv-&gt;framebuffer || !c) {
+ 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
+ 		return;
+ 	}
+-
+ 	if (wdx == 0 &amp;&amp; wdy == 0)
+ 		return;
+ 
+-	client_screen_bounds(srv, &amp;c, &amp;ox0, &amp;oy0, &amp;ox1, &amp;oy1);
+-
+-	moved = c;
+-	moved.x = (uint32_t)((int)c.x + wdx);
+-	moved.y = (uint32_t)((int)c.y + wdy);
++	client_screen_bounds(srv, c, &amp;ox0, &amp;oy0, &amp;ox1, &amp;oy1);
++	moved = *c;
++	moved.x = (uint32_t)((int)c-&gt;x + wdx);
++	moved.y = (uint32_t)((int)c-&gt;y + wdy);
+ 	client_screen_bounds(srv, &amp;moved, &amp;nx0, &amp;ny0, &amp;nx1, &amp;ny1);
+ 
+-	z = srv-&gt;zoom &gt; 0.0f ? srv-&gt;zoom : 1.0f;
+-	/* Integer screen shift of the window content. */
+-	sdx = (int)lroundf((float)wdx * z);
+-	sdy = (int)lroundf((float)wdy * z);
+-
++	sdx = nx0 - ox0;
++	sdy = ny0 - oy0;
+ 	if (sdx == 0 &amp;&amp; sdy == 0)
+ 		return;
+ 
+-	/* Lift cursor before copying FB pixels; caller repositions with set_cursor_pos. */
++	ow = ox1 - ox0;
++	oh = oy1 - oy0;
++	nw = nx1 - nx0;
++	nh = ny1 - ny0;
++
+ 	cursor_restore();
+ 
+-	/*
+-	 * 1) Slide the window's existing pixels to the new place (overlap-safe).
+-	 *    Uses the old on-screen rect as the source.
+-	 */
+-	fb_copy_rect_delta(srv, ox0, oy0, ox1, oy1, sdx, sdy);
++	if (ow == nw &amp;&amp; oh == nh) {
++		/* L-shape: scroll body, fill exposed strips only. */
++		fb_copy_rect_delta(srv, ox0, oy0, ox1, oy1, sdx, sdy);
++
++		if (sdx &gt; 0) {
++			int ex1 = ox0 + sdx;
++			if (ex1 &gt; ox1)
++				ex1 = ox1;
++			composite_behind_rect(srv, c-&gt;next, ox0, oy0, ex1, oy1);
++		} else if (sdx &lt; 0) {
++			int ex0 = ox1 + sdx;
++			if (ex0 &lt; ox0)
++				ex0 = ox0;
++			composite_behind_rect(srv, c-&gt;next, ex0, oy0, ox1, oy1);
++		}
++		if (sdy &gt; 0) {
++			int ey1 = oy0 + sdy;
++			if (ey1 &gt; oy1)
++				ey1 = oy1;
++			composite_behind_rect(srv, c-&gt;next, ox0, oy0, ox1, ey1);
++		} else if (sdy &lt; 0) {
++			int ey0 = oy1 + sdy;
++			if (ey0 &lt; oy0)
++				ey0 = oy0;
++			composite_behind_rect(srv, c-&gt;next, ox0, ey0, ox1, oy1);
++		}
+ 
+-	/*
+-	 * 2) Reveal what was under the old footprint: old − new.
+-	 *    For a pure translation this is at most an L-shape (two strips),
+-	 *    always clipped to the old rect so a large jump cannot paint into
+-	 *    the new window area.  c.next = windows behind + background.
+-	 */
+-	if (sdx &gt; 0) {
+-		int ex1 = ox0 + sdx;
+-		if (ex1 &gt; ox1)
+-			ex1 = ox1;
+-		composite_behind_rect(srv, c.next, ox0, oy0, ex1, oy1);
+-	} else if (sdx &lt; 0) {
+-		int ex0 = ox1 + sdx;
+-		if (ex0 &lt; ox0)
+-			ex0 = ox0;
+-		composite_behind_rect(srv, c.next, ex0, oy0, ox1, oy1);
+-	}
+-	if (sdy &gt; 0) {
+-		int ey1 = oy0 + sdy;
+-		if (ey1 &gt; oy1)
+-			ey1 = oy1;
+-		composite_behind_rect(srv, c.next, ox0, oy0, ox1, ey1);
+-	} else if (sdy &lt; 0) {
+-		int ey0 = oy1 + sdy;
+-		if (ey0 &lt; oy0)
+-			ey0 = oy0;
+-		composite_behind_rect(srv, c.next, ox0, ey0, ox1, oy1);
++		{
++			int bx0 = nx0, by0 = ny0, bx1 = nx1, by1 = ny1;
++			if (clip_to_display(srv, &amp;bx0, &amp;by0, &amp;bx1, &amp;by1))
++				blit_client_overlap(srv, &amp;moved, bx0, by0, bx1, by1);
++		}
++	} else {
++		ux0 = ox0 &lt; nx0 ? ox0 : nx0;
++		uy0 = oy0 &lt; ny0 ? oy0 : ny0;
++		ux1 = ox1 &gt; nx1 ? ox1 : nx1;
++		uy1 = oy1 &gt; ny1 ? oy1 : ny1;
++		if (clip_to_display(srv, &amp;ux0, &amp;uy0, &amp;ux1, &amp;uy1)) {
++			composite_chain_to_rect(srv, c-&gt;next, ux0, uy0, ux1, uy1);
++			blit_client_overlap(srv, &amp;moved, ux0, uy0, ux1, uy1);
++		}
+ 	}
+ 
+-	/*
+-	 * 3) Ensure the new rect shows this client (covers partial visibility,
+-	 *    zoom≠1, and any strip that scrolled in from off-screen).
+-	 */
+-	{
+-		int bx0 = nx0, by0 = ny0, bx1 = nx1, by1 = ny1;
+-		if (clip_to_display(srv, &amp;bx0, &amp;by0, &amp;bx1, &amp;by1))
+-			blit_client_overlap(srv, &amp;moved, bx0, by0, bx1, by1);
++	ux0 = ox0 &lt; nx0 ? ox0 : nx0;
++	uy0 = oy0 &lt; ny0 ? oy0 : ny0;
++	ux1 = ox1 &gt; nx1 ? ox1 : nx1;
++	uy1 = oy1 &gt; ny1 ? oy1 : ny1;
++	if (clip_to_display(srv, &amp;ux0, &amp;uy0, &amp;ux1, &amp;uy1)) {
++		for (p = srv-&gt;clients; p &amp;&amp; p != c; p = p-&gt;next)
++			blit_client_overlap(srv, p, ux0, uy0, ux1, uy1);
+ 	}
+ }
+ 
+diff --git a/input.c b/input.c
+index ec95e42..e3070d8 100644
+--- a/input.c
++++ b/input.c
+@@ -148,13 +148,19 @@ struct Client* pick_client(int x, int y) {
+ 	return (picked &amp;&amp; picked-&gt;z &gt; 0) ? picked : NULL; /* skip background */
+ }
+ 
+-/* Convert a screen-pixel delta to an integer world-pixel delta, with
+- * fractional accumulation so slow drags still move at high zoom. */
+-static void screen_delta_to_world(float sdx, float sdy, float* acc_x, float* acc_y,
++/*
++ * Screen-pixel mouse delta → integer world delta.
++ *   world += mouse * speed / zoom
++ * so on-screen motion ≈ mouse * speed at any zoom (relative speed constant).
++ * Fractional remainder is accumulated for smooth slow drags.
++ */
++static void screen_delta_to_world(float sdx, float sdy, float speed,
++                                  float* acc_x, float* acc_y,
+                                   int* wdx, int* wdy) {
+ 	float z = server.zoom &gt; 0.0f ? server.zoom : 1.0f;
+-	*acc_x += sdx / z;
+-	*acc_y += sdy / z;
++	float s = speed &gt; 0.0f ? speed : 1.0f;
++	*acc_x += sdx * s / z;
++	*acc_y += sdy * s / z;
+ 	*wdx = (int)truncf(*acc_x);
+ 	*wdy = (int)truncf(*acc_y);
+ 	*acc_x -= (float)*wdx;
+@@ -775,12 +781,13 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			switch (drag.type) {
+ 			case DRAG_PAN: {
+ 				float z = server.zoom &gt; 0.0f ? server.zoom : 1.0f;
++				float s = config.pan_speed &gt; 0.0f ? config.pan_speed : 1.0f;
+ 				float old_px = server.pan_x;
+ 				float old_py = server.pan_y;
+-				server.pan_x -= (float)dx / z;
+-				server.pan_y -= (float)dy / z;
++				/* Same relative on-screen speed as window move. */
++				server.pan_x -= (float)dx * s / z;
++				server.pan_y -= (float)dy * s / z;
+ 				clamp_viewport(&amp;server);
+-				/* Scroll scene (cursor lifted); re-paint at mouse. */
+ 				redraw_pan(&amp;server, old_px, old_py);
+ 				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				break;
+@@ -791,9 +798,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 					return 1;
+ 				int wdx, wdy;
+ 				screen_delta_to_world((float)dx, (float)dy,
++				                     config.move_speed,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				if (wdx || wdy) {
+-					redraw_region(&amp;server, *c, wdx, wdy);
++					redraw_region(&amp;server, c, wdx, wdy);
+ 					c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
+ 					c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
+ 				}
+@@ -803,10 +811,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			case DRAG_RESIZE: {
+ 				int wdx, wdy;
+ 				screen_delta_to_world((float)dx, (float)dy,
++				                     config.move_speed,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				drag.dx += wdx;
+ 				drag.dy += wdy;
+-				/* Keep cursor on top of the live drag. */
+ 				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				break;
+ 			}
+@@ -866,10 +874,11 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			switch (drag.type) {
+ 			case DRAG_PAN: {
+ 				float z = server.zoom &gt; 0.0f ? server.zoom : 1.0f;
++				float s = config.pan_speed &gt; 0.0f ? config.pan_speed : 1.0f;
+ 				float old_px = server.pan_x;
+ 				float old_py = server.pan_y;
+-				server.pan_x -= (float)dx / z;
+-				server.pan_y -= (float)dy / z;
++				server.pan_x -= (float)dx * s / z;
++				server.pan_y -= (float)dy * s / z;
+ 				clamp_viewport(&amp;server);
+ 				redraw_pan(&amp;server, old_px, old_py);
+ 				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+@@ -881,9 +890,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 					return 1;
+ 				int wdx, wdy;
+ 				screen_delta_to_world((float)dx, (float)dy,
++				                     config.move_speed,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				if (wdx || wdy) {
+-					redraw_region(&amp;server, *c, wdx, wdy);
++					redraw_region(&amp;server, c, wdx, wdy);
+ 					c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
+ 					c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
+ 				}
+@@ -893,6 +903,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			case DRAG_RESIZE: {
+ 				int wdx, wdy;
+ 				screen_delta_to_world((float)dx, (float)dy,
++				                     config.move_speed,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				drag.dx += wdx;
+ 				drag.dy += wdy;
+diff --git a/server.h b/server.h
+index 81e0773..f3f9e38 100644
+--- a/server.h
++++ b/server.h
+@@ -148,6 +148,14 @@ struct config {
+ 	int shortcut_count;
+ 
+ 	struct cursor_theme cursors;
++
++	/*
++	 * Pointer drag feel: screen-pixel mouse delta is scaled by these, then
++	 * by 1/zoom so on-screen pan/move speed stays consistent at any zoom.
++	 * 1.0 = one screen pixel of motion per mouse pixel at zoom 1.
++	 */
++	float move_speed;
++	float pan_speed;
+ };
+ 
+ // Load config file (~/.config/bgce.conf) and apply defaults
+@@ -217,10 +225,10 @@ void draw(struct ServerState* srv, struct Client cli);
+ 
+ /**
+  * Move client on screen by world delta (dx, dy).  `c` is still at the old
+- * position.  Scrolls existing window pixels, composites only the revealed
+- * strips from clients behind c.next, and blits the window at the new place.
++ * position.  Repaints the union of old and new screen rects in stack order
++ * (no FB scroll — avoids 1px edge trails).
+  */
+-void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
++void redraw_region(struct ServerState* srv, struct Client* c, int dx, int dy);
+ 
+ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);
+ 
+</pre>

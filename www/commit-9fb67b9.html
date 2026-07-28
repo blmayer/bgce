@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 9fb67b9</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 9fb67b9
+parent <a href=commit-7e3f610.html>7e3f610</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-12-28T13:56:02-03:00
+
+    fixed build
+
+<a href=tree-9fb67b9.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/bgce.h b/bgce.h
+index f41dd1c..2128c70 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -73,13 +73,21 @@ struct BufferReply {
+ 	uint32_t height;
+ };
+ 
++struct InputEvent {
++       uint32_t code; /* key code or button code */
++       int32_t value; /* press=1, release=0, or delta */
++       int32_t x;     /* optional: for mouse move */
++       int32_t y;     /* optional: for mouse move */
++       struct InputDevice device;
++};
++
+ struct BGCEMessage {
+ 	uint32_t type;
+ 	union {
+ 		struct ServerInfo server_info;
+ 		struct BufferRequest buffer_request;
+ 		struct BufferReply buffer_reply;
+-		struct MoveBufferRequest move_buffer_request;
++		struct MoveRequest move_buffer_request;
+ 		struct InputEvent input_event;
+ 		struct MoveRequest move_request;
+ 	} data;
+diff --git a/loop.c b/loop.c
+index 4b7174c..24f3377 100644
+--- a/loop.c
++++ b/loop.c
+@@ -79,7 +79,7 @@ void* client_thread(void* arg) {
+ 
+ 			// Unmap and unlink the existing buffer: for resize
+ 			if (client-&gt;buffer) {
+-				printf("[BGCE] Client already has a buffer, unmapping.\n",
++				printf("[BGCE] Client already has a buffer, unmapping.\n");
+ 				munmap(client-&gt;buffer, client-&gt;width * client-&gt;height * 4);
+ 				shm_unlink(client-&gt;shm_name);
+ 			}
+</pre>

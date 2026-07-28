@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce ddea799</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit ddea799
+parent <a href=commit-0d63547.html>0d63547</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-08T14:06:34-03:00
+
+    Detach VT keyboard and shortcut children from the console tty.
+
+    KD_GRAPHICS alone still fed keys to the line discipline. Set KDSKBMODE
+    K_OFF (restored on exit) so only /dev/input reaches clients, and point
+    shortcut children at /dev/null after setsid so new apps are not born on
+    the controlling terminal.
+
+<a href=tree-ddea799.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/display.c b/display.c
+index 19b0731..3bb1b53 100644
+--- a/display.c
++++ b/display.c
+@@ -24,6 +24,12 @@ extern struct ServerState server;
+ extern struct config config;
+ 
+ static int vt_fd = -1;
++/* Previous KDSKBMODE so we can restore on exit (KDGKBMODE uses long). */
++static long vt_saved_kbmode = -1;
++#ifndef K_OFF
++/* Disabled keyboard → console (Linux ≥ 2.6.39). */
++#define K_OFF 0x04
++#endif
+ 
+ #if CURSOR_WIDTH != 32 || CURSOR_HEIGHT != 32
+ #error "software cursor blit assumes CURSOR_WIDTH/HEIGHT == 32"
+@@ -482,38 +488,72 @@ void set_cursor_type(enum BGCECursorType type)
+ 
+ 
+ int setup_vt_handling(void) {
+-	/* Try the current tty first, then fall back to /dev/tty0 */
++	/*
++	 * KD_GRAPHICS only stops the *console driver drawing* text.
++	 * Keys still go to the VT line discipline unless we also disable
++	 * keyboard mode (K_OFF).  Without that, getty/shell/new apps on the
++	 * same tty still see keystrokes while bgce reads /dev/input.
++	 */
+ 	vt_fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
+ 	if (vt_fd &lt; 0)
+ 		vt_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
+ 	if (vt_fd &lt; 0) {
+ 		fprintf(stderr, "[BGCE] VT: cannot open tty: %s "
+-		        "(keystrokes will echo on the console)\n",
++		        "(keystrokes may still go to the console)\n",
+ 		        strerror(errno));
+ 		return -1;
+ 	}
+ 
++	vt_saved_kbmode = -1;
++	if (ioctl(vt_fd, KDGKBMODE, &amp;vt_saved_kbmode) &lt; 0) {
++		fprintf(stderr, "[BGCE] VT: KDGKBMODE failed: %s\n",
++		        strerror(errno));
++		vt_saved_kbmode = -1;
++	}
++
+ 	if (ioctl(vt_fd, KDSETMODE, KD_GRAPHICS) &lt; 0) {
+ 		fprintf(stderr, "[BGCE] VT: KDSETMODE KD_GRAPHICS failed: %s "
+-		        "(keystrokes will echo on the console)\n",
++		        "(keystrokes may still go to the console)\n",
+ 		        strerror(errno));
+ 		close(vt_fd);
+ 		vt_fd = -1;
++		vt_saved_kbmode = -1;
+ 		return -1;
+ 	}
+ 
+-	printf("[BGCE] VT: switched to KD_GRAPHICS mode\n");
++	/*
++	 * Silence the VT keyboard: no more cooked input / Ctrl+C / echo for
++	 * processes on this console.  bgce keeps using /dev/input/event*.
++	 */
++	if (ioctl(vt_fd, KDSKBMODE, (long)K_OFF) &lt; 0) {
++		fprintf(stderr, "[BGCE] VT: KDSKBMODE K_OFF failed: %s "
++		        "(keys may still reach the tty)\n",
++		        strerror(errno));
++	} else {
++		printf("[BGCE] VT: KD_GRAPHICS + keyboard off "
++		       "(input via /dev/input only)\n");
++	}
++
+ 	return 0;
+ }
+ 
+ void release_vt(void) {
+ 	if (vt_fd &lt; 0)
+ 		return;
++
++	if (vt_saved_kbmode &gt;= 0) {
++		if (ioctl(vt_fd, KDSKBMODE, vt_saved_kbmode) &lt; 0)
++			fprintf(stderr, "[BGCE] VT: restore KDSKBMODE failed: %s\n",
++			        strerror(errno));
++		vt_saved_kbmode = -1;
++	}
++
+ 	if (ioctl(vt_fd, KDSETMODE, KD_TEXT) &lt; 0)
+ 		fprintf(stderr, "[BGCE] VT: KDSETMODE KD_TEXT failed: %s\n",
+ 		        strerror(errno));
+ 	else
+-		printf("[BGCE] VT: restored KD_TEXT mode\n");
++		printf("[BGCE] VT: restored KD_TEXT + keyboard mode\n");
++
+ 	close(vt_fd);
+ 	vt_fd = -1;
+ }
+diff --git a/input.c b/input.c
+index 3f7649d..5a4a49c 100644
+--- a/input.c
++++ b/input.c
+@@ -499,16 +499,23 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			} else if (sc-&gt;type == SHORTCUT_COMMAND) {
+ 				pid_t pid = fork();
+ 				if (pid == 0) {
++					int devnull;
+ 					/*
+-					 * Leave bgce's process group / session.  Otherwise a
+-					 * terminal Ctrl+C delivers SIGINT to every shortcut
+-					 * child as well as the server (kernel process-group
+-					 * broadcast), while bgce only meant to forward a
+-					 * synthetic Ctrl+C to the focused client.
++					 * Detach from bgce's session/tty so the child is not
++					 * a console job: no process-group SIGINT with the
++					 * server, and no stdin/stdout bound to the VT (apps
++					 * would otherwise treat the tty as their terminal).
+ 					 */
+ 					if (setsid() &lt; 0)
+-						/* still try to run; better than _exit */
+ 						(void)setpgid(0, 0);
++					devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
++					if (devnull &gt;= 0) {
++						dup2(devnull, STDIN_FILENO);
++						dup2(devnull, STDOUT_FILENO);
++						dup2(devnull, STDERR_FILENO);
++						if (devnull &gt; STDERR_FILENO)
++							close(devnull);
++					}
+ 					signal(SIGINT, SIG_DFL);
+ 					signal(SIGTERM, SIG_DFL);
+ 					execl("/bin/sh", "sh", "-c", sc-&gt;value, (char *)NULL);
+</pre>

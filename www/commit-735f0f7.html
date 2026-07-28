@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 735f0f7</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 735f0f7
+parent <a href=commit-03c99b3.html>03c99b3</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-11-29T08:48:06-03:00
+
+    WIP: adding resize support
+
+<a href=tree-735f0f7.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/bgce.h b/bgce.h
+index 1e5711b..d3894f2 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -63,6 +63,7 @@ struct MoveBufferRequest {
+ };
+ 
+ struct BufferReply {
++	int status; // 0 for success, -1 for failure
+ 	char shm_name[64];
+ 	uint32_t width;
+ 	uint32_t height;
+diff --git a/display.c b/display.c
+index 92f69af..0c57eaa 100644
+--- a/display.c
++++ b/display.c
+@@ -394,17 +394,17 @@ void draw(struct ServerState* srv, struct Client cli) {
+ /*
+  * The situation:
+  *
+- *                         . (x,y)
+- *                         +----------------+
+- *                         |     rect A     | dy
+- *                         +----+-----------+----+
+- *                         |    |                |
+- *                         |    |                |
+- *                         |    |                |
+- *                         |  B |                |
+- *                         +----+                |
+- *                           dx |                |
+- *                              +----------------+
++ *     . (x,y)
++ *     +----------------+
++ *     |     rect A     | dy
++ *     +----+-----------+----+
++ *     |    |                |
++ *     |    |                |
++ *     |    |                |
++ *     |  B |                |
++ *     +----+                |
++ *       dx |                |
++ *          +----------------+
+  *
+  * So we redraw the rectangles:
+  * A: (x, y) (x+width, y+dy) and
+@@ -526,5 +526,5 @@ void release_display(void) {
+ 		drmModeFreeEncoder(encoder);
+ 
+ 	close(drm_fd);
+-	printf("Done, cleaned up.\n");
++	printf("[BGCE] Display released.\n");
+ }
+diff --git a/input.c b/input.c
+index 13ec77f..685d703 100644
+--- a/input.c
++++ b/input.c
+@@ -29,12 +29,7 @@ struct {
+ 	struct Client* target;
+ 	int start_mouse_x;
+ 	int start_mouse_y;
+-	uint32_t start_win_x;
+-	uint32_t start_win_y;
+-	uint32_t start_win_width;
+-	uint32_t start_win_height;
+ 	enum {
+-		DRAG_NONE,
+ 		DRAG_MOVE,
+ 		DRAG_RESIZE
+ 	} type;
+@@ -42,6 +37,44 @@ struct {
+ 
+ extern struct ServerState server;
+ 
++void resize_buffer(struct Client* c) {
++	// for resize we must reallocate the buffer
++	// Unmap and unlink old buffer
++	if (c-&gt;buffer) {
++		munmap(c-&gt;buffer, c-&gt;width * c-&gt;height * BGCE_BYTES_PER_PIXEL);
++		shm_unlink(c-&gt;shm_name);
++	}
++
++	// Create new shared memory name and object
++	snprintf(c-&gt;shm_name, sizeof(c-&gt;shm_name),
++	         "/bgce_buf_%d_%ld", getpid(), time(NULL));
++	int shm_fd = shm_open(c-&gt;shm_name, O_CREAT | O_RDWR, 0600);
++	if (shm_fd &lt; 0) {
++		perror("shm_open for resize");
++		bgce_send_msg(client_fd, &amp;msg);
++		break;
++	}
++
++	size_t buf_size = req.width * req.height * BGCE_BYTES_PER_PIXEL;
++	if (ftruncate(shm_fd, buf_size) &lt; 0) {
++		perror("ftruncate for resize");
++		close(shm_fd);
++		bgce_send_msg(client_fd, &amp;msg);
++		break;
++	}
++
++	c-&gt;buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++	if (c-&gt;buffer == MAP_FAILED) {
++		perror("mmap for resize");
++		close(shm_fd);
++		bgce_send_msg(client_fd, &amp;msg);
++		break;
++	}
++	c-&gt;width = req.width;
++	c-&gt;height = req.height;
++	close(shm_fd);
++}
++
+ struct Client* pick_client(int x, int y) {
+ 	// Iterate through clients to find the topmost client under the cursor
+ 	struct Client* c = server.clients;
+@@ -54,12 +87,12 @@ struct Client* pick_client(int x, int y) {
+ 		}
+ 		c = c-&gt;next;
+ 	}
+-	return picked;
++	return picked-&gt;z &gt; 0 ? picked : NULL; // avoid getting the background
+ }
+ 
+ int init_input(void) {
+ 	count = 0;
+-	drag.type = DRAG_NONE;
++	drag.active = 0;
+ 	mouse_x = server.display_w / 2;
+ 	mouse_y = server.display_h / 2;
+ 
+@@ -168,68 +201,70 @@ static int handle_input_event(struct input_event ev) {
+ 			alt_down = 0;
+ 		}
+ 
+-		// Stop drag on button release
+-		if (((ev.code == BTN_LEFT &amp;&amp; drag.type == DRAG_MOVE) ||
+-		     (ev.code == BTN_RIGHT &amp;&amp; drag.type == DRAG_RESIZE)) &amp;&amp;
+-		    drag.active) { // Only stop if it was an active drag of that type
++		// Stop drag/move on button release
++		if ((ev.code == BTN_LEFT || ev.code == BTN_RIGHT) &amp;&amp; drag.active) { // Only stop if it was an active drag of that type
+ 			printf("[BGCE] End of drag event.\n");
++			struct Client* c = drag.target;
+ 			drag.active = 0;
+ 			drag.target = NULL;
+-			drag.type = DRAG_NONE;
++
++			if (drag.type == DRAG_RESIZE) {
++				int resize_client(c);
++			}
+ 			return 1;
+ 		}
+ 	}
+ 
+-	if (ev.type == EV_KEY &amp;&amp; ev.code == BTN_LEFT &amp;&amp; ev.value == 1) {
++	if (ev.type == EV_KEY &amp;&amp; (ev.code == BTN_LEFT || ev.code == BTN_RIGHT) &amp;&amp; ev.value == 1) {
+ 		int mx = mouse_x;
+ 		int my = mouse_y;
+-		printf("[BGCE] Left click detected at (%d, %d).\n", mx, my);
+-	}
+-	if (ev.type == EV_KEY &amp;&amp; ev.code == BTN_LEFT &amp;&amp;
+-	    ev.value == 1 &amp;&amp; alt_down == 1) { // Alt + Left click down
+-		int mx = mouse_x;
+-		int my = mouse_y;
+-		printf("[BGCE] Alt + Left click detected at (%d, %d).\n", mx, my);
++		printf("[BGCE] Click detected at (%d, %d).\n", mx, my);
+ 
++		// switch focuse
+ 		struct Client* c = pick_client(mx, my);
+-		if (c) {
+-			printf("[BGCE] Left click detected at client %s.\n", c-&gt;shm_name);
+-			server.focused_client = c;
+-			drag.active = 1;
+-			drag.target = c;
+-			drag.start_mouse_x = mx;
+-			drag.start_mouse_y = my;
+-			drag.start_win_x = c-&gt;x;
+-			drag.start_win_y = c-&gt;y;
+-			drag.start_win_width = c-&gt;width;
+-			drag.start_win_height = c-&gt;height;
+-			drag.type = DRAG_MOVE;
+-			printf("[BGCE] Starting move event.\n");
+-			return 1;
++		if (!c) {
++			return 0;
+ 		}
+-	}
+ 
+-	if (ev.type == EV_KEY &amp;&amp; ev.code == BTN_RIGHT &amp;&amp;
+-	    ev.value == 1 &amp;&amp; alt_down) { // Alt + Right click down
+-		int mx = mouse_x;
+-		int my = mouse_y;
++		if (c != server.focused_client) {
++			printf("[BGCE] Click detected at client %s.\n", c-&gt;shm_name);
+ 
+-		struct Client* c = pick_client(mx, my);
+-		if (!c) {
+-			printf("[BGCE] No client found at (%d, %d).\n", mx, my);
+-			return 1;
++			// If the clicked client is not already the first, move it
++			if (c != server.clients) {
++				struct Client* prev = server.clients;
++				while (prev &amp;&amp; prev-&gt;next != c) {
++					prev = prev-&gt;next;
++				}
++				if (prev) {
++					prev-&gt;next = c-&gt;next;
++					c-&gt;next = server.clients;
++					server.clients = c;
++				}
++			}
++			c-&gt;z = server.focused_client-&gt;z + 1;
++			server.focused_client = c;
++			draw(&amp;server, *c);
++			printf("[BGCE] Client focused.\n");
+ 		}
+-		server.focused_client = c;
+-		drag.active = 1;
+-		drag.target = c;
++
++		if (!alt_down) {
++			return 0; // Alt + Left click down
++		}
++
++		printf("[BGCE] Alt is pressed, starting move/resize.\n");
+ 		drag.start_mouse_x = mx;
+ 		drag.start_mouse_y = my;
+-		drag.start_win_x = c-&gt;x;
+-		drag.start_win_y = c-&gt;y;
+-		drag.start_win_width = c-&gt;width;
+-		drag.start_win_height = c-&gt;height;
+-		drag.type = DRAG_RESIZE;
+-		printf("[BGCE] resize event.\n");
++		drag.active = 1;
++		drag.target = c;
++
++		if (ev.code == BTN_RIGHT) {
++			drag.type = DRAG_RESIZE;
++			printf("[BGCE] Resize event.\n");
++		} else {
++			drag.type = DRAG_MOVE;
++			printf("[BGCE] Move event.\n");
++		}
++
+ 		return 1;
+ 	}
+ 
+@@ -255,28 +290,45 @@ static int handle_input_event(struct input_event ev) {
+ 		        mouse_x,
+ 		        mouse_y);
+ 
+-		if (drag.active &amp;&amp; drag.type == DRAG_MOVE) {
++		if (drag.active) {
+ 			int dx = mouse_x - drag.start_mouse_x;
+ 			int dy = mouse_y - drag.start_mouse_y;
+ 			drag.start_mouse_x = mouse_x;
+ 			drag.start_mouse_y = mouse_y;
+-			printf("[BGCE] Draging client: dx=%d, dy=%d\n", dx, dy);
+-
+ 			struct Client* c = drag.target;
+ 			if (!c) {
+ 				printf("[BGCE] No client to drag\n");
+ 				return 1; // Should not happen
+ 			}
+ 
+-			// Redraw the old region before moving
+-			redraw_region(&amp;server, *c, dx, dy);
++			switch (drag.type) {
++			case DRAG_MOVE:
++				// if moving, redraw old region.
++				if (drag.type == DRAG_MOVE) {
++					redraw_region(&amp;server, *c, dx, dy);
++				}
+ 
+-			// Update client's position
+-			c-&gt;x = c-&gt;x + dx;
+-			c-&gt;y = c-&gt;y + dy;
+-			draw(&amp;server, *c);
+-			return 1;
++				// Update client's position
++				c-&gt;x = c-&gt;x + dx;
++				c-&gt;y = c-&gt;y + dy;
++				draw(&amp;server, *c);
++				break;
++
++			case DRAG_RESIZE:
++				// Calculate new width and height
++				c-&gt;width += dx;
++				c-&gt;height += dy;
++
++				// Enforce minimum size
++				if (c-&gt;width &lt; 10)
++					new_width = 10;
++				if (c-&gt;height &lt; 10)
++					new_height = 10;
++
++				break;
++			}
+ 		}
++		return 1;
+ 	}
+ 
+ 	// This means nothing was handled
+diff --git a/server.c b/server.c
+index 38060a8..03c2a65 100644
+--- a/server.c
++++ b/server.c
+@@ -16,8 +16,13 @@ struct ServerState server = {}; /* Global server state */
+ /* Cleanup on Ctrl+C */
+ static void handle_sigint(int sig) {
+ 	(void)sig;
++	printf("[BGCE] Got sigint, shutting down.\n");
++
+ 	unlink(SOCKET_PATH);
++	release_display();
++	free(server.framebuffer);
+ 	printf("\n[BGCE] Server terminated.\n");
++	
+ 	exit(0);
+ }
+ 
+@@ -70,7 +75,7 @@ int main(void) {
+ 	struct Client background_client;
+ 	background_client.x = 0;
+ 	background_client.y = 0;
+-	background_client.z = -1; // Special case
++	background_client.z = 0; // Special case
+ 	background_client.width = server.display_w;
+ 	background_client.height = server.display_h;
+ 	background_client.buffer = malloc(server.display_w * server.display_h * 4);
+</pre>

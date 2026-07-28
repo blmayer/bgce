@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce f6362a6</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit f6362a6
+parent <a href=commit-e5ff961.html>e5ff961</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-06T16:06:57-03:00
+
+    Keep server alive on client crash; timestamp log lines.
+
+    Ignore SIGPIPE, clean up focus/drag and redraw when a client drops,
+    and route stdout/stderr through a writer that prefixes each log line
+    with a local timestamp.
+
+<a href=tree-f6362a6.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/README.md b/README.md
+index 988dd9f..2810022 100644
+--- a/README.md
++++ b/README.md
+@@ -135,7 +135,7 @@ All server messages are written to a default log file:
+ - `$XDG_CACHE_HOME/bgce/bgce.log` (if `XDG_CACHE_HOME` is set)
+ - otherwise `~/.cache/bgce/bgce.log`
+ 
+-The path is printed to the terminal you used to start `bgce` so you know where to look (`tail -f` it, etc.). All `[BGCE]` output after that point goes into the log file.
++The path is printed to the terminal you used to start `bgce` so you know where to look (`tail -f` it, etc.). All server stdout/stderr after that point goes into the log file, with each line prefixed by a local timestamp (`YYYY-MM-DD HH:MM:SS.mmm`).
+ 
+ 
+ ### Config File Format
+diff --git a/input.c b/input.c
+index 6ba9393..1ca97da 100644
+--- a/input.c
++++ b/input.c
+@@ -167,6 +167,22 @@ static void apply_zoom_at_cursor(float factor) {
+ 	       server.zoom, server.pan_x, server.pan_y);
+ }
+ 
++void client_disconnected(struct Client* c)
++{
++	if (!c)
++		return;
++	if (drag.active &amp;&amp; drag.target == c) {
++		drag.active = 0;
++		drag.target = NULL;
++		drag.dx = 0;
++		drag.dy = 0;
++		drag.acc_x = 0;
++		drag.acc_y = 0;
++		set_cursor_type(BGCE_CURSOR_DEFAULT);
++		printf("[BGCE] Drag cancelled (client disconnected).\n");
++	}
++}
++
+ int init_input(void) {
+ 	count = 0;
+ 	drag.active = 0;
+diff --git a/libbgce.c b/libbgce.c
+index 8118390..34676f6 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -194,7 +194,9 @@ ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg) {
+ 
+ 	ssize_t n = write(conn, msg, size);
+ 	if (n &lt; 0) {
+-		if (errno == EINTR)
++		/* EPIPE/ECONNRESET: peer gone — caller should drop the client.
++		 * With SIGPIPE ignored on the server, this is a normal path. */
++		if (errno != EPIPE &amp;&amp; errno != ECONNRESET &amp;&amp; errno != EINTR)
+ 			perror("[BGCE] write");
+ 		return -1;
+ 	}
+diff --git a/loop.c b/loop.c
+index 622dbc0..f4eba04 100644
+--- a/loop.c
++++ b/loop.c
+@@ -27,6 +27,14 @@ void* client_thread(void* arg) {
+ 
+ 	client-&gt;fd = client_fd;
+ 
++	/* Background client is always first; keep the list non-empty. */
++	if (!server.clients) {
++		fprintf(stderr, "[BGCE] no client list (missing background); dropping connection\n");
++		close(client_fd);
++		free(client);
++		return NULL;
++	}
++
+ 	// Add client to the linked list
+ 	client-&gt;next = server.clients;
+ 	client-&gt;z = server.clients-&gt;z + 1;
+@@ -48,6 +56,7 @@ void* client_thread(void* arg) {
+ 		struct BGCEMessage msg;
+ 		ssize_t rc = bgce_recv_msg(client_fd, &amp;msg);
+ 		if (rc &lt;= 0) {
++			/* Crash, exit, or clean close — never tear down the server. */
+ 			printf("[BGCE] Client disconnected (fd=%d)\n", client_fd);
+ 			break;
+ 		}
+@@ -203,6 +212,9 @@ void* client_thread(void* arg) {
+ 		}
+ 	}
+ 
++	/* Stop any in-progress drag that targets this client (UAF otherwise). */
++	client_disconnected(client);
++
+ 	if (client-&gt;buffer) {
+ 		munmap(client-&gt;buffer, client-&gt;width * client-&gt;height * 4);
+ 		client-&gt;buffer = NULL;
+@@ -210,7 +222,7 @@ void* client_thread(void* arg) {
+ 		client-&gt;shm_name[0] = '\0';
+ 	}
+ 
+-	// Remove client from the linked list
++	// Remove client from the linked list (never drop the background client)
+ 	struct Client* prev = NULL;
+ 	struct Client* curr = server.clients;
+ 	while (curr) {
+@@ -218,6 +230,7 @@ void* client_thread(void* arg) {
+ 			if (prev) {
+ 				prev-&gt;next = curr-&gt;next;
+ 			} else {
++				/* Head is a real client; next should be background or another. */
+ 				server.clients = curr-&gt;next;
+ 			}
+ 			break;
+@@ -227,16 +240,17 @@ void* client_thread(void* arg) {
+ 	}
+ 
+ 	if (server.focused_client == client) {
+-		/* notify focused client it lost focus before we clear */
+-		struct BGCEMessage lost = {0};
+-		lost.type = MSG_FOCUS_CHANGE;
+-		lost.data.focus_event.state = 0;
+-		bgce_send_msg(client-&gt;fd, &amp;lost);
++		/* Socket is already dead — do not write a focus-lost message. */
+ 		server.focused_client = NULL;
+ 	}
+-	close(client-&gt;fd);
+ 
+-	printf("[BGCE] Thread exiting for client fd=%d\n", client-&gt;fd);
++	close(client_fd);
++	client-&gt;fd = -1;
++
++	/* Erase the window from the display; safe with only the background left. */
++	redraw_all(&amp;server);
++
++	printf("[BGCE] Client thread finished (fd=%d); server still running\n", client_fd);
+ 	free(client);
+ 	return NULL;
+ }
+diff --git a/server.c b/server.c
+index 1d52ed1..2eee958 100644
+--- a/server.c
++++ b/server.c
+@@ -5,12 +5,14 @@
+ #include &lt;fcntl.h&gt;
+ #include &lt;pthread.h&gt;
+ #include &lt;signal.h&gt;
++#include &lt;stdint.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+ #include &lt;sys/socket.h&gt;
+ #include &lt;sys/stat.h&gt;
+ #include &lt;sys/un.h&gt;
++#include &lt;time.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+ struct ServerState server = {}; /* Global server state */
+@@ -25,6 +27,50 @@ static void ensure_dir(const char *path) {
+ }
+ 
+ static char listen_sock_path[BGCE_SOCKPATH_MAX];
++static char log_file_path[512];
++
++/* Read lines from a pipe and append them to the log with timestamps. */
++static void *log_timestamp_thread(void *arg)
++{
++	int rfd = (int)(intptr_t)arg;
++	int out_fd;
++	FILE *in;
++	char line[8192];
++
++	out_fd = open(log_file_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
++	if (out_fd &lt; 0) {
++		close(rfd);
++		return NULL;
++	}
++
++	in = fdopen(rfd, "r");
++	if (!in) {
++		close(rfd);
++		close(out_fd);
++		return NULL;
++	}
++
++	/* Line-buffered so multi-thread printf interleaving is less chaotic */
++	while (fgets(line, sizeof(line), in)) {
++		struct timespec ts;
++		struct tm tm;
++		char stamp[40];
++
++		if (clock_gettime(CLOCK_REALTIME, &amp;ts) != 0)
++			ts.tv_sec = time(NULL), ts.tv_nsec = 0;
++		if (!localtime_r(&amp;ts.tv_sec, &amp;tm)) {
++			dprintf(out_fd, "%s", line);
++			continue;
++		}
++		/* ISO-like local time with milliseconds */
++		strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &amp;tm);
++		dprintf(out_fd, "%s.%03ld %s", stamp, ts.tv_nsec / 1000000L, line);
++	}
++
++	fclose(in); /* closes rfd */
++	close(out_fd);
++	return NULL;
++}
+ 
+ static void cleanup_and_exit(int sig) {
+ 	(void)sig;
+@@ -42,6 +88,9 @@ static void setup_log_file(void) {
+ 	const char *xdg = getenv("XDG_CACHE_HOME");
+ 	const char *home = getenv("HOME");
+ 	char dir[512];
++	int pipefd[2];
++	pthread_t tid;
++	pthread_attr_t attr;
+ 
+ 	if (xdg &amp;&amp; xdg[0]) {
+ 		snprintf(dir, sizeof(dir), "%s/bgce", xdg);
+@@ -57,31 +106,59 @@ static void setup_log_file(void) {
+ 		return;
+ 	}
+ 
+-	char log_path[512];
+-	snprintf(log_path, sizeof(log_path), "%s/bgce.log", dir);
++	snprintf(log_file_path, sizeof(log_file_path), "%s/bgce.log", dir);
+ 
+-	int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+-	if (fd &lt; 0)
++	/* Tell the user (on their original terminal) where logs are going */
++	dprintf(STDERR_FILENO, "[BGCE] Logging to %s\n", log_file_path);
++
++	if (pipe(pipefd) &lt; 0) {
++		/* Fall back to untimestamped direct log */
++		int fd = open(log_file_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
++		if (fd &gt;= 0) {
++			dup2(fd, STDOUT_FILENO);
++			dup2(fd, STDERR_FILENO);
++			close(fd);
++		}
+ 		return;
++	}
+ 
+-	/* Tell the user (on their original terminal) where logs are going */
+-	dprintf(STDERR_FILENO, "[BGCE] Logging to %s\n", log_path);
++	pthread_attr_init(&amp;attr);
++	pthread_attr_setdetachstate(&amp;attr, PTHREAD_CREATE_DETACHED);
++	if (pthread_create(&amp;tid, &amp;attr, log_timestamp_thread,
++	                   (void *)(intptr_t)pipefd[0]) != 0) {
++		pthread_attr_destroy(&amp;attr);
++		close(pipefd[0]);
++		close(pipefd[1]);
++		int fd = open(log_file_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
++		if (fd &gt;= 0) {
++			dup2(fd, STDOUT_FILENO);
++			dup2(fd, STDERR_FILENO);
++			close(fd);
++		}
++		return;
++	}
++	pthread_attr_destroy(&amp;attr);
+ 
+-	/* Redirect all future stdout/stderr output into the log file */
+-	dup2(fd, STDOUT_FILENO);
+-	dup2(fd, STDERR_FILENO);
+-	close(fd);
++	/* All server printf/fprintf go through the pipe → timestamped log */
++	dup2(pipefd[1], STDOUT_FILENO);
++	dup2(pipefd[1], STDERR_FILENO);
++	close(pipefd[1]);
++	/* pipefd[0] is owned by the log thread */
+ }
+ 
+ int main(void) {
+ 	setup_log_file();
+ 
+-	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
+-	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
++	/* Line-buffered so each log line is timestamped as a unit */
++	setvbuf(stdout, NULL, _IOLBF, 0);
++	setvbuf(stderr, NULL, _IOLBF, 0);
+ 
+ 	/* Auto-reap child processes so command shortcuts don't leave zombies */
+ 	signal(SIGCHLD, SIG_IGN);
+ 
++	/* A crashed client must not take down the server on the next write(). */
++	signal(SIGPIPE, SIG_IGN);
++
+ 	/* Ensure VT is restored on termination signals */
+ 	signal(SIGINT, cleanup_and_exit);
+ 	signal(SIGTERM, cleanup_and_exit);
+diff --git a/server.h b/server.h
+index dc26c0c..214e286 100644
+--- a/server.h
++++ b/server.h
+@@ -209,6 +209,9 @@ int init_input(void);
+ 
+ void* input_loop(void* arg);
+ 
++/** Drop any drag targeting this client (call before freeing it). */
++void client_disconnected(struct Client* c);
++
+ /*
+  * Client related stuff
+  * from loop.c mainly
+</pre>

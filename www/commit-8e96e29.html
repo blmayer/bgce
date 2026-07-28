@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 8e96e29</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 8e96e29
+parent <a href=commit-bcb005a.html>bcb005a</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-14T12:24:40-03:00
+
+    Fix compositor mouse freezes; keep orchestrator from stealing work.
+
+    Drop jobs when the queue is full so input never blocks, present the cursor
+    after each paint job, and update the pointer before submitting drag paint.
+    Orchestrator only enqueues FCFS tasks and waits — workers alone run them.
+
+<a href=tree-8e96e29.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/compositor.c b/compositor.c
+index fada85f..2789ac8 100644
+--- a/compositor.c
++++ b/compositor.c
+@@ -3,10 +3,10 @@
+  *
+  * display.c owns paint algorithms; this file owns when they run and threading.
+  *
+- * Two levels:
+- *   1) Job queue  — DRAW/MOVE/PAN/… consumed by the orchestrator (ordered).
+- *   2) Task queue — fine-grained paint fns; 3 workers grab FCFS (any worker
+- *                   can take underlay or mover work during a MOVE).
++ * Two levels (strict roles):
++ *   1) Job queue  — DRAW/MOVE/PAN/… consumed only by the orchestrator.
++ *   2) Task queue — fine-grained paint fns; only the 3 workers grab FCFS.
++ *      The orchestrator enqueues a batch and waits — it never runs tasks.
+  */
+ 
+ #include "compositor.h"
+@@ -176,6 +176,13 @@ static void run_job(const struct comp_job *job)
+ 	default:
+ 		break;
+ 	}
++
++	/*
++	 * Paint the software cursor here so it is not stuck waiting for the
++	 * input thread to win a race with fb_writing (input only dirties the
++	 * hotspot while a job is in flight).
++	 */
++	display_cursor_present();
+ }
+ 
+ static void *worker_main(void *arg)
+@@ -246,11 +253,10 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
+ 	}
+ 
+ 	/*
+-	 * Push all tasks, then wait.  Workers race to grab them (FCFS);
+-	 * which worker paints L0 vs mover is not fixed.
++	 * Orchestrator only enqueues and waits.  Blit workers alone pull tasks
++	 * FCFS — no work-stealing by the orchestrator (separation of concerns).
+ 	 */
+ 	pthread_mutex_lock(&amp;work_mu);
+-	/* Only one batch at a time (orchestrator is single-threaded). */
+ 	while (tasks_left &gt; 0)
+ 		pthread_cond_wait(&amp;work_done_cv, &amp;work_mu);
+ 
+@@ -259,15 +265,6 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
+ 	for (i = 0; i &lt; 3; i++) {
+ 		if (!fns[i])
+ 			continue;
+-		if (tq_count &gt;= TASK_QUEUE_CAP) {
+-			/* Should not happen with n &lt;= 3; run overflow serial. */
+-			pthread_mutex_unlock(&amp;work_mu);
+-			fns[i](args[i]);
+-			pthread_mutex_lock(&amp;work_mu);
+-			if (tasks_left &gt; 0)
+-				tasks_left--;
+-			continue;
+-		}
+ 		task_q[tq_tail].fn = fns[i];
+ 		task_q[tq_tail].arg = args[i];
+ 		tq_tail = (tq_tail + 1) % TASK_QUEUE_CAP;
+@@ -279,16 +276,28 @@ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
+ 	pthread_mutex_unlock(&amp;work_mu);
+ }
+ 
++/*
++ * Never block the producer (input) on a full queue — that freezes the mouse.
++ * Drop the new job if the queue is saturated (paint may lag; input stays live).
++ */
+ static void enqueue(const struct comp_job *job)
+ {
++	static int drop_log;
++
+ 	if (comp_sync) {
+ 		run_job(job);
+ 		return;
+ 	}
+ 
+ 	pthread_mutex_lock(&amp;q_mu);
+-	while (q_count &gt;= COMP_QUEUE_CAP)
+-		pthread_cond_wait(&amp;q_not_full, &amp;q_mu);
++	if (q_count &gt;= COMP_QUEUE_CAP) {
++		pthread_mutex_unlock(&amp;q_mu);
++		if ((drop_log++ % 64) == 0)
++			fprintf(stderr,
++			        "[BGCE] compositor: queue full, dropping job op=%d\n",
++			        (int)job-&gt;op);
++		return;
++	}
+ 	queue[q_tail] = *job;
+ 	q_tail = (q_tail + 1) % COMP_QUEUE_CAP;
+ 	q_count++;
+diff --git a/input.c b/input.c
+index bbe8599..055456e 100644
+--- a/input.c
++++ b/input.c
+@@ -825,12 +825,13 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 
+ 				if (sp &lt; 1)
+ 					sp = 256;
++				/* Cursor first so a busy compositor never freezes the pointer. */
++				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				/* Integer screen pixels; pan paint is queued. */
+ 				sdx = dx * sp / 256;
+ 				sdy = dy * sp / 256;
+ 				if (sdx || sdy)
+ 					bgce_comp_submit_pan(sdx, sdy);
+-				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				break;
+ 			}
+ 			case DRAG_MOVE: {
+@@ -840,6 +841,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 
+ 				if (!c)
+ 					return 1;
++				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				screen_delta_to_world(dx, dy, config.move_speed,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				if (wdx || wdy) {
+@@ -850,7 +852,6 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 					bgce_comp_submit_move(c-&gt;id, old_x, old_y,
+ 					                      (int)c-&gt;x, (int)c-&gt;y);
+ 				}
+-				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				break;
+ 			}
+ 			case DRAG_RESIZE: {
+@@ -922,11 +923,11 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 
+ 				if (sp &lt; 1)
+ 					sp = 256;
++				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				sdx = dx * sp / 256;
+ 				sdy = dy * sp / 256;
+ 				if (sdx || sdy)
+ 					bgce_comp_submit_pan(sdx, sdy);
+-				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				break;
+ 			}
+ 			case DRAG_MOVE: {
+@@ -936,6 +937,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 
+ 				if (!c)
+ 					return 1;
++				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				screen_delta_to_world(dx, dy, config.move_speed,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				if (wdx || wdy) {
+@@ -946,7 +948,6 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 					bgce_comp_submit_move(c-&gt;id, ox, oy,
+ 					                      (int)c-&gt;x, (int)c-&gt;y);
+ 				}
+-				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				break;
+ 			}
+ 			case DRAG_RESIZE: {
+</pre>

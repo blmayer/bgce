@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 164087a</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 164087a
+parent <a href=commit-30ef0d0.html>30ef0d0</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-08T18:36:56-03:00
+
+    Respect stacking on draw; erase only closed window damage.
+
+    MSG_DRAW recomposes the client stack into that window's screen rect
+    so a redraw no longer raises the client. On disconnect, erase_client
+    repaints only the former footprint instead of redraw_all.
+
+<a href=tree-164087a.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/display.c b/display.c
+index e7ccbe9..426680b 100644
+--- a/display.c
++++ b/display.c
+@@ -1024,6 +1024,22 @@ void redraw_all(struct ServerState* srv) {
+ 	cursor_paint();
+ }
+ 
++void erase_client(struct ServerState* srv, const struct Client* gone) {
++	int sx0, sy0, sx1, sy1;
++
++	if (!srv || !srv-&gt;framebuffer || !gone)
++		return;
++
++	client_screen_bounds(srv, gone, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1);
++	if (!clip_to_display(srv, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1))
++		return;
++
++	cursor_restore();
++	/* Remaining clients only (caller already unlinked `gone`). */
++	composite_chain_to_rect(srv, srv-&gt;clients, sx0, sy0, sx1, sy1);
++	cursor_paint();
++}
++
+ /*
+  * Shift framebuffer pixels by (sdx, sdy) screen pixels.
+  * Positive sdx/sdy move content right/down.
+@@ -1125,30 +1141,25 @@ void redraw_pan(struct ServerState *srv, float old_pan_x, float old_pan_y)
+ }
+ 
+ void draw(struct ServerState* srv, struct Client cli) {
++	int sx0, sy0, sx1, sy1;
++
+ 	if (!srv || !srv-&gt;framebuffer || !cli.buffer) {
+ 		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
+ 		return;
+ 	}
+ 
+-	int sx0, sy0, sx1, sy1;
++	/*
++	 * Recompose the stack into this client's screen footprint only.
++	 * Blitting only `cli` would paint it on top of everyone (raise on
++	 * every MSG_DRAW).  Windows above it stay above; others outside
++	 * the rect are untouched.
++	 */
+ 	client_screen_bounds(srv, &amp;cli, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1);
+-
+-	if (sx0 &lt; 0)
+-		sx0 = 0;
+-	if (sy0 &lt; 0)
+-		sy0 = 0;
+-	if (sx1 &gt; (int)srv-&gt;display_w)
+-		sx1 = (int)srv-&gt;display_w;
+-	if (sy1 &gt; (int)srv-&gt;display_h)
+-		sy1 = (int)srv-&gt;display_h;
+-
+-	if (sx0 &gt;= sx1 || sy0 &gt;= sy1)
++	if (!clip_to_display(srv, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1))
+ 		return;
+ 
+-	/* Must restore before blit: otherwise underlay is stale and the next
+-	 * cursor move leaves a black rectangle at the old position. */
+ 	cursor_restore();
+-	blit_client_overlap(srv, &amp;cli, sx0, sy0, sx1, sy1);
++	composite_chain_to_rect(srv, srv-&gt;clients, sx0, sy0, sx1, sy1);
+ 	cursor_paint();
+ }
+ 
+diff --git a/loop.c b/loop.c
+index c853678..5a7ee8d 100644
+--- a/loop.c
++++ b/loop.c
+@@ -274,8 +274,12 @@ void* client_thread(void* arg) {
+ 	close(client_fd);
+ 	client-&gt;fd = -1;
+ 
+-	/* Erase the window from the display; safe with only the background left. */
+-	redraw_all(&amp;server);
++	/*
++	 * Only repaint the closed window's screen rect from whatever is still
++	 * in the stack (background + windows that sat under / overlapped it).
++	 * Other on-screen clients outside that rect are left alone.
++	 */
++	erase_client(&amp;server, client);
+ 
+ 	printf("[BGCE] Client thread finished (fd=%d); server still running\n", client_fd);
+ 	free(client);
+diff --git a/server.h b/server.h
+index 1a1cdd2..81e0773 100644
+--- a/server.h
++++ b/server.h
+@@ -209,6 +209,10 @@ void display_cursor_refresh(void);
+ 
+ void set_cursor_type(enum BGCECursorType type);
+ 
++/**
++ * Client content changed (MSG_DRAW): recompose the stacking order into
++ * this client's screen rect only.  Does not raise the client.
++ */
+ void draw(struct ServerState* srv, struct Client cli);
+ 
+ /**
+@@ -223,6 +227,13 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
+ /** Full-scene recomposite (used after zoom and other full invalidations). */
+ void redraw_all(struct ServerState* srv);
+ 
++/**
++ * After a client is removed from the list: repaint only its former screen
++ * footprint from the remaining stack (background + windows that were under
++ * or overlapped that rect).  Does not touch the rest of the desktop.
++ */
++void erase_client(struct ServerState* srv, const struct Client* gone);
++
+ /**
+  * Pan: shift pixels already on the framebuffer and only composite the
+  * newly exposed edge(s).  old_pan_* is the viewport origin before the pan
+</pre>

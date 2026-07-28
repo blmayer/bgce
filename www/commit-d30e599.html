@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce d30e599</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit d30e599
+parent <a href=commit-eeca4e4.html>eeca4e4</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-11-24T19:24:05-03:00
+
+    improved client to test more stuff
+
+    - fixed input handling only grabing one device
+
+<a href=tree-d30e599.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/client.c b/client.c
+index 7d99fbc..56e38a5 100644
+--- a/client.c
++++ b/client.c
+@@ -3,6 +3,8 @@
+ #include &lt;linux/input.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;time.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+ int main(void) {
+@@ -28,9 +30,8 @@ int main(void) {
+ 		       info.devices[i].name,
+ 		       info.devices[i].type_mask);
+ 	}
+-
+-	int w = info.width;
+-	int h = info.height;
++	int w = 800;
++	int h = 600;
+ 
+ 	struct BufferRequest req = {.width = w, .height = h};
+ 	uint8_t* buf = bgce_get_buffer(conn, req);
+@@ -60,30 +61,37 @@ int main(void) {
+ 
+ 	printf("[BGCE] Frame drawn. Check /tmp/bgce_frame.ppm\n");
+ 
+-	// while (1) {
+-	//	struct BGCEMessage msg;
+-	//	ssize_t rc = bgce_recv_msg(conn, &amp;msg);
+-	//	if (rc &lt;= 0) {
+-	//		printf("[BGCE Client] Disconnected from server\n");
+-	//		break;
+-	//	}
+-
+-	//	switch (msg.type) {
+-	//	case MSG_INPUT_EVENT: {
+-	//		struct input_event ev;
+-	//		memcpy(&amp;ev, msg.data, sizeof(ev));
+-
+-	//		/* Example: Print keyboard/mouse input */
+-	//		printf("[BGCE Client] Input event: type=%hu code=%hu value=%d\n",
+-	//		       ev.type, ev.code, ev.value);
+-	//		break;
+-	//	}
+-
+-	//	default:
+-	//		printf("[BGCE Client] Unknown message type %d\n", msg.type);
+-	//		break;
+-	//	}
+-	//}
++	time_t start_time = time(NULL);
++	while (1) {
++		struct BGCEMessage msg;
++		ssize_t rc = bgce_recv_msg(conn, &amp;msg);
++		if (rc &lt;= 0) {
++			printf("[BGCE Client] Disconnected from server\n");
++			break;
++		}
++
++		switch (msg.type) {
++		case MSG_INPUT_EVENT: {
++			struct input_event ev;
++			memcpy(&amp;ev, msg.data, sizeof(ev));
++
++			/* Example: Print keyboard/mouse input */
++			printf("[BGCE Client] Input event: type=%hu code=%hu value=%d\n",
++			       ev.type, ev.code, ev.value);
++			break;
++		}
++
++		default:
++			printf("[BGCE Client] Unknown message type %d\n", msg.type);
++			break;
++		}
++
++		// Check if 10 seconds have passed
++		if (time(NULL) - start_time &gt;= 10) {
++			printf("[BGCE Client] Timeout reached, exiting...\n");
++			break;
++		}
++	}
+ 
+ 	bgce_disconnect(conn);
+ 
+diff --git a/input.c b/input.c
+index 01e8f59..9b8cdb3 100644
+--- a/input.c
++++ b/input.c
+@@ -165,11 +165,14 @@ static int handle_input_event(struct input_event ev) {
+ 		}
+ 
+ 		// Ctrl+Alt+Q combo
+-		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL)
++		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
++			printf("[BGCE] Ctrl pressed.\n");
+ 			input_state.ctrl_down = 1;
+-		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT)
++		}
++		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
++			printf("[BGCE] Alt pressed.\n");
+ 			input_state.alt_down = 1;
+-
++		}
+ 		if (input_state.ctrl_down &amp;&amp; input_state.alt_down &amp;&amp; ev.code == KEY_Q) {
+ 			printf("[BGCE] Ctrl+Alt+Q pressed, exiting.\n");
+ 			return 1;
+@@ -177,10 +180,14 @@ static int handle_input_event(struct input_event ev) {
+ 	}
+ 
+ 	if (ev.type == EV_KEY &amp;&amp; ev.value == 0) { // Key release
+-		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL)
++		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
++			printf("[BGCE] Ctrl released.\n");
+ 			input_state.ctrl_down = 0;
+-		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT)
++		}
++		if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
++			printf("[BGCE] Alt released.\n");
+ 			input_state.alt_down = 0;
++		}
+ 
+ 		// Stop drag on button release
+ 		if (((ev.code == BTN_LEFT &amp;&amp; input_state.drag.type == DRAG_MOVE) ||
+@@ -262,7 +269,6 @@ static int handle_input_event(struct input_event ev) {
+ 
+ 		// Set the cursor position
+ 		printf("[BGCE] new mouse position: (%u,%u).\n", input_state.mouse_x, input_state.mouse_y);
+-		printf("[BGCE] server: %u %u.\n", server.drm_fd, server.crtc_id);
+ 		drmModeMoveCursor(
+ 		        server.drm_fd,
+ 		        server.crtc_id,
+@@ -327,56 +333,56 @@ void* input_loop(void* arg) {
+ 			struct input_event ev;
+ 
+ 			if (input_state.fds[i].revents &amp; POLLIN) {
+-				while (1) {
+-					ssize_t n = read(input_state.fds[i].fd, &amp;ev, sizeof(ev));
+-					if (n == -1) {
+-						if (errno == EAGAIN || errno == EWOULDBLOCK)
+-							break;
+-						perror("read input");
++				printf("[BGCE] Reading from device: %s\n", server.input.devs[i].name);
++				ssize_t n = read(input_state.fds[i].fd, &amp;ev, sizeof(ev));
++				if (n == -1) {
++					if (errno == EAGAIN || errno == EWOULDBLOCK) {
++						perror("[BGCE] read input");
+ 						break;
+ 					}
+-					if (n != sizeof(ev))
+-						break;
+-
+-					printf("input: type=%d code=%d value=%d\n",
+-					       ev.type, ev.code, ev.value);
+-
+-					if (handle_input_event(ev)) {
+-						printf("[BGCE] Event handled\n");
+-						continue;
+-					}
++					perror("read input");
++					break;
++				}
++				if (n != sizeof(ev))
++					break;
++				printf("[BGCE] Received input: type=%d code=%d value=%d device=%s\n",
++				       ev.type, ev.code, ev.value, server.input.devs[i].name);
++
++				if (handle_input_event(ev)) {
++					printf("[BGCE] Event handled\n");
++					continue;
++				}
+ 
+-					if (!server.focused_client) {
+-						continue;
+-					}
++				if (!server.focused_client) {
++					continue;
++				}
+ 
+-					struct BGCEInputEvent e = {0};
+-
+-					if (ev.type == EV_KEY) {
+-						e.type = INPUT_KEYBOARD;
+-						e.code = ev.code;
+-						e.value = ev.value;
+-					} else if (ev.type == EV_REL) {
+-						e.type = INPUT_MOUSE_MOVE;
+-						if (ev.code == REL_X)
+-							e.x = ev.value;
+-						else if (ev.code == REL_Y)
+-							e.y = ev.value;
+-					} else if (ev.type == EV_SYN) {
+-						continue;
+-					} else {
+-						continue;
+-					}
++				struct BGCEInputEvent e = {0};
++
++				if (ev.type == EV_KEY) {
++					e.type = INPUT_KEYBOARD;
++					e.code = ev.code;
++					e.value = ev.value;
++				} else if (ev.type == EV_REL) {
++					e.type = INPUT_MOUSE_MOVE;
++					if (ev.code == REL_X)
++						e.x = ev.value;
++					else if (ev.code == REL_Y)
++						e.y = ev.value;
++				} else if (ev.type == EV_SYN) {
++					continue;
++				} else {
++					continue;
++				}
+ 
+-					for (int sub = 0; sub &lt; MAX_INPUT_DEVICES; sub++) {
+-						if (server.focused_client-&gt;inputs[sub] == i) {
+-							/* Send to focused client */
+-							struct BGCEMessage msg;
+-							msg.type = MSG_INPUT_EVENT;
+-							memcpy(msg.data, &amp;ev, sizeof(ev));
++				for (int sub = 0; sub &lt; MAX_INPUT_DEVICES; sub++) {
++					if (server.focused_client-&gt;inputs[sub] == i) {
++						/* Send to focused client */
++						struct BGCEMessage msg;
++						msg.type = MSG_INPUT_EVENT;
++						memcpy(msg.data, &amp;ev, sizeof(ev));
+ 
+-							bgce_send_msg(server.focused_client-&gt;fd, &amp;msg);
+-						}
++						bgce_send_msg(server.focused_client-&gt;fd, &amp;msg);
+ 					}
+ 				}
+ 			}
+diff --git a/test/server_client.sh b/test/server_client.sh
+index 110a069..607bb7d 100755
+--- a/test/server_client.sh
++++ b/test/server_client.sh
+@@ -1,13 +1,13 @@
+ #!/bin/bash
+ 
+ (LD_LIBRARY_PATH=. ./bgce) &gt; server.log 2&gt;&amp;1 &amp;
+-sleep 2
++sleep 1
+ echo "[MAKE] Server running"
+ 
+ echo "[MAKE] Running test client..."
+-#LD_LIBRARY_PATH=. ./client &gt; client.log 2&gt;&amp;1
++LD_LIBRARY_PATH=. ./client &gt; client.log 2&gt;&amp;1
+ 
+-sleep 3
++sleep 2
+ echo "[MAKE] Stopping server..."
+ killall bgce
+ 
+</pre>

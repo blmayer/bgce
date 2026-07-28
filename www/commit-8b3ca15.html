@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 8b3ca15</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 8b3ca15
+parent <a href=commit-735f0f7.html>735f0f7</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-12-01T19:59:30-03:00
+
+    fixed resize function
+
+<a href=tree-8b3ca15.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/bgce.h b/bgce.h
+index d3894f2..baf42de 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -122,6 +122,9 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
+  */
+ void* bgce_get_buffer(int conn, const struct BufferRequest req);
+ 
++// TODO: add comment
++void* bgce_resize_buffer(const struct BufferReply reply);
++
+ /**
+  * Send a draw command to the server, telling it to blit the
+  * shared memory contents to the framebuffer.
+diff --git a/client.c b/client.c
+index 3a62389..8a301b7 100644
+--- a/client.c
++++ b/client.c
+@@ -6,6 +6,24 @@
+ #include &lt;time.h&gt;
+ #include &lt;unistd.h&gt;
+ 
++int w = 800;
++int h = 600;
++uint8_t* buf = NULL;
++
++void draw_gradient() {
++	for (int y = 0; y &lt; h; y++) {
++		for (int x = 0; x &lt; w; x++) {
++			uint32_t* p = (uint32_t*)buf + (y * w + x);
++
++			uint8_t r = (x * 255) / w;
++			uint8_t g = (y * 255) / h;
++			uint8_t b = 128;
++
++			*p = 0xFF000000 | (r &lt;&lt; 16) | (g &lt;&lt; 8) | b; // ARGB
++		}
++	}
++}
++
+ int main(void) {
+ 	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
+ 	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
+@@ -32,11 +50,9 @@ int main(void) {
+ 		       info.devices[i].name,
+ 		       info.devices[i].type_mask);
+ 	}
+-	int w = 800;
+-	int h = 600;
+ 
+ 	struct BufferRequest req = {.width = w, .height = h};
+-	uint8_t* buf = bgce_get_buffer(conn, req);
++	buf = bgce_get_buffer(conn, req);
+ 	if (!buf) {
+ 		fprintf(stderr, "[BGCE] Failed to get buffer\n");
+ 		return 3;
+@@ -44,17 +60,7 @@ int main(void) {
+ 	printf("Client got buffer at: %p\n", buf);
+ 
+ 	printf("[BGCE] Drawing gradient...\n");
+-	for (int y = 0; y &lt; h; y++) {
+-		for (int x = 0; x &lt; w; x++) {
+-			uint32_t* p = (uint32_t*)buf + (y * w + x);
+-
+-			uint8_t r = (x * 255) / w;
+-			uint8_t g = (y * 255) / h;
+-			uint8_t b = 128;
+-
+-			*p = 0xFF000000 | (r &lt;&lt; 16) | (g &lt;&lt; 8) | b; // ARGB
+-		}
+-	}
++	draw_gradient();
+ 
+ 	if (bgce_draw(conn) &lt; 0) {
+ 		fprintf(stderr, "[BGCE] Draw failed\n");
+@@ -81,6 +87,23 @@ int main(void) {
+ 			       ev.device.name, ev.code, ev.value);
+ 			break;
+ 		}
++		case MSG_BUFFER_CHANGE: {
++			struct BufferReply b = msg.data.buffer_reply;
++			printf("[BGCE] Buffer change event: w=%u h=%u shm_name=%s\n", b.width, b.height, b.shm_name);
++
++			buf = bgce_resize_buffer(b);
++			w = b.width;
++			h = b.height;
++
++			printf("[BGCE] Drawing gradient...\n");
++			draw_gradient();
++
++			if (bgce_draw(conn) &lt; 0) {
++				fprintf(stderr, "[BGCE] Draw failed\n");
++				return 4;
++			}
++			break;
++		}
+ 
+ 		default:
+ 			printf("[BGCE Client] Unknown message type %d\n", msg.type);
+diff --git a/display.c b/display.c
+index 0c57eaa..c64ed4c 100644
+--- a/display.c
++++ b/display.c
+@@ -394,17 +394,17 @@ void draw(struct ServerState* srv, struct Client cli) {
+ /*
+  * The situation:
+  *
+- *     . (x,y)
+- *     +----------------+
+- *     |     rect A     | dy
+- *     +----+-----------+----+
+- *     |    |                |
+- *     |    |                |
+- *     |    |                |
+- *     |  B |                |
+- *     +----+                |
+- *       dx |                |
+- *          +----------------+
++ * dx&lt;0:                             dx&gt;0:  . (x,y)
++ * dy&lt;0:  +----------------+         dy&gt;0:  +----------------+
++ *        |     (x,y)      | dx             |     rect A     | dy
++ *        |    .           +----+           +----+-----------+----+
++ *        |                |    |           |    |                |
++ *        |                |    |           |    |                |
++ *        |                |    |           |    |                |
++ *        |                | B  |           |  B |                |
++ *        +----+-----------+----+           +----+                |
++ *          dy |     rect A     |             dx |                |
++ *             +----------------+                +----------------+
+  *
+  * So we redraw the rectangles:
+  * A: (x, y) (x+width, y+dy) and
+@@ -489,6 +489,70 @@ void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy) {
+ 	}
+ }
+ 
++static void redraw_exposed_rect(struct ServerState* srv, const struct Client* resized_client,
++                                int exposed_x, int exposed_y, int exposed_width, int exposed_height) {
++	if (exposed_width &lt;= 0 || exposed_height &lt;= 0) {
++		return; // Nothing to draw
++	}
++
++	uint32_t screen_w = srv-&gt;display_w;
++
++	// Now, iterate through clients behind the resized_client and draw them if they overlap
++	struct Client* cli = resized_client-&gt;next;
++	while (cli) {
++		// Calculate overlap between the exposed rectangle and the current client 'cli'
++		int cli_end_x = cli-&gt;x + cli-&gt;width;
++		int cli_end_y = cli-&gt;y + cli-&gt;height;
++
++		int overlap_start_x = exposed_x &gt; cli-&gt;x ? exposed_x : cli-&gt;x;
++		int overlap_start_y = exposed_y &gt; cli-&gt;y ? exposed_y : cli-&gt;y;
++
++		int overlap_end_x = (exposed_x + exposed_width) &lt; cli_end_x ? (exposed_x + exposed_width) : cli_end_x;
++		int overlap_end_y = (exposed_y + exposed_height) &lt; cli_end_y ? (exposed_y + exposed_height) : cli_end_y;
++
++		if (overlap_start_x &lt; overlap_end_x &amp;&amp; overlap_start_y &lt; overlap_end_y) {
++			// There's an overlap, copy from client's buffer to framebuffer
++			for (int y = overlap_start_y; y &lt; overlap_end_y; y++) {
++				uint32_t* drow = (uint32_t*)srv-&gt;framebuffer + y * screen_w + overlap_start_x;
++				uint32_t* srow = (uint32_t*)cli-&gt;buffer + (y - cli-&gt;y) * cli-&gt;width + (overlap_start_x - cli-&gt;x);
++				memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
++			}
++		}
++		cli = cli-&gt;next;
++	}
++}
++
++void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
++	if (!srv || !srv-&gt;framebuffer) {
++		fprintf(stderr, "Redraw from resize: Invalid server or framebuffer\n");
++		return;
++	}
++
++	// Calculate the client's old dimensions
++	int old_width = c.width - dx;
++	int old_height = c.height - dy;
++
++	// Handle horizontal shrinkage (area on the right)
++	if (dx &lt; 0) {
++		int exposed_x = c.x + c.width; // Start of the exposed area
++		int exposed_y = c.y;
++		int exposed_width = -dx;       // The amount it shrunk
++		int exposed_height = old_height; // This should be the old height
++
++		redraw_exposed_rect(srv, &amp;c, exposed_x, exposed_y, exposed_width, exposed_height);
++	}
++
++	// Handle vertical shrinkage (area at the bottom)
++	if (dy &lt; 0) {
++		int exposed_x = c.x;
++		int exposed_y = c.y + c.height; // Start of the exposed area
++		int exposed_width = old_width;   // This should be the old width
++		int exposed_height = -dy;       // The amount it shrunk
++
++		redraw_exposed_rect(srv, &amp;c, exposed_x, exposed_y, exposed_width, exposed_height);
++	}
++}
++
+ void release_display(void) {
+ 	if (cur_fb)
+ 		drmModeRmFB(drm_fd, cur_fb);
+diff --git a/input.c b/input.c
+index 685d703..89e7f92 100644
+--- a/input.c
++++ b/input.c
+@@ -11,13 +11,14 @@
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+ #include &lt;sys/ioctl.h&gt;
++#include &lt;sys/mman.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+ #define test_bit(bit, array) ((array)[(bit) / 8] &amp; (1 &lt;&lt; ((bit) % 8)))
+ #define INPUT_DIR "/dev/input"
+ 
+-int ctrl_down;
+-int alt_down;
++int ctrl_down = 0;
++int alt_down = 0;
+ int mouse_x;
+ int mouse_y;
+ 
+@@ -27,8 +28,8 @@ struct pollfd fds[MAX_INPUT_DEVICES];
+ struct {
+ 	int active;
+ 	struct Client* target;
+-	int start_mouse_x;
+-	int start_mouse_y;
++	int dx;
++	int dy;
+ 	enum {
+ 		DRAG_MOVE,
+ 		DRAG_RESIZE
+@@ -37,7 +38,7 @@ struct {
+ 
+ extern struct ServerState server;
+ 
+-void resize_buffer(struct Client* c) {
++int resize_buffer(struct Client* c, int dx, int dy) {
+ 	// for resize we must reallocate the buffer
+ 	// Unmap and unlink old buffer
+ 	if (c-&gt;buffer) {
+@@ -47,32 +48,36 @@ void resize_buffer(struct Client* c) {
+ 
+ 	// Create new shared memory name and object
+ 	snprintf(c-&gt;shm_name, sizeof(c-&gt;shm_name),
+-	         "/bgce_buf_%d_%ld", getpid(), time(NULL));
++	         "bgce_buf_%d_%ld", getpid(), time(NULL));
+ 	int shm_fd = shm_open(c-&gt;shm_name, O_CREAT | O_RDWR, 0600);
+ 	if (shm_fd &lt; 0) {
+ 		perror("shm_open for resize");
+-		bgce_send_msg(client_fd, &amp;msg);
+-		break;
++		return 0;
+ 	}
+ 
+-	size_t buf_size = req.width * req.height * BGCE_BYTES_PER_PIXEL;
++	size_t buf_size = (c-&gt;width + dx) * (c-&gt;height + dy) * BGCE_BYTES_PER_PIXEL;
+ 	if (ftruncate(shm_fd, buf_size) &lt; 0) {
+ 		perror("ftruncate for resize");
+ 		close(shm_fd);
+-		bgce_send_msg(client_fd, &amp;msg);
+-		break;
++		return 0;
+ 	}
+ 
+ 	c-&gt;buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+ 	if (c-&gt;buffer == MAP_FAILED) {
+ 		perror("mmap for resize");
+ 		close(shm_fd);
+-		bgce_send_msg(client_fd, &amp;msg);
+-		break;
++		return 0;
+ 	}
+-	c-&gt;width = req.width;
+-	c-&gt;height = req.height;
++
++	c-&gt;width += dx;
++	c-&gt;height += dy;
+ 	close(shm_fd);
++	printf("[BGCE] Client resized: %p size=%zu (%dx%d) name=%s\n",
++	       c-&gt;buffer,
++	       c-&gt;width * c-&gt;height * 4UL,
++	       c-&gt;width, c-&gt;height,
++	       c-&gt;shm_name);
++	return 1;
+ }
+ 
+ struct Client* pick_client(int x, int y) {
+@@ -162,7 +167,6 @@ int init_input(void) {
+  * This is the key mappings handling part, for now this is hardcoded
+  * but in the future will be read from config.
+  * Shortcuts available:
+- *  ESC: exit
+  *  CTRL + ALT + q: exit
+  *  ALT + CLICK + DRAG: move
+  *  ALT + RIGHT_CLICK + DRAG: resize
+@@ -171,11 +175,6 @@ int init_input(void) {
+  */
+ static int handle_input_event(struct input_event ev) {
+ 	if (ev.type == EV_KEY &amp;&amp; ev.value == 1) { // Key press
+-		if (ev.code == KEY_ESC) {
+-			printf("[BGCE] ESC pressed, exiting.\n");
+-			return 1;
+-		}
+-
+ 		// Ctrl+Alt+Q combo
+ 		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
+ 			printf("[BGCE] Ctrl pressed.\n");
+@@ -185,7 +184,7 @@ static int handle_input_event(struct input_event ev) {
+ 			printf("[BGCE] Alt pressed.\n");
+ 			alt_down = 1;
+ 		}
+-		if (ctrl_down == 1 &amp;&amp; alt_down == 1 &amp;&amp; ev.code == KEY_Q) {
++		if (ctrl_down &amp;&amp; alt_down &amp;&amp; ev.code == KEY_Q) {
+ 			printf("[BGCE] Ctrl+Alt+Q pressed, exiting.\n");
+ 			exit(1);
+ 		}
+@@ -204,43 +203,63 @@ static int handle_input_event(struct input_event ev) {
+ 		// Stop drag/move on button release
+ 		if ((ev.code == BTN_LEFT || ev.code == BTN_RIGHT) &amp;&amp; drag.active) { // Only stop if it was an active drag of that type
+ 			printf("[BGCE] End of drag event.\n");
++			if (drag.type == DRAG_MOVE) {
++				drag.active = 0;
++				drag.target = NULL;
++				return 1;
++			}
++
+ 			struct Client* c = drag.target;
++			if (resize_buffer(c, drag.dx, drag.dy)) {
++				printf("[BGCE] Redrawing dx=%d dy=%d.\n", drag.dx, drag.dy);
++				if (drag.dx &lt; 0 || drag.dy &lt; 0) {
++					redraw_from_resize(
++					        &amp;server,
++					        *c,
++					        drag.dx,
++					        drag.dy);
++				}
++				draw(&amp;server, *c);
++
++				struct BGCEMessage msg;
++				msg.type = MSG_BUFFER_CHANGE;
++				struct BufferReply reply = {0};
++				strncpy(reply.shm_name, c-&gt;shm_name, sizeof(reply.shm_name));
++				reply.width = c-&gt;width;
++				reply.height = c-&gt;height;
++				msg.data.buffer_reply = reply;
++				bgce_send_msg(c-&gt;fd, &amp;msg);
++			}
+ 			drag.active = 0;
+ 			drag.target = NULL;
+ 
+-			if (drag.type == DRAG_RESIZE) {
+-				int resize_client(c);
+-			}
+ 			return 1;
+ 		}
+ 	}
+ 
+ 	if (ev.type == EV_KEY &amp;&amp; (ev.code == BTN_LEFT || ev.code == BTN_RIGHT) &amp;&amp; ev.value == 1) {
+-		int mx = mouse_x;
+-		int my = mouse_y;
+-		printf("[BGCE] Click detected at (%d, %d).\n", mx, my);
++		printf("[BGCE] Click detected at (%d, %d).\n", mouse_x, mouse_y);
+ 
+ 		// switch focuse
+-		struct Client* c = pick_client(mx, my);
++		struct Client* c = pick_client(mouse_x, mouse_y);
+ 		if (!c) {
+ 			return 0;
+ 		}
++		printf("[BGCE] Click detected at client %s z=%d.\n", c-&gt;shm_name, c-&gt;z);
+ 
+-		if (c != server.focused_client) {
+-			printf("[BGCE] Click detected at client %s.\n", c-&gt;shm_name);
+-
+-			// If the clicked client is not already the first, move it
+-			if (c != server.clients) {
+-				struct Client* prev = server.clients;
+-				while (prev &amp;&amp; prev-&gt;next != c) {
+-					prev = prev-&gt;next;
+-				}
+-				if (prev) {
+-					prev-&gt;next = c-&gt;next;
+-					c-&gt;next = server.clients;
+-					server.clients = c;
+-				}
++		// If the clicked client is not already the first, move it
++		if (c != server.clients) {
++			struct Client* prev = server.clients;
++			while (prev &amp;&amp; prev-&gt;next != c) {
++				prev = prev-&gt;next;
++			}
++			if (prev) {
++				prev-&gt;next = c-&gt;next;
++				c-&gt;next = server.clients;
++				server.clients = c;
+ 			}
++		}
++		if (c != server.focused_client) {
+ 			c-&gt;z = server.focused_client-&gt;z + 1;
+ 			server.focused_client = c;
+ 			draw(&amp;server, *c);
+@@ -252,10 +271,10 @@ static int handle_input_event(struct input_event ev) {
+ 		}
+ 
+ 		printf("[BGCE] Alt is pressed, starting move/resize.\n");
+-		drag.start_mouse_x = mx;
+-		drag.start_mouse_y = my;
+ 		drag.active = 1;
+ 		drag.target = c;
++		drag.dx = 0;
++		drag.dy = 0;
+ 
+ 		if (ev.code == BTN_RIGHT) {
+ 			drag.type = DRAG_RESIZE;
+@@ -269,10 +288,17 @@ static int handle_input_event(struct input_event ev) {
+ 	}
+ 
+ 	if (ev.type == EV_REL) {
+-		if (ev.code == REL_X)
+-			mouse_x += ev.value;
+-		else if (ev.code == REL_Y)
+-			mouse_y += ev.value;
++		int dx = 0;
++		int dy = 0;
++		switch (ev.code) {
++		case REL_X:
++			dx += ev.value;
++			break;
++		case REL_Y:
++			dy += ev.value;
++		}
++		mouse_x += dx;
++		mouse_y += dy;
+ 
+ 		// Clamp mouse coordinates to screen boundaries
+ 		if (mouse_x &lt; 0)
+@@ -291,10 +317,6 @@ static int handle_input_event(struct input_event ev) {
+ 		        mouse_y);
+ 
+ 		if (drag.active) {
+-			int dx = mouse_x - drag.start_mouse_x;
+-			int dy = mouse_y - drag.start_mouse_y;
+-			drag.start_mouse_x = mouse_x;
+-			drag.start_mouse_y = mouse_y;
+ 			struct Client* c = drag.target;
+ 			if (!c) {
+ 				printf("[BGCE] No client to drag\n");
+@@ -315,17 +337,9 @@ static int handle_input_event(struct input_event ev) {
+ 				break;
+ 
+ 			case DRAG_RESIZE:
+-				// Calculate new width and height
+-				c-&gt;width += dx;
+-				c-&gt;height += dy;
+-
+-				// Enforce minimum size
+-				if (c-&gt;width &lt; 10)
+-					new_width = 10;
+-				if (c-&gt;height &lt; 10)
+-					new_height = 10;
+-
+-				break;
++				// Accumulate new width and height
++				drag.dx += dx;
++				drag.dy += dy;
+ 			}
+ 		}
+ 		return 1;
+@@ -377,6 +391,7 @@ void* input_loop(void* arg) {
+ 				e.device = server.input.devs[i];
+ 				e.code = ev.code;
+ 
++				// TODO: send x, y for mouse move
+ 				if (ev.type == EV_KEY) {
+ 					e.value = ev.value;
+ 				} else if (ev.type == EV_REL) {
+diff --git a/libbgce.c b/libbgce.c
+index a0e7d6b..6050a48 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -110,6 +110,25 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
+ 	return buf;
+ }
+ 
++// TODO: unmap old mem
++void* bgce_resize_buffer(struct BufferReply reply) {
++	size_t size = reply.width * reply.height * 4;
++	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
++	if (shm_fd &lt; 0) {
++		perror("shm_open (client)");
++		return NULL;
++	}
++
++	void* buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++	if (buf == MAP_FAILED) {
++		perror("mmap (client)");
++		close(shm_fd);
++		return NULL;
++	}
++
++	return buf;
++}
++
+ /* Public API: Draw current buffer */
+ int bgce_draw(int conn) {
+ 	if (conn &lt; 0)
+diff --git a/loop.c b/loop.c
+index 904a004..23731ae 100644
+--- a/loop.c
++++ b/loop.c
+@@ -30,6 +30,7 @@ void* client_thread(void* arg) {
+ 
+ 	// Add client to the linked list
+ 	client-&gt;next = server.clients;
++	client-&gt;z = server.clients-&gt;z + 1;
+ 	server.clients = client;
+ 	server.focused_client = client; /* last connected client gets focus */
+ 
+@@ -39,7 +40,7 @@ void* client_thread(void* arg) {
+ 		return NULL;
+ 	}
+ 
+-	printf("[BGCE] Thread started for client fd=%d\n", client_fd);
++	printf("[BGCE] Thread started for client fd=%d z=%d\n", client_fd, client-&gt;z);
+ 
+ 	while (1) {
+ 		struct BGCEMessage msg;
+@@ -74,7 +75,7 @@ void* client_thread(void* arg) {
+ 			        req.height);
+ 
+ 			snprintf(client-&gt;shm_name, sizeof(client-&gt;shm_name),
+-			         "/bgce_buf_%d_%ld", getpid(), time(NULL));
++			         "bgce_buf_%d_%ld", getpid(), time(NULL));
+ 
+ 			int shm_fd = shm_open(client-&gt;shm_name, O_CREAT | O_RDWR, 0600);
+ 			if (shm_fd &lt; 0) {
+diff --git a/server.h b/server.h
+index d21137c..b9b1b34 100644
+--- a/server.h
++++ b/server.h
+@@ -82,6 +82,8 @@ void draw(struct ServerState* srv, struct Client cli);
+ 
+ void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
+ 
++void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);
++
+ /**
+  * Input device related functions
+  * from input.c
+</pre>

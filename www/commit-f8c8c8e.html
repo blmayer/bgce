@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce f8c8c8e</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit f8c8c8e
+parent <a href=commit-949fa81.html>949fa81</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-01-07T14:22:56-03:00
+
+    added fallback background
+
+<a href=tree-f8c8c8e.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/Makefile b/Makefile
+index 042f9e8..cde559d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -36,7 +36,7 @@ install: bgce libbgce.so bgce.h
+ 	install -m 644 bgce.h $(INSTALL_INCLUDE)
+ 	ldconfig
+ 
+-.PHONY: test
++.PHONY: test-server
+ test-server: bgce
+ 	@echo "[MAKE] Starting BGCE server..."
+ 	@LD_LIBRARY_PATH=. ./bgce &gt; $(SERVER_LOG) 2&gt;&amp;1 &amp; echo $$! &gt; $(SERVER_PID)
+diff --git a/config.c b/config.c
+index f744077..5c03f76 100644
+--- a/config.c
++++ b/config.c
+@@ -125,7 +125,12 @@ int apply_background(struct config* config, uint32_t* buffer, uint32_t width, ui
+ 		unsigned char* img_data = stbi_load(config-&gt;path, &amp;img_width, &amp;img_height, &amp;img_channels, 4);
+ 		if (!img_data) {
+ 			fprintf(stderr, "Failed to load image: %s\n", config-&gt;path);
+-			return -1;
++			// Fallback to a default color (dark gray with full opacity)
++			fprintf(stderr, "[BGCE] Falling back to default color #333333\n");
++			for (uint32_t i = 0; i &lt; width * height; i++) {
++				buffer[i] = 0xFF333333;
++			}
++			return 0;
+ 		}
+ 
+ 		if (config-&gt;mode == IMAGE_TILED) {
+</pre>

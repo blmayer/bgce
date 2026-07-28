@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce cd04e4e</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit cd04e4e
+parent <a href=commit-d9032c6.html>d9032c6</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-06-20T18:59:56-03:00
+
+    display: restored VT before DRM teardown to prevent frozen terminal
+
+    Moved release_vt() to the top of release_display() so KD_TEXT is
+    set before any DRM cleanup that could hang. Removed printf from
+    the signal handler to avoid async-signal-safety issues.
+
+<a href=tree-cd04e4e.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/display.c b/display.c
+index 75935f9..7829572 100644
+--- a/display.c
++++ b/display.c
+@@ -646,6 +646,10 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
+ }
+ 
+ void release_display(void) {
++	/* Restore text mode first so the terminal is usable even if
++	 * the DRM teardown below hangs or crashes. */
++	release_vt();
++
+ 	if (cur_fb)
+ 		drmModeRmFB(drm_fd, cur_fb);
+ 
+@@ -681,8 +685,6 @@ void release_display(void) {
+ 	if (encoder)
+ 		drmModeFreeEncoder(encoder);
+ 
+-	release_vt();
+-
+ 	close(drm_fd);
+ 	printf("[BGCE] Display released.\n");
+ }
+diff --git a/server.c b/server.c
+index a629947..6e7a40d 100644
+--- a/server.c
++++ b/server.c
+@@ -25,7 +25,7 @@ static void ensure_dir(const char *path) {
+ }
+ 
+ static void cleanup_and_exit(int sig) {
+-	printf("[BGCE] Caught signal %d, cleaning up\n", sig);
++	(void)sig;
+ 	release_display();
+ 	_exit(0);
+ }
+</pre>

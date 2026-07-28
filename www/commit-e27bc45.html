@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce e27bc45</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit e27bc45
+parent <a href=commit-64c7e57.html>64c7e57</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-08T20:34:03-03:00
+
+    Persist client window positions across restarts.
+
+    Store last world (x,y) per app id in ~/.cache/bgce/windows.cache.
+    Identify clients via SO_PEERCRED + /proc/pid/comm on Linux, restore on
+    first buffer request, and save on move, MSG_MOVE, and disconnect.
+    Headless test covers remember + restore.
+
+<a href=tree-e27bc45.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 9855ec3..71154dc 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -33,7 +33,7 @@ behaviour by inspecting PNGs:
+ 
+ ```bash
+ make headless &amp;&amp; ./headless
+-# writes headless_00_bg.png … headless_07_panned.png
++# writes headless_00_bg.png … headless_08_location_restored.png
+ ```
+ 
+ API (see `mock.h`): `bgce_mock_init`, `bgce_mock_add_client`, `bgce_mock_draw`,
+@@ -49,7 +49,7 @@ kernel headers. Real `bgce` still requires Linux.
+ [X] Implement taking screenshots
+ [X] Implement zoomable/pannable virtual desktop (4× area, zoom 50%–400%)
+ [X] Headless mock + screenshot tests (`make headless`)
+-[ ] Implement a cache file to memorize the last location of clients, in order to reopen them on the same place
++[X] Cache file to memorize last client locations (`~/.cache/bgce/windows.cache`)
+ 
+ ### Protocol features
+ [X] Add suport for moving a buffer at a specific location
+@@ -59,6 +59,14 @@ kernel headers. Real `bgce` still requires Linux.
+ [ ] Create more tests
+   - [ ] test if events go to the correct client and only the one
+   - [X] headless stacking / move / erase screenshots
++  - [X] headless location-cache restore
++
++### Location cache
++- File: `$XDG_CACHE_HOME/bgce/windows.cache` or `~/.cache/bgce/windows.cache`
++- Format: `app_id x y` (world pixels), one entry per line
++- Identity: Linux `SO_PEERCRED` + `/proc/pid/comm` (fallback `"client"`)
++- Restore on first buffer request; save on move end, MSG_MOVE, and disconnect
++- Same binary name shares one slot (last place wins)
+ 
+ ### Zoom / pan controls
+ - **Alt + scroll**: zoom in/out toward the cursor (range 0.5×–4.0×)
+diff --git a/Makefile b/Makefile
+index e3aeb35..757b4f6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,11 +23,11 @@ else
+ DISPLAY_OBJ = display_fbdev.o
+ endif
+ 
+-SERVER_OBJS = server.o loop.o libbgce.so input.o display.o $(DISPLAY_OBJ) config.o
++SERVER_OBJS = server.o loop.o libbgce.so input.o display.o $(DISPLAY_OBJ) config.o location_cache.o
+ LIB_OBJS = libbgce.o
+ 
+ # Headless mock compositor (no fbdev/input) — works on macOS + Linux
+-HEADLESS_OBJS = display.o display_mock.o config.o mock.o input_headless.o
++HEADLESS_OBJS = display.o display_mock.o config.o mock.o input_headless.o location_cache.o
+ 
+ all: bgce libbgce.so
+ 
+diff --git a/input.c b/input.c
+index e3070d8..8257098 100644
+--- a/input.c
++++ b/input.c
+@@ -1,4 +1,5 @@
+ #include "bgce.h"   /* for access to global server state */
++#include "location_cache.h"
+ #include "server.h" /* for access to global server state */
+ 
+ #include &lt;dirent.h&gt;
+@@ -597,6 +598,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			set_cursor_type(BGCE_CURSOR_DEFAULT);
+ 
+ 			if (drag.type == DRAG_MOVE || drag.type == DRAG_PAN) {
++				if (drag.type == DRAG_MOVE &amp;&amp; drag.target)
++					location_cache_remember_client(drag.target);
+ 				drag.active = 0;
+ 				drag.target = NULL;
+ 				drag.acc_x = 0;
+diff --git a/location_cache.c b/location_cache.c
+new file mode 100644
+index 0000000..a35db7a
+--- /dev/null
++++ b/location_cache.c
+@@ -0,0 +1,256 @@
++/*
++ * Persist last window positions per app id under the user cache dir:
++ *   $XDG_CACHE_HOME/bgce/windows.cache
++ *   or ~/.cache/bgce/windows.cache
++ *
++ * File format (one entry per line):
++ *   app_id x y
++ */
++
++#define _GNU_SOURCE
++#include "location_cache.h"
++#include "server.h"
++
++#include &lt;errno.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/socket.h&gt;
++#include &lt;sys/stat.h&gt;
++#include &lt;unistd.h&gt;
++
++#ifndef SO_PEERCRED
++/* Non-Linux: identification falls back to "client". */
++#endif
++
++#define LOC_CACHE_MAX 64
++#define LOC_ID_MAX 64
++
++struct loc_entry {
++	char id[LOC_ID_MAX];
++	uint32_t x;
++	uint32_t y;
++	int used;
++};
++
++static struct loc_entry entries[LOC_CACHE_MAX];
++static int entries_loaded;
++
++static int cache_dir(char *buf, size_t buflen)
++{
++	const char *xdg = getenv("XDG_CACHE_HOME");
++	const char *home = getenv("HOME");
++	int n;
++
++	if (xdg &amp;&amp; xdg[0] == '/')
++		n = snprintf(buf, buflen, "%s/bgce", xdg);
++	else if (home &amp;&amp; home[0])
++		n = snprintf(buf, buflen, "%s/.cache/bgce", home);
++	else
++		return -1;
++	if (n &lt; 0 || (size_t)n &gt;= buflen)
++		return -1;
++	return 0;
++}
++
++static int cache_path(char *buf, size_t buflen)
++{
++	char dir[512];
++
++	if (cache_dir(dir, sizeof(dir)) &lt; 0)
++		return -1;
++	if (snprintf(buf, buflen, "%s/windows.cache", dir) &gt;= (int)buflen)
++		return -1;
++	return 0;
++}
++
++static void ensure_cache_dir(void)
++{
++	char dir[512];
++	char parent[512];
++	const char *home;
++	const char *xdg;
++
++	if (cache_dir(dir, sizeof(dir)) &lt; 0)
++		return;
++
++	xdg = getenv("XDG_CACHE_HOME");
++	home = getenv("HOME");
++	if (xdg &amp;&amp; xdg[0] == '/') {
++		mkdir(xdg, 0700);
++	} else if (home &amp;&amp; home[0]) {
++		snprintf(parent, sizeof(parent), "%s/.cache", home);
++		mkdir(parent, 0700);
++	}
++	mkdir(dir, 0700);
++}
++
++void location_cache_load(void)
++{
++	char path[512];
++	FILE *f;
++	char line[256];
++	int i;
++
++	memset(entries, 0, sizeof(entries));
++	entries_loaded = 1;
++
++	if (cache_path(path, sizeof(path)) &lt; 0)
++		return;
++	f = fopen(path, "r");
++	if (!f)
++		return;
++
++	i = 0;
++	while (fgets(line, sizeof(line), f) &amp;&amp; i &lt; LOC_CACHE_MAX) {
++		char id[LOC_ID_MAX];
++		unsigned int x, y;
++
++		if (line[0] == '#' || line[0] == '\n')
++			continue;
++		if (sscanf(line, "%63s %u %u", id, &amp;x, &amp;y) != 3)
++			continue;
++		strncpy(entries[i].id, id, sizeof(entries[i].id) - 1);
++		entries[i].x = x;
++		entries[i].y = y;
++		entries[i].used = 1;
++		i++;
++	}
++	fclose(f);
++	printf("[BGCE] location cache: loaded %d entr%s from %s\n",
++	       i, i == 1 ? "y" : "ies", path);
++}
++
++void location_cache_save(void)
++{
++	char path[512];
++	FILE *f;
++	int i, n = 0;
++
++	if (!entries_loaded)
++		return;
++	ensure_cache_dir();
++	if (cache_path(path, sizeof(path)) &lt; 0)
++		return;
++
++	f = fopen(path, "w");
++	if (!f) {
++		perror("[BGCE] location cache write");
++		return;
++	}
++	fprintf(f, "# BGCE window locations: app_id x y (world pixels)\n");
++	for (i = 0; i &lt; LOC_CACHE_MAX; i++) {
++		if (!entries[i].used)
++			continue;
++		fprintf(f, "%s %u %u\n", entries[i].id, entries[i].x,
++		        entries[i].y);
++		n++;
++	}
++	fclose(f);
++	printf("[BGCE] location cache: saved %d entr%s to %s\n",
++	       n, n == 1 ? "y" : "ies", path);
++}
++
++int location_cache_lookup(const char *app_id, uint32_t *x, uint32_t *y)
++{
++	int i;
++
++	if (!app_id || !app_id[0] || !entries_loaded)
++		return 0;
++	for (i = 0; i &lt; LOC_CACHE_MAX; i++) {
++		if (entries[i].used &amp;&amp; strcmp(entries[i].id, app_id) == 0) {
++			if (x)
++				*x = entries[i].x;
++			if (y)
++				*y = entries[i].y;
++			return 1;
++		}
++	}
++	return 0;
++}
++
++void location_cache_store(const char *app_id, uint32_t x, uint32_t y)
++{
++	int i;
++	int free_slot = -1;
++
++	if (!app_id || !app_id[0])
++		return;
++	if (!entries_loaded)
++		location_cache_load();
++
++	for (i = 0; i &lt; LOC_CACHE_MAX; i++) {
++		if (entries[i].used &amp;&amp; strcmp(entries[i].id, app_id) == 0) {
++			entries[i].x = x;
++			entries[i].y = y;
++			return;
++		}
++		if (!entries[i].used &amp;&amp; free_slot &lt; 0)
++			free_slot = i;
++	}
++	if (free_slot &lt; 0)
++		free_slot = 0; /* overwrite first if full */
++	strncpy(entries[free_slot].id, app_id, sizeof(entries[free_slot].id) - 1);
++	entries[free_slot].id[sizeof(entries[free_slot].id) - 1] = '\0';
++	entries[free_slot].x = x;
++	entries[free_slot].y = y;
++	entries[free_slot].used = 1;
++}
++
++void location_cache_identify_client(struct Client *client, int sock_fd)
++{
++	if (!client)
++		return;
++	strncpy(client-&gt;app_id, "client", sizeof(client-&gt;app_id) - 1);
++	client-&gt;app_id[sizeof(client-&gt;app_id) - 1] = '\0';
++
++#ifdef SO_PEERCRED
++	{
++		struct ucred cred;
++		socklen_t len = sizeof(cred);
++		char path[64];
++		char comm[LOC_ID_MAX];
++		FILE *f;
++		size_t n;
++
++		memset(&amp;cred, 0, sizeof(cred));
++		if (getsockopt(sock_fd, SOL_SOCKET, SO_PEERCRED, &amp;cred, &amp;len) == 0 &amp;&amp;
++		    cred.pid &gt; 0) {
++			client-&gt;pid = cred.pid;
++			snprintf(path, sizeof(path), "/proc/%d/comm", (int)cred.pid);
++			f = fopen(path, "r");
++			if (f) {
++				if (fgets(comm, sizeof(comm), f)) {
++					n = strlen(comm);
++					while (n &gt; 0 &amp;&amp;
++					       (comm[n - 1] == '\n' ||
++					        comm[n - 1] == '\r'))
++						comm[--n] = '\0';
++					if (comm[0]) {
++						strncpy(client-&gt;app_id, comm,
++						        sizeof(client-&gt;app_id) - 1);
++						client-&gt;app_id[sizeof(client-&gt;app_id) - 1] =
++						        '\0';
++					}
++				}
++				fclose(f);
++			}
++		}
++	}
++#else
++	(void)sock_fd;
++#endif
++	printf("[BGCE] client id='%s' pid=%d\n", client-&gt;app_id,
++	       (int)client-&gt;pid);
++}
++
++void location_cache_remember_client(const struct Client *client)
++{
++	if (!client || !client-&gt;app_id[0])
++		return;
++	/* Skip placeholder background client */
++	if (client-&gt;z == 0 &amp;&amp; client-&gt;fd &lt; 0)
++		return;
++	location_cache_store(client-&gt;app_id, client-&gt;x, client-&gt;y);
++	location_cache_save();
++}
+diff --git a/location_cache.h b/location_cache.h
+new file mode 100644
+index 0000000..1cade32
+--- /dev/null
++++ b/location_cache.h
+@@ -0,0 +1,32 @@
++#ifndef BGCE_LOCATION_CACHE_H
++#define BGCE_LOCATION_CACHE_H
++
++#include &lt;stdint.h&gt;
++
++struct Client;
++
++/** Load cache from disk into memory (call once at server start). */
++void location_cache_load(void);
++
++/** Write memory cache to disk. */
++void location_cache_save(void);
++
++/**
++ * Look up last world position for app_id.
++ * Returns 1 if found (writes *x, *y), 0 if unknown.
++ */
++int location_cache_lookup(const char *app_id, uint32_t *x, uint32_t *y);
++
++/** Remember world position for app_id (memory only until save). */
++void location_cache_store(const char *app_id, uint32_t x, uint32_t y);
++
++/**
++ * Fill client-&gt;app_id from the peer process (SO_PEERCRED + /proc/pid/comm
++ * on Linux).  Falls back to "client" if unavailable.
++ */
++void location_cache_identify_client(struct Client *client, int sock_fd);
++
++/** Store this client's current x,y under its app_id and flush to disk. */
++void location_cache_remember_client(const struct Client *client);
++
++#endif
+diff --git a/loop.c b/loop.c
+index 5a7ee8d..190f19f 100644
+--- a/loop.c
++++ b/loop.c
+@@ -1,6 +1,7 @@
+ #define _XOPEN_SOURCE 700
+ 
+ #include "bgce.h"
++#include "location_cache.h"
+ #include "server.h"
+ 
+ #include &lt;fcntl.h&gt;
+@@ -26,6 +27,7 @@ void* client_thread(void* arg) {
+ 	}
+ 
+ 	client-&gt;fd = client_fd;
++	location_cache_identify_client(client, client_fd);
+ 
+ 	/* Background client is always first; keep the list non-empty. */
+ 	if (!server.clients) {
+@@ -169,21 +171,36 @@ void* client_thread(void* arg) {
+ 				client-&gt;height = req.height;
+ 				client-&gt;world_w = world_w;
+ 				client-&gt;world_h = world_h;
+-				/* First buffer only: place at the current viewport so the window
+-				 * appears on-screen even when the user has panned/zoomed. */
++				/*
++				 * First buffer only: restore last location from cache
++				 * if known; otherwise place at the current viewport.
++				 */
+ 				if (!had_buffer) {
+-					float wx, wy;
+-					screen_to_world(&amp;server, 0.0f, 0.0f, &amp;wx, &amp;wy);
+-					if (wx &lt; 0.0f)
+-						wx = 0.0f;
+-					if (wy &lt; 0.0f)
+-						wy = 0.0f;
+-					if (wx &gt; (float)server.virtual_w)
+-						wx = (float)server.virtual_w;
+-					if (wy &gt; (float)server.virtual_h)
+-						wy = (float)server.virtual_h;
+-					client-&gt;x = (uint32_t)wx;
+-					client-&gt;y = (uint32_t)wy;
++					uint32_t cx, cy;
++					if (location_cache_lookup(client-&gt;app_id, &amp;cx, &amp;cy)) {
++						if (cx &gt; server.virtual_w)
++							cx = server.virtual_w;
++						if (cy &gt; server.virtual_h)
++							cy = server.virtual_h;
++						client-&gt;x = cx;
++						client-&gt;y = cy;
++						printf("[BGCE] restored location for '%s' "
++						       "at %u,%u\n",
++						       client-&gt;app_id, cx, cy);
++					} else {
++						float wx, wy;
++						screen_to_world(&amp;server, 0.0f, 0.0f, &amp;wx, &amp;wy);
++						if (wx &lt; 0.0f)
++							wx = 0.0f;
++						if (wy &lt; 0.0f)
++							wy = 0.0f;
++						if (wx &gt; (float)server.virtual_w)
++							wx = (float)server.virtual_w;
++						if (wy &gt; (float)server.virtual_h)
++							wy = (float)server.virtual_h;
++						client-&gt;x = (uint32_t)wx;
++						client-&gt;y = (uint32_t)wy;
++					}
+ 				}
+ 				printf("[BGCE] Client buffer: %p size=%zu "
+ 				       "buf=%ux%u world=%ux%u name=%s\n",
+@@ -220,10 +237,9 @@ void* client_thread(void* arg) {
+ 				"[BGCE] Client requested move to position (%d, %d)\n",
+ 				move_req.x, move_req.y);
+ 
+-			// Update client position
+-			client-&gt;x = move_req.x;
+-			client-&gt;y = move_req.y;
+-
++			client-&gt;x = (uint32_t)move_req.x;
++			client-&gt;y = (uint32_t)move_req.y;
++			location_cache_remember_client(client);
+ 			break;
+ 		}
+ 		case MSG_SET_CURSOR: {
+@@ -279,6 +295,7 @@ void* client_thread(void* arg) {
+ 	 * in the stack (background + windows that sat under / overlapped it).
+ 	 * Other on-screen clients outside that rect are left alone.
+ 	 */
++	location_cache_remember_client(client);
+ 	erase_client(&amp;server, client);
+ 
+ 	printf("[BGCE] Client thread finished (fd=%d); server still running\n", client_fd);
+diff --git a/mock.c b/mock.c
+index 3768d64..5a80578 100644
+--- a/mock.c
++++ b/mock.c
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include "mock.h"
++#include "location_cache.h"
+ 
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+@@ -83,6 +84,7 @@ int bgce_mock_init(uint32_t width, uint32_t height)
+ 	server.clients = bg_client;
+ 
+ 	init_input();
++	location_cache_load();
+ 	redraw_all(&amp;server);
+ 	mock_active = 1;
+ 	printf("[BGCE] mock init %ux%u virtual %ux%u\n",
+@@ -144,6 +146,16 @@ struct Client *bgce_mock_add_client(uint32_t x, uint32_t y,
+ 	c-&gt;x = x;
+ 	c-&gt;y = y;
+ 	c-&gt;fd = -1;
++	snprintf(c-&gt;app_id, sizeof(c-&gt;app_id), "mock_%u",
++	         (unsigned)server.client_count + 1);
++	/* Restore last place if this app_id was cached (tests can set app_id). */
++	{
++		uint32_t cx, cy;
++		if (location_cache_lookup(c-&gt;app_id, &amp;cx, &amp;cy)) {
++			c-&gt;x = cx;
++			c-&gt;y = cy;
++		}
++	}
+ 	c-&gt;next = server.clients;
+ 	c-&gt;z = server.clients ? server.clients-&gt;z + 1 : 1;
+ 	server.clients = c;
+@@ -190,6 +202,7 @@ void bgce_mock_remove_client(struct Client *c)
+ 	if (server.focused_client == c)
+ 		server.focused_client = NULL;
+ 
++	location_cache_remember_client(c);
+ 	erase_client(&amp;server, c);
+ 	if (c-&gt;buffer)
+ 		free(c-&gt;buffer);
+@@ -244,6 +257,7 @@ void bgce_mock_move(struct Client *c, int wdx, int wdy)
+ 	redraw_region(&amp;server, c, wdx, wdy);
+ 	c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
+ 	c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
++	location_cache_remember_client(c);
+ }
+ 
+ void bgce_mock_pan_screen(int sdx, int sdy)
+diff --git a/mock.h b/mock.h
+index e0492e8..9376f77 100644
+--- a/mock.h
++++ b/mock.h
+@@ -24,6 +24,7 @@ void bgce_mock_fini(void);
+ /**
+  * Add a client window with its own buffer (ARGB), filled with solid color.
+  * x,y,w,h are in world pixels.  Returns the client, or NULL.
++ * Sets app_id to mock_N; override c-&gt;app_id before draw to test location cache.
+  */
+ struct Client *bgce_mock_add_client(uint32_t x, uint32_t y,
+                                     uint32_t w, uint32_t h, uint32_t argb);
+diff --git a/server.c b/server.c
+index 15ac16a..6d2891e 100644
+--- a/server.c
++++ b/server.c
+@@ -1,5 +1,6 @@
+ #include "server.h"
+ #include "bgce.h"
++#include "location_cache.h"
+ 
+ #include &lt;errno.h&gt;
+ #include &lt;fcntl.h&gt;
+@@ -264,6 +265,7 @@ int main(void) {
+ 		fprintf(stderr, "[BGCE] HOME unset; using default config\n");
+ 	}
+ 	print_config(&amp;config);
++	location_cache_load();
+ 
+ 	if (!bgce_socket_path(listen_sock_path, sizeof(listen_sock_path))) {
+ 		fprintf(stderr, "[BGCE] socket path too long\n");
+diff --git a/server.h b/server.h
+index f3f9e38..347dba5 100644
+--- a/server.h
++++ b/server.h
+@@ -27,6 +27,8 @@
+ struct Client {
+ 	int fd;
+ 	pid_t pid;
++	/* Stable app key for location cache (e.g. /proc/pid/comm). */
++	char app_id[64];
+ 	char shm_name[64];
+ 	void* buffer;
+ 	/* Buffer pixel size (what the client draws into). */
+diff --git a/test/headless.c b/test/headless.c
+index 34dca98..5fc822a 100644
+--- a/test/headless.c
++++ b/test/headless.c
+@@ -7,10 +7,12 @@
+  * Writes headless_*.png for visual inspection.  No real display or input.
+  */
+ 
++#include "location_cache.h"
+ #include "mock.h"
+ 
+ #include &lt;stdio.h&gt;
+ #include &lt;stdint.h&gt;
++#include &lt;string.h&gt;
+ 
+ int main(void)
+ {
+@@ -71,6 +73,43 @@ int main(void)
+ 	if (bgce_mock_screenshot("headless_07_panned.png") != 0)
+ 		return 1;
+ 
++	/* Location cache: remember A, reopen with same app_id */
++	{
++		uint32_t saved_x, saved_y, cx = 0, cy = 0;
++
++		strncpy(a-&gt;app_id, "test_app", sizeof(a-&gt;app_id) - 1);
++		a-&gt;app_id[sizeof(a-&gt;app_id) - 1] = '\0';
++		bgce_mock_move(a, 50, 30); /* stores cache on move */
++		saved_x = a-&gt;x;
++		saved_y = a-&gt;y;
++		bgce_mock_remove_client(a);
++		a = NULL;
++
++		a = bgce_mock_add_client(0, 0, 200, 150, 0xFF2ECC71);
++		if (!a) {
++			fprintf(stderr, "headless: re-add client failed\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		strncpy(a-&gt;app_id, "test_app", sizeof(a-&gt;app_id) - 1);
++		a-&gt;app_id[sizeof(a-&gt;app_id) - 1] = '\0';
++		/* Same path as server first-buffer placement */
++		if (location_cache_lookup("test_app", &amp;cx, &amp;cy)) {
++			a-&gt;x = cx;
++			a-&gt;y = cy;
++		}
++		bgce_mock_draw(a);
++		if (a-&gt;x != saved_x || a-&gt;y != saved_y) {
++			fprintf(stderr,
++			        "headless: location cache failed (got %u,%u want %u,%u)\n",
++			        a-&gt;x, a-&gt;y, saved_x, saved_y);
++			bgce_mock_fini();
++			return 1;
++		}
++		if (bgce_mock_screenshot("headless_08_location_restored.png") != 0)
++			return 1;
++	}
++
+ 	printf("headless complete. PNG frames written.\n");
+ 	bgce_mock_fini();
+ 	return 0;
+</pre>

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 28dfb1f</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 28dfb1f
+parent <a href=commit-e6c0a6b.html>e6c0a6b</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-11-01T19:11:11-03:00
+
+    Fixed input polling
+
+<a href=tree-28dfb1f.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/input.c b/input.c
+index 24189a5..b03ffea 100644
+--- a/input.c
++++ b/input.c
+@@ -17,16 +17,14 @@
+ #define INPUT_DIR "/dev/input"
+ 
+ static struct {
+-	int fds[MAX_INPUT_DEVICES];
+ 	size_t count;
++	struct pollfd fds[MAX_INPUT_DEVICES];
+ } input_state;
+ 
+ extern struct ServerState server;
+ 
+-static struct pollfd* fds = NULL;
+-static int num_fds = 0;
+-
+ int bgce_input_init(void) {
++	input_state.count = 0;
+ 	DIR* dir = opendir(INPUT_DIR);
+ 	if (!dir) {
+ 		perror("[BGCE] Failed to open /dev/input");
+@@ -34,14 +32,14 @@ int bgce_input_init(void) {
+ 	}
+ 
+ 	struct dirent* ent;
+-	while ((ent = readdir(dir)) != NULL) {
++	while ((ent = readdir(dir)) != NULL &amp;&amp; input_state.count &lt; 8) {
+ 		if (strncmp(ent-&gt;d_name, "event", 5) != 0)
+ 			continue;
+ 
+ 		char path[256 + 12];
+ 		snprintf(path, sizeof(path), "%s/%s", INPUT_DIR, ent-&gt;d_name);
+ 
+-		int fd = open(path, O_RDONLY | O_NONBLOCK);
++		int fd = open(path, O_RDONLY);
+ 		if (fd &lt; 0)
+ 			continue; // skip inaccessible devices
+ 
+@@ -64,17 +62,9 @@ int bgce_input_init(void) {
+ 		if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) &lt; 0)
+ 			strcpy(name, "Unknown");
+ 
+-		fds = realloc(fds, sizeof(struct pollfd) * (num_fds + 1));
+-		if (!fds) {
+-			perror("[BGCE] realloc");
+-			close(fd);
+-			closedir(dir);
+-			return -1;
+-		}
+-
+-		fds[num_fds].fd = fd;
+-		fds[num_fds].events = POLLIN;
+-		num_fds++;
++		input_state.fds[input_state.count].fd = fd;
++		input_state.fds[input_state.count].events = POLLIN;
++		input_state.count++;
+ 
+ 		printf("[BGCE] Input device accepted: %s (%s)%s%s\n",
+ 		       path, name,
+@@ -84,7 +74,7 @@ int bgce_input_init(void) {
+ 
+ 	closedir(dir);
+ 
+-	if (num_fds == 0) {
++	if (input_state.count == 0) {
+ 		fprintf(stderr, "[BGCE] No suitable input devices found\n");
+ 		return -1;
+ 	}
+@@ -95,17 +85,19 @@ int bgce_input_init(void) {
+ void* bgce_input_thread(void* arg) {
+ 	(void)arg;
+ 
+-	struct pollfd fds[MAX_INPUT_DEVICES];
+-	for (size_t i = 0; i &lt; input_state.count; i++) {
+-		fds[i].fd = input_state.fds[i];
+-		fds[i].events = POLLIN;
+-	}
+-
+ 	printf("[BGCE] Input thread started\n");
+ 
+ 	while (1) {
+-		if (poll(fds, input_state.count, -1) &lt;= 0)
+-			continue;
++		int ret = poll(input_state.fds, input_state.count, -1);
++		if (ret &lt; 0) {
++			if (errno == EINTR) {
++				printf("EINTR\n");
++				continue;
++			}
++			perror("[BGCE] poll");
++			break;
++		}
++		printf("[BGCE] poll() returned %d\n", ret);
+ 
+ 		if (!server.focused_client) {
+ 			printf("[BGCE] No focused client for input event!\n");
+@@ -113,19 +105,15 @@ void* bgce_input_thread(void* arg) {
+ 		}
+ 
+ 		for (size_t i = 0; i &lt; input_state.count; i++) {
+-			if (!(fds[i].revents &amp; POLLIN))
++			if (input_state.fds[i].revents) {
++				printf("[BGCE] fd[%zu]=%d revents=0x%0x\n", i, input_state.fds[i].fd, input_state.fds[i].revents);
+ 				continue;
++			}
+ 
+ 			struct input_event ev;
+-			int rc = read(fds[i].fd, &amp;ev, sizeof(ev));
+-			if (rc == sizeof(ev)) {
+-				printf("[BGCE] event: type=%d code=%d value=%d\n", ev.type, ev.code, ev.value);
+-			} else if (rc &lt; 0 &amp;&amp; errno != EAGAIN) {
+-				perror("[BGCE] read");
+-			}
++			ssize_t n;
+ 
+-			while (rc == sizeof(ev)) {
+-				printf("[BGCE] Event: type=%d code=%d value=%d\n", ev.type, ev.code, ev.value);
++			while ((n = read(input_state.fds[i].fd, &amp;ev, sizeof(ev))) == sizeof(ev)) {
+ 				struct BGCEInputEvent e = {0};
+ 
+ 				if (ev.type == EV_KEY) {
+@@ -151,6 +139,9 @@ void* bgce_input_thread(void* arg) {
+ 
+ 				bgce_send_msg(server.focused_client-&gt;fd, &amp;msg);
+ 			}
++
++			if (n &lt; 0 &amp;&amp; errno != EAGAIN)
++				perror("[BGCE] read");
+ 		}
+ 	}
+ 	return NULL;
+</pre>

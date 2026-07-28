@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce fb1aa0b</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit fb1aa0b
+parent <a href=commit-6016e01.html>6016e01</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-10T11:42:49-03:00
+
+    Restore original window-move damage path.
+
+    L-shaped expose only: underlay stack bottom-to-top in the strips, then
+    full blit of the mover from its buffer at the new place. Drop FB scroll
+    of the window body and full-stack recompose of old∪new. Document in
+    redraw_region(), server.h, and AGENTS.md.
+
+<a href=tree-fb1aa0b.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 51dfd99..2ddf63e 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -19,7 +19,10 @@ Implement a minimal Linux graphical environment that runs without root, manages
+ - **MSG_DRAW:** Blit only the client that asked, clipped by opaque windows
+   above (subtract their rects). Do **not** full-stack recompose wallpaper /
+   clients below on ordinary draw — that was a regression (blink/refill).
+-  Full stack is for erase/move expose/pan/zoom only.
++- **Window move:** L-shaped expose only → underlay stack (bottom→top) in those
++  strips; then full blit of the moving client from its buffer. No FB scroll
++  of the window body; no full-stack recompose of old∪new.
++  Full stack remains for erase / pan edges / zoom.
+ - **Focus Handling:** Server tracks which client receives keyboard/mouse events.
+ - **Event Model:** Blocking reads (no polling); async draw calls.
+ - **Security:** Clients are sandboxed via file descriptors; no root operations.
+diff --git a/display.c b/display.c
+index 027d302..eeb8c34 100644
+--- a/display.c
++++ b/display.c
+@@ -1194,84 +1194,6 @@ static void composite_behind_rect(struct ServerState *srv, struct Client *behind
+ 	composite_chain_to_rect(srv, behind, x0, y0, x1, y1);
+ }
+ 
+-/*
+- * Slide a screen rect by (sdx,sdy). Overlap-safe. Source is [x0,x1)×[y0,y1).
+- */
+-static void fb_copy_rect_delta(struct ServerState *srv,
+-                               int x0, int y0, int x1, int y1,
+-                               int sdx, int sdy)
+-{
+-	uint32_t *fb;
+-	uint32_t sp;
+-	int sx0, sy0, sx1, sy1, dx0, dy0, w, h, y;
+-
+-	if (!srv || !srv-&gt;framebuffer || (sdx == 0 &amp;&amp; sdy == 0))
+-		return;
+-
+-	sx0 = x0;
+-	sy0 = y0;
+-	sx1 = x1;
+-	sy1 = y1;
+-	if (!clip_to_display(srv, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1))
+-		return;
+-
+-	dx0 = sx0 + sdx;
+-	dy0 = sy0 + sdy;
+-	{
+-		int dx1 = sx1 + sdx, dy1 = sy1 + sdy;
+-		int max_sx0 = sx0, max_sy0 = sy0, min_sx1 = sx1, min_sy1 = sy1;
+-		if (dx0 &gt; max_sx0 + sdx) { /* keep for clarity */ }
+-		if (dx0 - sdx &gt; max_sx0)
+-			max_sx0 = dx0 - sdx;
+-		if (dy0 - sdy &gt; max_sy0)
+-			max_sy0 = dy0 - sdy;
+-		if (dx1 - sdx &lt; min_sx1)
+-			min_sx1 = dx1 - sdx;
+-		if (dy1 - sdy &lt; min_sy1)
+-			min_sy1 = dy1 - sdy;
+-		/* Also clip dest into display */
+-		if (dx0 &lt; 0) {
+-			max_sx0 += -dx0;
+-			dx0 = 0;
+-		}
+-		if (dy0 &lt; 0) {
+-			max_sy0 += -dy0;
+-			dy0 = 0;
+-		}
+-		if (dx0 + (min_sx1 - max_sx0) &gt; (int)srv-&gt;display_w)
+-			min_sx1 = max_sx0 + ((int)srv-&gt;display_w - dx0);
+-		if (dy0 + (min_sy1 - max_sy0) &gt; (int)srv-&gt;display_h)
+-			min_sy1 = max_sy0 + ((int)srv-&gt;display_h - dy0);
+-		sx0 = max_sx0;
+-		sy0 = max_sy0;
+-		sx1 = min_sx1;
+-		sy1 = min_sy1;
+-		if (sx0 &gt;= sx1 || sy0 &gt;= sy1)
+-			return;
+-		dx0 = sx0 + sdx;
+-		dy0 = sy0 + sdy;
+-		w = sx1 - sx0;
+-		h = sy1 - sy0;
+-	}
+-
+-	fb = (uint32_t *)srv-&gt;framebuffer;
+-	sp = display_stride_px(srv);
+-
+-	if (sdy &gt; 0 || (sdy == 0 &amp;&amp; sdx &gt; 0)) {
+-		for (y = h - 1; y &gt;= 0; y--) {
+-			uint32_t *src = fb + (sy0 + y) * (int)sp + sx0;
+-			uint32_t *dst = fb + (dy0 + y) * (int)sp + dx0;
+-			memmove(dst, src, (size_t)w * sizeof(uint32_t));
+-		}
+-	} else {
+-		for (y = 0; y &lt; h; y++) {
+-			uint32_t *src = fb + (sy0 + y) * (int)sp + sx0;
+-			uint32_t *dst = fb + (dy0 + y) * (int)sp + dx0;
+-			memmove(dst, src, (size_t)w * sizeof(uint32_t));
+-		}
+-	}
+-}
+-
+ void redraw_all(struct ServerState* srv) {
+ 	if (!srv || !srv-&gt;framebuffer)
+ 		return;
+@@ -1475,21 +1397,40 @@ void draw(struct ServerState *srv, struct Client *cli)
+ }
+ 
+ /*
+- * Move a client on screen by (wdx, wdy) world pixels.
+- * `c` is still at the old position; caller updates x/y after.
++ * Window move — design (initial BGCE model; do not “optimize” with FB scroll
++ * of the whole window or full-stack recompose of old∪new):
++ *
++ * Caller: `c` is still at the OLD world position; apply (wdx,wdy) after.
++ *
++ *   1. Split the L-shaped expose: parts of the OLD screen rect that the
++ *      window no longer covers after the move (axis strips when size is
++ *      unchanged; old minus new when size changes).
++ *   2. For each L strip only: composite bottom → top from clients *under*
++ *      the mover (`c-&gt;next` … wallpaper). Small area, full underlay stack.
++ *   3. For the moving client itself: blit it FULL from its buffer at the
++ *      NEW position.  Do NOT re-walk windows under that body — only the
++ *      drawer’s pixels.  (Same spirit as MSG_DRAW’s “only me”.)
++ *   4. Re-blit windows stacked *above* the mover over old∪new so we never
++ *      paint over them.
+  *
+- * Fast path: FB scroll + L-shaped expose (classic).  sdx/sdy from actual
+- * screen bounds so strips match.  Then blit window from buffer at new pos.
+- * If screen size changed (odd zoom), fall back to union recompose.
++ * Forbidden regressions:
++ *   - fb_copy_rect_delta / FB scroll of the window body (looks fast, trails
++ *     and wrong underlay; was mislabeled “fast path”).
++ *   - composite_chain over the entire union of old and new for a move.
+  */
+-void redraw_region(struct ServerState* srv, struct Client* c, int wdx, int wdy) {
++void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
++{
+ 	struct Client moved;
+-	struct Client* p;
++	struct Client *p;
+ 	int ox0, oy0, ox1, oy1;
+ 	int nx0, ny0, nx1, ny1;
+ 	int sdx, sdy;
+ 	int ow, oh, nw, nh;
+ 	int ux0, uy0, ux1, uy1;
++	int bx0, by0, bx1, by1;
++	int expose[4][4];
++	int nexp = 0;
++	int i;
+ 
+ 	if (!srv || !srv-&gt;framebuffer || !c) {
+ 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
+@@ -1506,7 +1447,8 @@ void redraw_region(struct ServerState* srv, struct Client* c, int wdx, int wdy)
+ 
+ 	sdx = nx0 - ox0;
+ 	sdy = ny0 - oy0;
+-	if (sdx == 0 &amp;&amp; sdy == 0)
++	if (sdx == 0 &amp;&amp; sdy == 0 &amp;&amp;
++	    (ox1 - ox0) == (nx1 - nx0) &amp;&amp; (oy1 - oy0) == (ny1 - ny0))
+ 		return;
+ 
+ 	ow = ox1 - ox0;
+@@ -1515,52 +1457,56 @@ void redraw_region(struct ServerState* srv, struct Client* c, int wdx, int wdy)
+ 	nh = ny1 - ny0;
+ 
+ 	cursor_fb_begin();
+-	/* Move path may scroll FB pixels; always lift glyph first. */
+ 	(void)cursor_lift_all_ret();
+ 
++	/* ---- 1–2. L-shaped (or old\\new) expose: underlay only ---- */
+ 	if (ow == nw &amp;&amp; oh == nh) {
+-		/* L-shape: scroll body, fill exposed strips only. */
+-		fb_copy_rect_delta(srv, ox0, oy0, ox1, oy1, sdx, sdy);
+-
++		/* Classic L strips from translation of a fixed-size box. */
+ 		if (sdx &gt; 0) {
+ 			int ex1 = ox0 + sdx;
+ 			if (ex1 &gt; ox1)
+ 				ex1 = ox1;
+-			composite_behind_rect(srv, c-&gt;next, ox0, oy0, ex1, oy1);
++			if (ox0 &lt; ex1)
++				composite_behind_rect(srv, c-&gt;next, ox0, oy0, ex1, oy1);
+ 		} else if (sdx &lt; 0) {
+ 			int ex0 = ox1 + sdx;
+ 			if (ex0 &lt; ox0)
+ 				ex0 = ox0;
+-			composite_behind_rect(srv, c-&gt;next, ex0, oy0, ox1, oy1);
++			if (ex0 &lt; ox1)
++				composite_behind_rect(srv, c-&gt;next, ex0, oy0, ox1, oy1);
+ 		}
+ 		if (sdy &gt; 0) {
+ 			int ey1 = oy0 + sdy;
+ 			if (ey1 &gt; oy1)
+ 				ey1 = oy1;
+-			composite_behind_rect(srv, c-&gt;next, ox0, oy0, ox1, ey1);
++			if (oy0 &lt; ey1)
++				composite_behind_rect(srv, c-&gt;next, ox0, oy0, ox1, ey1);
+ 		} else if (sdy &lt; 0) {
+ 			int ey0 = oy1 + sdy;
+ 			if (ey0 &lt; oy0)
+ 				ey0 = oy0;
+-			composite_behind_rect(srv, c-&gt;next, ox0, ey0, ox1, oy1);
+-		}
+-
+-		{
+-			int bx0 = nx0, by0 = ny0, bx1 = nx1, by1 = ny1;
+-			if (clip_to_display(srv, &amp;bx0, &amp;by0, &amp;bx1, &amp;by1))
+-				blit_client_overlap(srv, &amp;moved, bx0, by0, bx1, by1);
++			if (ey0 &lt; oy1)
++				composite_behind_rect(srv, c-&gt;next, ox0, ey0, ox1, oy1);
+ 		}
+ 	} else {
+-		ux0 = ox0 &lt; nx0 ? ox0 : nx0;
+-		uy0 = oy0 &lt; ny0 ? oy0 : ny0;
+-		ux1 = ox1 &gt; nx1 ? ox1 : nx1;
+-		uy1 = oy1 &gt; ny1 ? oy1 : ny1;
+-		if (clip_to_display(srv, &amp;ux0, &amp;uy0, &amp;ux1, &amp;uy1)) {
+-			composite_chain_to_rect(srv, c-&gt;next, ux0, uy0, ux1, uy1);
+-			blit_client_overlap(srv, &amp;moved, ux0, uy0, ux1, uy1);
+-		}
++		/* Size changed: expose = old rect minus new rect. */
++		nexp = rect_subtract(ox0, oy0, ox1, oy1, nx0, ny0, nx1, ny1,
++		                     expose, 4);
++		for (i = 0; i &lt; nexp; i++)
++			composite_behind_rect(srv, c-&gt;next,
++			                      expose[i][0], expose[i][1],
++			                      expose[i][2], expose[i][3]);
+ 	}
+ 
++	/* ---- 3. Moving client: full buffer blit at new place only ---- */
++	bx0 = nx0;
++	by0 = ny0;
++	bx1 = nx1;
++	by1 = ny1;
++	if (clip_to_display(srv, &amp;bx0, &amp;by0, &amp;bx1, &amp;by1))
++		blit_client_overlap(srv, &amp;moved, bx0, by0, bx1, by1);
++
++	/* ---- 4. Windows above: redraw over old∪new ---- */
+ 	ux0 = ox0 &lt; nx0 ? ox0 : nx0;
+ 	uy0 = oy0 &lt; ny0 ? oy0 : ny0;
+ 	ux1 = ox1 &gt; nx1 ? ox1 : nx1;
+diff --git a/server.h b/server.h
+index ee22306..dc3b28e 100644
+--- a/server.h
++++ b/server.h
+@@ -233,11 +233,12 @@ void set_cursor_type(enum BGCECursorType type);
+ void draw(struct ServerState *srv, struct Client *cli);
+ 
+ /**
+- * Move client on screen by world delta (dx, dy).  `c` is still at the old
+- * position.  Repaints the union of old and new screen rects in stack order
+- * (no FB scroll — avoids 1px edge trails).
++ * Move client by world delta (dx, dy).  `c` is still at the old position.
++ * Design: L-shaped expose with underlay stack only; full blit of the mover
++ * at the new place (no FB scroll, no underlay under the window body).
++ * See redraw_region() in display.c.
+  */
+-void redraw_region(struct ServerState* srv, struct Client* c, int dx, int dy);
++void redraw_region(struct ServerState *srv, struct Client *c, int dx, int dy);
+ 
+ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);
+ 
+</pre>

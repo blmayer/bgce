@@ -1,0 +1,1701 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 924fcda</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 924fcda
+parent <a href=commit-00bd7af.html>00bd7af</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-06T12:17:24-03:00
+
+    Default to fbdev; optional DRM backend; per-user socket.
+
+    Drop the libdrm dependency for the common path: scanout via /dev/fb0,
+    software cursor blitted as a fixed 32x32 tile, and a uid-scoped server
+    socket ($XDG_RUNTIME_DIR/bgce.sock or /tmp/bgce-&lt;uid&gt;.sock). Keep
+    BACKEND=drm for KMS builds that still have libdrm.
+
+<a href=tree-924fcda.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/.DS_Store b/.DS_Store
+deleted file mode 100644
+index bd201e1..0000000
+Binary files a/.DS_Store and /dev/null differ
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..282ed2e
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,7 @@
++.DS_Store
++.tai
++._*
++*.o
++bgce
++libbgce.so
++client
+diff --git a/AGENTS.md b/AGENTS.md
+index dfc007a..3543d7a 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -8,7 +8,7 @@ Implement a minimal Linux graphical environment that runs without root, manages
+ 
+ - **Language:** C
+ - **Privilege Model:** Runs as user in `video` group; no `setuid` or `sudo` required.
+-- **Display Backend:** Uses `/dev/fb0` (Linux framebuffer device) directly.
++- **Display Backend:** Uses `/dev/fb0` (Linux framebuffer device) directly. Optional `BACKEND=drm` uses libdrm/KMS.
+ - **Architecture:**
+   - `bgced`: server that manages framebuffers, input, and client communication.
+   - `libbgce.so`: client library that handles IPC and buffer management.
+diff --git a/Makefile b/Makefile
+index 8fa42ec..af951ce 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,20 +1,30 @@
+ CC ?= cc
+-CFLAGS ?= -Wall -O1 -std=c99 -fPIC -g -I/include/libdrm -I.
+-LDFLAGS ?= -lrt -ldrm -lm
++BACKEND ?= fbdev
+ 
+-SERVER_OBJS = server.o loop.o libbgce.so input.o display.o config.o
++CFLAGS ?= -Wall -O1 -std=c99 -fPIC -g -I.
++LDFLAGS ?= -lrt -lm -lpthread
++
++ifeq ($(BACKEND),drm)
++CFLAGS += -DBGCE_USE_DRM -I/include/libdrm
++LDFLAGS += -ldrm
++DISPLAY_OBJ = display_drm.o
++else
++DISPLAY_OBJ = display_fbdev.o
++endif
++
++SERVER_OBJS = server.o loop.o libbgce.so input.o display.o $(DISPLAY_OBJ) config.o
+ LIB_OBJS = libbgce.o
+ 
+ all: bgce libbgce.so
+ 
+ bgce: $(SERVER_OBJS)
+-	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) -L. -lbgce $(LDFLAGS)
++	$(CC) $(CFLAGS) -o $@ server.o loop.o input.o display.o $(DISPLAY_OBJ) config.o -L. -lbgce $(LDFLAGS)
+ 
+ libbgce.so: $(LIB_OBJS)
+-	$(CC) -shared -o $@ $(LIB_OBJS) $(LDFLAGS)
++	$(CC) -shared -o $@ $(LIB_OBJS) -lrt
+ 
+ client: client.c bgce.h
+-	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce $(LDFLAGS)
++	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce -lrt
+ 
+ %.o: %.c
+ 	$(CC) $(CFLAGS) -c $&lt; -o $@
+@@ -35,35 +45,3 @@ install: bgce libbgce.so bgce.h
+ 	install -d $(INSTALL_INCLUDE)
+ 	install -m 644 bgce.h $(INSTALL_INCLUDE)
+ 	-ldconfig 2&gt;/dev/null || true
+-
+-SERVER_LOG ?= server.log
+-SERVER_PID ?= server.pid
+-
+-.PHONY: test-server
+-test-server: bgce
+-	@echo "[MAKE] Starting BGCE server..."
+-	@LD_LIBRARY_PATH=. ./bgce &gt; $(SERVER_LOG) 2&gt;&amp;1 &amp; echo $$! &gt; $(SERVER_PID)
+-	chvt 1
+-	@sleep 3
+-	@echo "[MAKE] Server running with PID `cat $(SERVER_PID)`"
+-
+-	@sleep 3
+-	@echo "[MAKE] Stopping server..."
+-	@kill `cat $(SERVER_PID)` 2&gt;/dev/null || true
+-	@rm -f $(SERVER_PID)
+-
+-	@echo ""
+-	@echo "=== SERVER LOG ==="
+-	@tail -n 50 $(SERVER_LOG)
+-
+-CLIENT_LOG ?= client.log
+-
+-test-client: client
+-	@echo "[MAKE] Running test client..."
+-	@LD_LIBRARY_PATH=. ./client &gt; $(CLIENT_LOG) 2&gt;&amp;1 || true
+-
+-	@echo ""
+-	@echo "=== CLIENT LOG ==="
+-	@tail -n 50 $(CLIENT_LOG)
+-	@echo ""
+-	@echo "[MAKE] Test finished."
+diff --git a/README.md b/README.md
+index 99e5632..55cfa2f 100644
+--- a/README.md
++++ b/README.md
+@@ -52,7 +52,7 @@ I also posted a video on my blog:
+ ### Goals
+ 
+ - Minimal, understandable graphics stack in C
+-- No external dependencies (no OpenGL, no X11, no Wayland)
++- No external dependencies by default (no OpenGL, X11, Wayland, or libdrm)
+ - Educational reference for framebuffer-based compositing and IPC
+ 
+ 
+@@ -72,7 +72,7 @@ I also posted a video on my blog:
+ 
+ ### Privileges
+ - BGCE must **run as a normal user** (no root, no setuid).
+-- The user should be in the **video** group to access `/dev/dri/card1` (framebuffer device).
++- The user should be in the **video** group to access `/dev/fb0` (framebuffer device).
+ 
+ 
+ ### Event Loop
+@@ -87,14 +87,16 @@ On lin0 use `/bin/cc` and install into the flat root (`/bin`, `/lib`, `/include`
+ ```bash
+ git clone &lt;repo-url&gt;
+ cd bgce
+-make CC=cc CFLAGS='-Wall -O1 -std=c99 -fPIC -I/include/libdrm -I.' all client
++make CC=cc all client          # default: /dev/fb0, no libdrm
++# make CC=cc BACKEND=drm all   # optional DRM/KMS + libdrm
+ make install
+ ./bgce   # Start server
+ # Go to a different tty
+ ./client  # Start test client
+ ```
+ 
+-Needs userspace `libdrm` headers in `/include/libdrm` and `libdrm.so` in `/lib`.
++Default build needs only kernel headers (`linux/fb.h`) and `/dev/fb0`
++(DRM fbdev emulation is fine). `BACKEND=drm` needs libdrm.
+ 
+ 
+ ## Configuration
+diff --git a/bgce.h b/bgce.h
+index 6fd714b..8204c13 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -15,9 +15,17 @@
+  * and send draw commands.
+  * ------------------------------------------------------------------ */
+ 
+-#define SOCKET_PATH "/tmp/bgce.sock"
+ #define BGCE_BYTES_PER_PIXEL 4
+ #define MAX_INPUT_DEVICES 4
++/* sun_path capacity used by bgce_socket_path() */
++#define BGCE_SOCKPATH_MAX 108
++
++/**
++ * Fill buf with this user's server socket path:
++ *   $XDG_RUNTIME_DIR/bgce.sock  or  /tmp/bgce-&lt;uid&gt;.sock
++ * Returns buf, or NULL if buf is too small.
++ */
++char *bgce_socket_path(char *buf, size_t buflen);
+ 
+ /* ----------------------------
+  * Protocol Message Types
+@@ -129,8 +137,8 @@ ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg);
+ ssize_t bgce_recv_msg(int conn, struct BGCEMessage* msg);
+ 
+ /**
+- * Connect to a BGCE server socket.
+- * Returns a file descriptor, or -1 on error.
++ * Connect to a BGCE server socket (see bgce_socket_path).
++ * Returns a file descriptor, or negative on error.
+  */
+ int bgce_connect(void);
+ 
+diff --git a/display.c b/display.c
+index 83e1aca..0dcf285 100644
+--- a/display.c
++++ b/display.c
+@@ -1,19 +1,6 @@
+ /*
+- * drm_dumb_cursor.c
+- *
+- * Minimal example showing how to:
+- *  - initialize DRM
+- *  - create dumb buffers (scanout + cursor)
+- *  - use drmModeSetCrtc and drmModeSetCursor
+- *
+- * Build:
+- *   gcc drm_dumb_cursor.c -o drm_dumb_cursor -ldrm
+- *
+- * Run (needs permissions to /dev/dri/cardX):
+- *   sudo ./drm_dumb_cursor
+- *
+- * NOTE: This is example/demo code. Error handling tries to be good, but
+- * real production code should be more thorough and handle more corner cases.
++ * display.c — compositing, software cursor, VT handling.
++ * Scanout setup lives in display_fbdev.c (default) or display_drm.c (BGCE_USE_DRM).
+  */
+ 
+ #define STB_IMAGE_WRITE_IMPLEMENTATION
+@@ -22,7 +9,6 @@
+ #include &lt;errno.h&gt;
+ #include &lt;fcntl.h&gt;
+ #include &lt;linux/kd.h&gt;
+-#include &lt;linux/vt.h&gt;
+ #include &lt;math.h&gt;
+ #include &lt;stdbool.h&gt;
+ #include &lt;stdint.h&gt;
+@@ -32,30 +18,6 @@
+ #include &lt;sys/ioctl.h&gt;
+ #include &lt;sys/mman.h&gt;
+ #include &lt;unistd.h&gt;
+-#if defined(__has_include)
+-#  if __has_include(&lt;libdrm/drm.h&gt;)
+-#    include &lt;libdrm/drm.h&gt;
+-#  elif __has_include(&lt;drm/drm.h&gt;)
+-#    include &lt;drm/drm.h&gt;
+-#  else
+-#    include &lt;drm/drm.h&gt;
+-#  endif
+-#else
+-#  include &lt;drm/drm.h&gt;
+-#endif
+-#if defined(__has_include)
+-#  if __has_include(&lt;libdrm/drm_mode.h&gt;)
+-#    include &lt;libdrm/drm_mode.h&gt;
+-#  elif __has_include(&lt;drm/drm_mode.h&gt;)
+-#    include &lt;drm/drm_mode.h&gt;
+-#  else
+-#    include &lt;drm/drm_mode.h&gt;
+-#  endif
+-#else
+-#  include &lt;drm/drm_mode.h&gt;
+-#endif
+-#include &lt;xf86drm.h&gt;
+-#include &lt;xf86drmMode.h&gt;
+ #include &lt;stb_image_write.h&gt;
+ 
+ extern struct ServerState server;
+@@ -63,56 +25,16 @@ extern struct config config;
+ 
+ static int vt_fd = -1;
+ 
+-int drm_fd = -1;
+-uint32_t conn_id = 0;
+-uint32_t cur_fb = 0;
+-uint32_t cur_handle;
+-uint64_t cur_size;
+-uint32_t cur_w = CURSOR_WIDTH;
+-uint32_t cur_h = CURSOR_HEIGHT;
+-void* cur_map;
+-uint32_t scanout_handle;
+-uint64_t scanout_size;
+-drmModeConnector* connector = NULL;
+-uint32_t fb_id = 0;
+-drmModeRes* resources = NULL;
+-drmModeEncoder* encoder = NULL;
+-drmModeCrtc* saved_crtc = NULL;
+-
+-/* wrappers for ioctl structures (from drm_mode.h) */
+-static int drm_create_dumb(int fd, uint32_t width, uint32_t height, uint32_t bpp,
+-                           struct drm_mode_create_dumb* create) {
+-	memset(create, 0, sizeof(*create));
+-	create-&gt;width = width;
+-	create-&gt;height = height;
+-	create-&gt;bpp = bpp;
+-	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, create) &lt; 0) {
+-		perror("[BGCE] DRM_IOCTL_MODE_CREATE_DUMB");
+-		return -1;
+-	}
+-	return 0;
+-}
+-
+-static int drm_map_dumb(int fd, uint32_t handle, uint64_t* offset) {
+-	struct drm_mode_map_dumb map = {0};
+-	map.handle = handle;
+-	if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &amp;map) &lt; 0) {
+-		perror("[BGCE] DRM_IOCTL_MODE_MAP_DUMB");
+-		return -1;
+-	}
+-	*offset = map.offset;
+-	return 0;
+-}
++#if CURSOR_WIDTH != 32 || CURSOR_HEIGHT != 32
++#error "software cursor blit assumes CURSOR_WIDTH/HEIGHT == 32"
++#endif
+ 
+-static int drm_destroy_dumb(int fd, uint32_t handle) {
+-	struct drm_mode_destroy_dumb dest = {0};
+-	dest.handle = handle;
+-	if (ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &amp;dest) &lt; 0) {
+-		perror("[BGCE] DRM_IOCTL_MODE_DESTROY_DUMB");
+-		return -1;
+-	}
+-	return 0;
+-}
++/* Software cursor: fixed 32×32 glyph + underlay, row memcpy onto fbdev. */
++static uint32_t cur_img[32 * 32];
++static uint32_t cur_underlay[32 * 32];
++static int cursor_x;
++static int cursor_y;
++static int cursor_visible;
+ 
+ static enum BGCECursorType current_cursor = BGCE_CURSOR_DEFAULT;
+ 
+@@ -371,25 +293,167 @@ static void render_cursor(uint32_t* buf, uint32_t stride_px, uint32_t w, uint32_
+ 	}
+ }
+ 
+-void set_cursor_type(enum BGCECursorType type) {
+-	if (type &lt; 0 || type &gt;= BGCE_CURSOR_COUNT)
+-		type = BGCE_CURSOR_DEFAULT;
+-	if (type == current_cursor)
++static void cursor_restore(void);
++static void cursor_paint(void);
++
++static uint32_t display_stride_px(const struct ServerState *srv)
++{
++	if (srv-&gt;display_pitch &gt;= srv-&gt;display_w * 4)
++		return srv-&gt;display_pitch / 4;
++	return srv-&gt;display_w;
++}
++
++/* Branchless src-over; a==0 keeps dst, a==255 keeps src. */
++static inline uint32_t blend32(uint32_t s, uint32_t d)
++{
++	uint32_t a = s &gt;&gt; 24;
++	uint32_t na = 255u - a;
++	uint32_t sr = (s &gt;&gt; 16) &amp; 255u, sg = (s &gt;&gt; 8) &amp; 255u, sb = s &amp; 255u;
++	uint32_t dr = (d &gt;&gt; 16) &amp; 255u, dg = (d &gt;&gt; 8) &amp; 255u, db = d &amp; 255u;
++	return (255u &lt;&lt; 24)
++		| (((sr * a + dr * na) / 255u) &lt;&lt; 16)
++		| (((sg * a + dg * na) / 255u) &lt;&lt; 8)
++		| ((sb * a + db * na) / 255u);
++}
++
++/*
++ * Blend a contiguous 32×32 block in place (1024 px). Unrolled — no row loop.
++ * sq holds underlay on entry, composited result on exit; src is the glyph.
++ */
++static void blend_sq32(uint32_t sq[32 * 32], const uint32_t src[32 * 32])
++{
++#define B(i) sq[i] = blend32(src[i], sq[i])
++#define BROW(o) \
++	B((o)+0);  B((o)+1);  B((o)+2);  B((o)+3);  \
++	B((o)+4);  B((o)+5);  B((o)+6);  B((o)+7);  \
++	B((o)+8);  B((o)+9);  B((o)+10); B((o)+11); \
++	B((o)+12); B((o)+13); B((o)+14); B((o)+15); \
++	B((o)+16); B((o)+17); B((o)+18); B((o)+19); \
++	B((o)+20); B((o)+21); B((o)+22); B((o)+23); \
++	B((o)+24); B((o)+25); B((o)+26); B((o)+27); \
++	B((o)+28); B((o)+29); B((o)+30); B((o)+31)
++	BROW(0);    BROW(32);   BROW(64);   BROW(96);
++	BROW(128);  BROW(160);  BROW(192);  BROW(224);
++	BROW(256);  BROW(288);  BROW(320);  BROW(352);
++	BROW(384);  BROW(416);  BROW(448);  BROW(480);
++	BROW(512);  BROW(544);  BROW(576);  BROW(608);
++	BROW(640);  BROW(672);  BROW(704);  BROW(736);
++	BROW(768);  BROW(800);  BROW(832);  BROW(864);
++	BROW(896);  BROW(928);  BROW(960);  BROW(992);
++#undef BROW
++#undef B
++}
++
++/* fb rows are pitch-separated; gather/scatter one 32×32 tile (unrolled memcpy). */
++static void fb_gather32(uint32_t sq[32 * 32], uint32_t *fb, uint32_t sp, int x, int y)
++{
++	size_t n = 32 * sizeof(uint32_t);
++#define G(r) memcpy(sq + (r) * 32, fb + (y + (r)) * (int)sp + x, n)
++	G(0);  G(1);  G(2);  G(3);  G(4);  G(5);  G(6);  G(7);
++	G(8);  G(9);  G(10); G(11); G(12); G(13); G(14); G(15);
++	G(16); G(17); G(18); G(19); G(20); G(21); G(22); G(23);
++	G(24); G(25); G(26); G(27); G(28); G(29); G(30); G(31);
++#undef G
++}
++
++static void fb_scatter32(uint32_t *fb, uint32_t sp, int x, int y,
++                         const uint32_t sq[32 * 32])
++{
++	size_t n = 32 * sizeof(uint32_t);
++#define S(r) memcpy(fb + (y + (r)) * (int)sp + x, sq + (r) * 32, n)
++	S(0);  S(1);  S(2);  S(3);  S(4);  S(5);  S(6);  S(7);
++	S(8);  S(9);  S(10); S(11); S(12); S(13); S(14); S(15);
++	S(16); S(17); S(18); S(19); S(20); S(21); S(22); S(23);
++	S(24); S(25); S(26); S(27); S(28); S(29); S(30); S(31);
++#undef S
++}
++
++static void clamp_cursor_pos(int *x, int *y)
++{
++	int max_x = (int)server.display_w - 32;
++	int max_y = (int)server.display_h - 32;
++	if (max_x &lt; 0) max_x = 0;
++	if (max_y &lt; 0) max_y = 0;
++	if (*x &lt; 0) *x = 0;
++	if (*y &lt; 0) *y = 0;
++	if (*x &gt; max_x) *x = max_x;
++	if (*y &gt; max_y) *y = max_y;
++}
++
++int display_cursor_init(void)
++{
++	render_cursor(cur_img, 32, 32, 32);
++	cursor_x = (int)server.display_w / 2;
++	cursor_y = (int)server.display_h / 2;
++	clamp_cursor_pos(&amp;cursor_x, &amp;cursor_y);
++	cursor_visible = 0;
++	cursor_paint();
++	return 0;
++}
++
++void display_cursor_fini(void)
++{
++	cursor_restore();
++	cursor_visible = 0;
++}
++
++static void cursor_restore(void)
++{
++	uint32_t sp;
++
++	if (!cursor_visible || !server.framebuffer)
+ 		return;
++	sp = display_stride_px(&amp;server);
++	fb_scatter32(server.framebuffer, sp, cursor_x, cursor_y, cur_underlay);
++	cursor_visible = 0;
++}
+ 
+-	current_cursor = type;
++static void cursor_paint(void)
++{
++	uint32_t sp;
++	uint32_t block[32 * 32];
+ 
+-	/* cur_map is the mmap'd DRM dumb buffer for the cursor */
+-	if (!cur_map || cur_map == MAP_FAILED)
++	if (!server.framebuffer)
+ 		return;
++	sp = display_stride_px(&amp;server);
++	fb_gather32(block, server.framebuffer, sp, cursor_x, cursor_y);
++	memcpy(cur_underlay, block, sizeof(block));
++	blend_sq32(block, cur_img);
++	fb_scatter32(server.framebuffer, sp, cursor_x, cursor_y, block);
++	cursor_visible = 1;
++}
++
++void display_cursor_refresh(void)
++{
++	cursor_restore();
++	cursor_paint();
++}
+ 
+-	uint32_t stride_px = cur_w; /* pitch in pixels (32bpp, tightly packed) */
+-	render_cursor((uint32_t*)cur_map, stride_px, cur_w, cur_h);
++void set_cursor_pos(struct ServerState *srv, int x, int y)
++{
++	(void)srv;
++	clamp_cursor_pos(&amp;x, &amp;y);
++	if (x == cursor_x &amp;&amp; y == cursor_y &amp;&amp; cursor_visible)
++		return;
++	cursor_restore();
++	cursor_x = x;
++	cursor_y = y;
++	cursor_paint();
++}
+ 
+-	/* Re-upload cursor to hardware */
+-	drmModeSetCursor(server.drm_fd, server.crtc_id, cur_handle, cur_w, cur_h);
++void set_cursor_type(enum BGCECursorType type)
++{
++	if (type &lt; 0 || type &gt;= BGCE_CURSOR_COUNT)
++		type = BGCE_CURSOR_DEFAULT;
++	if (type == current_cursor)
++		return;
++	current_cursor = type;
++	cursor_restore();
++	render_cursor(cur_img, 32, 32, 32);
++	cursor_paint();
+ }
+ 
++
+ int setup_vt_handling(void) {
+ 	/* Try the current tty first, then fall back to /dev/tty0 */
+ 	vt_fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
+@@ -415,7 +479,7 @@ int setup_vt_handling(void) {
+ 	return 0;
+ }
+ 
+-static void release_vt(void) {
++void release_vt(void) {
+ 	if (vt_fd &lt; 0)
+ 		return;
+ 	if (ioctl(vt_fd, KDSETMODE, KD_TEXT) &lt; 0)
+@@ -427,231 +491,6 @@ static void release_vt(void) {
+ 	vt_fd = -1;
+ }
+ 
+-int init_display() {
+-	uint32_t crtc_id = 0;
+-	drmModeModeInfo chosen_mode;
+-	bool found = false;
+-
+-	drm_fd = -1;
+-	for (int card = 0; card &lt; 10; card++) {
+-		char path[64];
+-		snprintf(path, sizeof(path), "/dev/dri/card%d", card);
+-		drm_fd = open(path, O_RDWR | O_CLOEXEC);
+-		if (drm_fd &gt;= 0) {
+-			break;
+-		}
+-	}
+-	if (drm_fd &lt; 0) {
+-		perror("[BGCE] open drm device (tried /dev/dri/card0..9)");
+-		return 1;
+-	}
+-	server.drm_fd = drm_fd;
+-
+-	setup_vt_handling();
+-
+-	resources = drmModeGetResources(drm_fd);
+-	if (!resources) {
+-		fprintf(stderr, "[BGCE] drmModeGetResources failed\n");
+-		close(drm_fd);
+-		return 1;
+-	}
+-
+-	/* Find first connected connector with at least one mode */
+-	for (int i = 0; i &lt; resources-&gt;count_connectors; i++) {
+-		connector = drmModeGetConnector(drm_fd, resources-&gt;connectors[i]);
+-		if (!connector)
+-			continue;
+-		if (connector-&gt;connection == DRM_MODE_CONNECTED &amp;&amp; connector-&gt;count_modes &gt; 0) {
+-			/* choose first mode */
+-			chosen_mode = connector-&gt;modes[0];
+-			conn_id = connector-&gt;connector_id;
+-			found = true;
+-			break;
+-		}
+-		drmModeFreeConnector(connector);
+-		connector = NULL;
+-	}
+-
+-	if (!found) {
+-		fprintf(stderr, "[BGCE] No connected connector with modes found\n");
+-		drmModeFreeResources(resources);
+-		close(drm_fd);
+-		return 1;
+-	}
+-
+-	/* Try to find an encoder and CRTC */
+-	if (connector-&gt;encoder_id)
+-		encoder = drmModeGetEncoder(drm_fd, connector-&gt;encoder_id);
+-
+-	if (encoder &amp;&amp; encoder-&gt;crtc_id) {
+-		crtc_id = encoder-&gt;crtc_id;
+-	} else {
+-		/* fallback: choose any possible CRTC from resources */
+-		for (int i = 0; i &lt; resources-&gt;count_encoders; i++) {
+-			drmModeEncoder* enc = drmModeGetEncoder(drm_fd, resources-&gt;encoders[i]);
+-			if (!enc)
+-				continue;
+-			/* pick first crtc that exists */
+-			for (int c = 0; c &lt; resources-&gt;count_crtcs; c++) {
+-				uint32_t possible = enc-&gt;possible_crtcs;
+-				if (possible &amp; (1 &lt;&lt; c)) {
+-					crtc_id = resources-&gt;crtcs[c];
+-					break;
+-				}
+-			}
+-			drmModeFreeEncoder(enc);
+-			if (crtc_id)
+-				break;
+-		}
+-	}
+-
+-	if (!crtc_id) {
+-		fprintf(stderr, "[BGCE] Failed to find a suitable CRTC\n");
+-		drmModeFreeConnector(connector);
+-		drmModeFreeResources(resources);
+-		close(drm_fd);
+-		return 1;
+-	}
+-
+-	/* Save current CRTC to restore later */
+-	saved_crtc = drmModeGetCrtc(drm_fd, crtc_id);
+-	if (!saved_crtc) {
+-		fprintf(stderr, "[BGCE] drmModeGetCrtc failed\n");
+-		/* continue anyway, but we'll try to restore nothing */
+-	}
+-
+-	uint32_t width = chosen_mode.hdisplay;
+-	uint32_t height = chosen_mode.vdisplay;
+-	uint32_t bpp = 32; /* use 32bpp for scanout */
+-	server.crtc_id = crtc_id;
+-	server.display_w = chosen_mode.hdisplay;
+-	server.display_h = chosen_mode.vdisplay;
+-	server.display_bpp = bpp;
+-
+-	printf("[BGCE] Setting up connector %u, CRTC %u, mode %ux%u@%u\n",
+-	       conn_id, crtc_id, width, height, chosen_mode.vrefresh);
+-
+-	/* ---------- Create dumb scanout buffer ---------- */
+-	struct drm_mode_create_dumb create = {0};
+-	if (drm_create_dumb(drm_fd, width, height, bpp, &amp;create) &lt; 0) {
+-		fprintf(stderr, "[BGCE] Failed to create dumb buffer for scanout\n");
+-		return -1;
+-	}
+-	scanout_handle = create.handle;
+-	scanout_size = create.size;
+-	uint32_t scanout_pitch = create.pitch;
+-
+-	/* allocate map */
+-	uint64_t scanout_offset;
+-	if (drm_map_dumb(drm_fd, scanout_handle, &amp;scanout_offset) &lt; 0) {
+-		fprintf(stderr, "[BGCE] Failed to map dumb buffer for scanout\n");
+-		return -1;
+-	}
+-
+-	server.framebuffer = mmap(NULL, scanout_size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, scanout_offset);
+-	if (server.framebuffer == MAP_FAILED) {
+-		perror("[BGCE] mmap scanout");
+-		return -1;
+-	}
+-
+-	/* Clear/draw content */
+-	memset(server.framebuffer, 0x00, scanout_size);
+-
+-	/* Create framebuffer object for scanout.
+-	 * Prefer drmModeAddFB2 (for specifying pixel-format), fallback to drmModeAddFB.
+-	 */
+-	bool fb2_ok = false;
+-#ifdef DRM_FORMAT_ARGB8888
+-	/* try adb2 path */
+-	{
+-		uint32_t handles[4] = {scanout_handle, 0, 0, 0};
+-		uint32_t pitches[4] = {scanout_pitch, 0, 0, 0};
+-		uint32_t offsets[4] = {0, 0, 0, 0};
+-		uint32_t format = DRM_FORMAT_XRGB8888; /* scanout content uses XRGB (no alpha) */
+-		if (drmModeAddFB2(drm_fd, width, height, format, handles, pitches, offsets, &amp;fb_id, 0) == 0) {
+-			fb2_ok = true;
+-		} else {
+-			/* drmModeAddFB2 may fail on older drivers; we'll fallback */
+-			fb2_ok = false;
+-		}
+-	}
+-#endif
+-
+-	if (!fb2_ok) {
+-		/* compute depth and bpp for legacy call */
+-		uint32_t depth = 24;
+-		if (drmModeAddFB(drm_fd, width, height, depth, bpp, scanout_pitch, scanout_handle, &amp;fb_id) != 0) {
+-			fprintf(stderr, "[BGCE] drmModeAddFB failed\n");
+-			return -1;
+-		}
+-	}
+-
+-	/* ---------- Create dumb cursor buffer (small ARGB) ---------- */
+-
+-	struct drm_mode_create_dumb cur_create = {0};
+-	if (drm_create_dumb(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, 32, &amp;cur_create) &lt; 0) {
+-		fprintf(stderr, "[BGCE] Failed to create dumb buffer for cursor\n");
+-		return -1;
+-	}
+-	cur_handle = cur_create.handle;
+-	cur_size = cur_create.size;
+-
+-	uint64_t cur_offset;
+-	uint32_t cur_pitch = cur_create.pitch;
+-	if (drm_map_dumb(drm_fd, cur_handle, &amp;cur_offset) &lt; 0) {
+-		fprintf(stderr, "[BGCE] Failed to map dumb cursor\n");
+-		return -1;
+-	}
+-	cur_map = mmap(NULL, cur_size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, cur_offset);
+-	if (cur_map == MAP_FAILED) {
+-		perror("[BGCE] mmap cursor");
+-		return -1;
+-	}
+-	memset(cur_map, 0, cur_size);
+-
+-	render_cursor((uint32_t*)cur_map, cur_w, CURSOR_WIDTH, CURSOR_HEIGHT);
+-
+-#ifdef DRM_FORMAT_ARGB8888
+-	{
+-		uint32_t handles[4] = {cur_handle, 0, 0, 0};
+-		uint32_t pitches[4] = {cur_pitch, 0, 0, 0};
+-		uint32_t offsets[4] = {0, 0, 0, 0};
+-		uint32_t format = DRM_FORMAT_ARGB8888;
+-		if (drmModeAddFB2(drm_fd, cur_w, cur_h, format, handles, pitches, offsets, &amp;cur_fb, 0) != 0) {
+-			fprintf(stderr, "[BGCE] drmModeAddFB2 for cursor failed, trying legacy\n");
+-			cur_fb = 0;
+-		}
+-	}
+-#endif
+-	if (!cur_fb) {
+-		/* Legacy fb creation for cursor might not support alpha; still try */
+-		uint32_t depth = 24;
+-		if (drmModeAddFB(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, depth, 32, cur_pitch, cur_handle, &amp;cur_fb) != 0) {
+-			fprintf(stderr, "[BGCE] drmModeAddFB for cursor failed\n");
+-			return -1;
+-		}
+-	}
+-
+-	/* ---------- Set CRTC (scanout) ---------- */
+-	if (drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &amp;conn_id, 1, &amp;chosen_mode) != 0) {
+-		fprintf(stderr, "[BGCE] drmModeSetCrtc failed: %s\n", strerror(errno));
+-		return -1;
+-	}
+-
+-	/* ---------- Set cursor ---------- */
+-	if (drmModeSetCursor(drm_fd, crtc_id, cur_handle, CURSOR_WIDTH, CURSOR_HEIGHT) != 0) {
+-		fprintf(stderr, "[BGCE] drmModeSetCursor failed: %s\n", strerror(errno));
+-		/* keep going — maybe hardware doesn't support cursor */
+-	} else {
+-		/* move cursor to near center */
+-		if (drmModeMoveCursor(drm_fd, crtc_id, width / 2, height / 2) != 0) {
+-			fprintf(stderr, "[BGCE] drmModeMoveCursor failed\n");
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+ /* ------------------------------------------------------------------
+  * Viewport / coordinate transforms
+  * ------------------------------------------------------------------ */
+@@ -751,7 +590,7 @@ static void blit_client_overlap(struct ServerState* srv, const struct Client* cl
+ 	if (ox0 &gt;= ox1 || oy0 &gt;= oy1)
+ 		return;
+ 
+-	uint32_t screen_w = srv-&gt;display_w;
++	uint32_t screen_w = display_stride_px(srv);
+ 	uint32_t* dst = (uint32_t*)srv-&gt;framebuffer;
+ 	uint32_t* src = (uint32_t*)cli-&gt;buffer;
+ 	const int cw = (int)cli-&gt;width;
+@@ -847,6 +686,7 @@ void redraw_all(struct ServerState* srv) {
+ 		return;
+ 	composite_chain_to_rect(srv, srv-&gt;clients, 0, 0,
+ 	                        (int)srv-&gt;display_w, (int)srv-&gt;display_h);
++	display_cursor_refresh();
+ }
+ 
+ void draw(struct ServerState* srv, struct Client cli) {
+@@ -871,6 +711,7 @@ void draw(struct ServerState* srv, struct Client cli) {
+ 		return;
+ 
+ 	blit_client_overlap(srv, &amp;cli, sx0, sy0, sx1, sy1);
++	display_cursor_refresh();
+ }
+ 
+ /*
+@@ -914,6 +755,7 @@ void redraw_region(struct ServerState* srv, struct Client c, int wdx, int wdy) {
+ 	 * then draw()s the client on top at its new position. */
+ 	if (ux0 &lt; ux1 &amp;&amp; uy0 &lt; uy1)
+ 		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
++	display_cursor_refresh();
+ }
+ 
+ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
+@@ -953,50 +795,7 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
+ 	/* Everything behind the resized client into the union; draw() later. */
+ 	if (ux0 &lt; ux1 &amp;&amp; uy0 &lt; uy1)
+ 		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
+-}
+-
+-void release_display(void) {
+-	/* Restore text mode first so the terminal is usable even if
+-	 * the DRM teardown below hangs or crashes. */
+-	release_vt();
+-
+-	if (cur_fb)
+-		drmModeRmFB(drm_fd, cur_fb);
+-
+-	if (cur_map &amp;&amp; cur_map != MAP_FAILED)
+-		munmap(cur_map, cur_size);
+-
+-	if (cur_handle)
+-		drm_destroy_dumb(drm_fd, cur_handle);
+-
+-	if (fb_id)
+-		drmModeRmFB(drm_fd, fb_id);
+-
+-	if (server.framebuffer &amp;&amp; server.framebuffer != MAP_FAILED)
+-		munmap(server.framebuffer, scanout_size);
+-
+-	if (scanout_handle)
+-		drm_destroy_dumb(drm_fd, scanout_handle);
+-
+-	/* restore saved CRTC if we have it */
+-	if (saved_crtc) {
+-		drmModeSetCrtc(drm_fd, saved_crtc-&gt;crtc_id,
+-		               saved_crtc-&gt;buffer_id,
+-		               saved_crtc-&gt;x, saved_crtc-&gt;y,
+-		               &amp;conn_id, 1,
+-		               &amp;saved_crtc-&gt;mode);
+-		drmModeFreeCrtc(saved_crtc);
+-	}
+-
+-	if (connector)
+-		drmModeFreeConnector(connector);
+-	if (resources)
+-		drmModeFreeResources(resources);
+-	if (encoder)
+-		drmModeFreeEncoder(encoder);
+-
+-	close(drm_fd);
+-	printf("[BGCE] Display released.\n");
++	display_cursor_refresh();
+ }
+ 
+ int take_screenshot(const char* filename) {
+@@ -1007,16 +806,16 @@ int take_screenshot(const char* filename) {
+ 
+ 	uint32_t width = server.display_w;
+ 	uint32_t height = server.display_h;
+-	uint32_t stride = width * BGCE_BYTES_PER_PIXEL;
++	uint32_t stride = server.display_pitch ? server.display_pitch
++	                                       : width * BGCE_BYTES_PER_PIXEL;
+ 
+-	// Write the framebuffer to a PNG file
+ 	int result = stbi_write_png(
+ 		filename,
+ 		width,
+ 		height,
+ 		BGCE_BYTES_PER_PIXEL,
+ 		server.framebuffer,
+-		stride
++		(int)stride
+ 	);
+ 
+ 	if (!result) {
+diff --git a/display_drm.c b/display_drm.c
+new file mode 100644
+index 0000000..3ce1693
+--- /dev/null
++++ b/display_drm.c
+@@ -0,0 +1,266 @@
++/*
++ * DRM/KMS display backend (optional). Build with BACKEND=drm / -DBGCE_USE_DRM.
++ * Still uses software cursor from display.c (no libdrm cursor ioctls required
++ * beyond modeset). Links -ldrm.
++ */
++#include "server.h"
++
++#include &lt;errno.h&gt;
++#include &lt;fcntl.h&gt;
++#include &lt;stdbool.h&gt;
++#include &lt;stdint.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/ioctl.h&gt;
++#include &lt;sys/mman.h&gt;
++#include &lt;unistd.h&gt;
++
++#if defined(__has_include)
++#  if __has_include(&lt;libdrm/drm.h&gt;)
++#    include &lt;libdrm/drm.h&gt;
++#    include &lt;libdrm/drm_mode.h&gt;
++#  else
++#    include &lt;drm/drm.h&gt;
++#    include &lt;drm/drm_mode.h&gt;
++#  endif
++#else
++#  include &lt;drm/drm.h&gt;
++#  include &lt;drm/drm_mode.h&gt;
++#endif
++#include &lt;xf86drm.h&gt;
++#include &lt;xf86drmMode.h&gt;
++
++extern struct ServerState server;
++
++static uint32_t conn_id;
++static uint32_t fb_id;
++static uint32_t scanout_handle;
++static uint64_t scanout_size;
++static drmModeConnector *connector;
++static drmModeRes *resources;
++static drmModeEncoder *encoder;
++static drmModeCrtc *saved_crtc;
++
++static int drm_create_dumb(int fd, uint32_t width, uint32_t height, uint32_t bpp,
++                           struct drm_mode_create_dumb *create)
++{
++	memset(create, 0, sizeof(*create));
++	create-&gt;width = width;
++	create-&gt;height = height;
++	create-&gt;bpp = bpp;
++	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, create) &lt; 0) {
++		perror("[BGCE] DRM_IOCTL_MODE_CREATE_DUMB");
++		return -1;
++	}
++	return 0;
++}
++
++static int drm_map_dumb(int fd, uint32_t handle, uint64_t *offset)
++{
++	struct drm_mode_map_dumb map = {0};
++	map.handle = handle;
++	if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &amp;map) &lt; 0) {
++		perror("[BGCE] DRM_IOCTL_MODE_MAP_DUMB");
++		return -1;
++	}
++	*offset = map.offset;
++	return 0;
++}
++
++static int drm_destroy_dumb(int fd, uint32_t handle)
++{
++	struct drm_mode_destroy_dumb dest = {0};
++	dest.handle = handle;
++	if (ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &amp;dest) &lt; 0) {
++		perror("[BGCE] DRM_IOCTL_MODE_DESTROY_DUMB");
++		return -1;
++	}
++	return 0;
++}
++
++int init_display(void)
++{
++	int drm_fd = -1;
++	for (int card = 0; card &lt; 10; card++) {
++		char path[64];
++		snprintf(path, sizeof(path), "/dev/dri/card%d", card);
++		drm_fd = open(path, O_RDWR | O_CLOEXEC);
++		if (drm_fd &gt;= 0)
++			break;
++	}
++	if (drm_fd &lt; 0) {
++		perror("[BGCE] open drm device (tried /dev/dri/card0..9)");
++		return 1;
++	}
++	server.display_fd = drm_fd;
++	setup_vt_handling();
++
++	resources = drmModeGetResources(drm_fd);
++	if (!resources) {
++		fprintf(stderr, "[BGCE] drmModeGetResources failed\n");
++		close(drm_fd);
++		server.display_fd = -1;
++		return 1;
++	}
++
++	drmModeModeInfo chosen_mode;
++	bool found = false;
++	uint32_t crtc_id = 0;
++	for (int i = 0; i &lt; resources-&gt;count_connectors; i++) {
++		connector = drmModeGetConnector(drm_fd, resources-&gt;connectors[i]);
++		if (!connector)
++			continue;
++		if (connector-&gt;connection == DRM_MODE_CONNECTED &amp;&amp;
++		    connector-&gt;count_modes &gt; 0) {
++			chosen_mode = connector-&gt;modes[0];
++			conn_id = connector-&gt;connector_id;
++			found = true;
++			break;
++		}
++		drmModeFreeConnector(connector);
++		connector = NULL;
++	}
++	if (!found) {
++		fprintf(stderr, "[BGCE] No connected connector with modes found\n");
++		drmModeFreeResources(resources);
++		resources = NULL;
++		close(drm_fd);
++		server.display_fd = -1;
++		return 1;
++	}
++
++	if (connector-&gt;encoder_id)
++		encoder = drmModeGetEncoder(drm_fd, connector-&gt;encoder_id);
++	if (encoder &amp;&amp; encoder-&gt;crtc_id) {
++		crtc_id = encoder-&gt;crtc_id;
++	} else {
++		for (int i = 0; i &lt; resources-&gt;count_encoders; i++) {
++			drmModeEncoder *enc = drmModeGetEncoder(drm_fd, resources-&gt;encoders[i]);
++			if (!enc)
++				continue;
++			for (int c = 0; c &lt; resources-&gt;count_crtcs; c++) {
++				if (enc-&gt;possible_crtcs &amp; (1u &lt;&lt; c)) {
++					crtc_id = resources-&gt;crtcs[c];
++					break;
++				}
++			}
++			drmModeFreeEncoder(enc);
++			if (crtc_id)
++				break;
++		}
++	}
++	if (!crtc_id) {
++		fprintf(stderr, "[BGCE] Failed to find a suitable CRTC\n");
++		release_display();
++		return 1;
++	}
++	server.crtc_id = crtc_id;
++	saved_crtc = drmModeGetCrtc(drm_fd, crtc_id);
++
++	uint32_t width = chosen_mode.hdisplay;
++	uint32_t height = chosen_mode.vdisplay;
++	uint32_t bpp = 32;
++	server.display_w = width;
++	server.display_h = height;
++	server.display_bpp = bpp;
++
++	struct drm_mode_create_dumb create = {0};
++	if (drm_create_dumb(drm_fd, width, height, bpp, &amp;create) &lt; 0)
++		return -1;
++	scanout_handle = create.handle;
++	scanout_size = create.size;
++	uint32_t scanout_pitch = create.pitch;
++	server.display_pitch = scanout_pitch;
++	server.fb_size = (size_t)scanout_size;
++
++	uint64_t scanout_offset;
++	if (drm_map_dumb(drm_fd, scanout_handle, &amp;scanout_offset) &lt; 0)
++		return -1;
++	server.framebuffer = mmap(NULL, scanout_size, PROT_READ | PROT_WRITE,
++	                          MAP_SHARED, drm_fd, scanout_offset);
++	if (server.framebuffer == MAP_FAILED) {
++		perror("[BGCE] mmap scanout");
++		return -1;
++	}
++	memset(server.framebuffer, 0, scanout_size);
++
++	bool fb2_ok = false;
++#ifdef DRM_FORMAT_XRGB8888
++	{
++		uint32_t handles[4] = {scanout_handle, 0, 0, 0};
++		uint32_t pitches[4] = {scanout_pitch, 0, 0, 0};
++		uint32_t offsets[4] = {0, 0, 0, 0};
++		if (drmModeAddFB2(drm_fd, width, height, DRM_FORMAT_XRGB8888,
++		                  handles, pitches, offsets, &amp;fb_id, 0) == 0)
++			fb2_ok = true;
++	}
++#endif
++	if (!fb2_ok) {
++		if (drmModeAddFB(drm_fd, width, height, 24, bpp, scanout_pitch,
++		                 scanout_handle, &amp;fb_id) != 0) {
++			fprintf(stderr, "[BGCE] drmModeAddFB failed\n");
++			return -1;
++		}
++	}
++
++	if (drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &amp;conn_id, 1,
++	                   &amp;chosen_mode) != 0) {
++		fprintf(stderr, "[BGCE] drmModeSetCrtc failed: %s\n", strerror(errno));
++		return -1;
++	}
++
++	printf("[BGCE] DRM connector %u CRTC %u mode %ux%u@%u pitch=%u\n",
++	       conn_id, crtc_id, width, height, chosen_mode.vrefresh, scanout_pitch);
++
++	if (display_cursor_init() != 0) {
++		fprintf(stderr, "[BGCE] software cursor init failed\n");
++		release_display();
++		return 1;
++	}
++	return 0;
++}
++
++void release_display(void)
++{
++	release_vt();
++	display_cursor_fini();
++
++	int drm_fd = server.display_fd;
++	if (fb_id &amp;&amp; drm_fd &gt;= 0)
++		drmModeRmFB(drm_fd, fb_id);
++	fb_id = 0;
++
++	if (server.framebuffer &amp;&amp; server.framebuffer != MAP_FAILED) {
++		munmap(server.framebuffer, scanout_size ? scanout_size : server.fb_size);
++		server.framebuffer = NULL;
++	}
++	if (scanout_handle &amp;&amp; drm_fd &gt;= 0)
++		drm_destroy_dumb(drm_fd, scanout_handle);
++	scanout_handle = 0;
++
++	if (saved_crtc &amp;&amp; drm_fd &gt;= 0) {
++		drmModeSetCrtc(drm_fd, saved_crtc-&gt;crtc_id, saved_crtc-&gt;buffer_id,
++		               saved_crtc-&gt;x, saved_crtc-&gt;y, &amp;conn_id, 1,
++		               &amp;saved_crtc-&gt;mode);
++		drmModeFreeCrtc(saved_crtc);
++		saved_crtc = NULL;
++	}
++	if (connector) {
++		drmModeFreeConnector(connector);
++		connector = NULL;
++	}
++	if (resources) {
++		drmModeFreeResources(resources);
++		resources = NULL;
++	}
++	if (encoder) {
++		drmModeFreeEncoder(encoder);
++		encoder = NULL;
++	}
++	if (drm_fd &gt;= 0) {
++		close(drm_fd);
++		server.display_fd = -1;
++	}
++	printf("[BGCE] Display released.\n");
++}
+diff --git a/display_fbdev.c b/display_fbdev.c
+new file mode 100644
+index 0000000..7a85859
+--- /dev/null
++++ b/display_fbdev.c
+@@ -0,0 +1,133 @@
++/*
++ * Linux framebuffer (/dev/fb0) display backend — default, no libdrm.
++ */
++#include "server.h"
++
++#include &lt;errno.h&gt;
++#include &lt;fcntl.h&gt;
++#include &lt;linux/fb.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/ioctl.h&gt;
++#include &lt;sys/mman.h&gt;
++#include &lt;unistd.h&gt;
++
++extern struct ServerState server;
++
++static struct fb_var_screeninfo saved_vinfo;
++static int have_saved_vinfo;
++
++int init_display(void)
++{
++	static const char *paths[] = {
++		"/dev/fb0", "/dev/fb1", "/dev/fb2", NULL
++	};
++	int fd = -1;
++	const char *used = NULL;
++	int i;
++
++	for (i = 0; paths[i]; i++) {
++		fd = open(paths[i], O_RDWR | O_CLOEXEC);
++		if (fd &gt;= 0) {
++			used = paths[i];
++			break;
++		}
++	}
++	if (fd &lt; 0) {
++		perror("[BGCE] open /dev/fb*");
++		return 1;
++	}
++
++	struct fb_var_screeninfo vinfo;
++	struct fb_fix_screeninfo finfo;
++	memset(&amp;vinfo, 0, sizeof(vinfo));
++	memset(&amp;finfo, 0, sizeof(finfo));
++	if (ioctl(fd, FBIOGET_VSCREENINFO, &amp;vinfo) &lt; 0 ||
++	    ioctl(fd, FBIOGET_FSCREENINFO, &amp;finfo) &lt; 0) {
++		perror("[BGCE] FBIOGET_*SCREENINFO");
++		close(fd);
++		return 1;
++	}
++	saved_vinfo = vinfo;
++	have_saved_vinfo = 1;
++
++	if (vinfo.bits_per_pixel != 32) {
++		vinfo.bits_per_pixel = 32;
++		vinfo.xoffset = 0;
++		vinfo.yoffset = 0;
++		if (ioctl(fd, FBIOPUT_VSCREENINFO, &amp;vinfo) &lt; 0) {
++			fprintf(stderr,
++			        "[BGCE] need 32bpp framebuffer (have %u): %s\n",
++			        saved_vinfo.bits_per_pixel, strerror(errno));
++			close(fd);
++			return 1;
++		}
++		if (ioctl(fd, FBIOGET_VSCREENINFO, &amp;vinfo) &lt; 0 ||
++		    ioctl(fd, FBIOGET_FSCREENINFO, &amp;finfo) &lt; 0) {
++			perror("[BGCE] re-read screen info");
++			close(fd);
++			return 1;
++		}
++	}
++
++	if (vinfo.bits_per_pixel != 32) {
++		fprintf(stderr, "[BGCE] unsupported bpp %u (want 32)\n",
++		        (unsigned)vinfo.bits_per_pixel);
++		close(fd);
++		return 1;
++	}
++
++	size_t visible = (size_t)finfo.line_length * (size_t)vinfo.yres;
++	size_t size = (size_t)finfo.smem_len;
++	if (size &lt; visible)
++		size = visible;
++
++	void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	if (map == MAP_FAILED) {
++		perror("[BGCE] mmap /dev/fb");
++		close(fd);
++		return 1;
++	}
++
++	server.display_fd = fd;
++	server.framebuffer = map;
++	server.fb_size = size;
++	server.display_w = vinfo.xres;
++	server.display_h = vinfo.yres;
++	server.display_bpp = vinfo.bits_per_pixel;
++	server.display_pitch = finfo.line_length;
++	memset(map, 0, visible);
++
++	setup_vt_handling();
++
++	printf("[BGCE] fbdev %s %ux%u pitch=%u bpp=%u\n",
++	       used, server.display_w, server.display_h,
++	       server.display_pitch, server.display_bpp);
++
++	if (display_cursor_init() != 0) {
++		fprintf(stderr, "[BGCE] software cursor init failed\n");
++		release_display();
++		return 1;
++	}
++	return 0;
++}
++
++void release_display(void)
++{
++	release_vt();
++	display_cursor_fini();
++
++	if (server.framebuffer &amp;&amp; server.framebuffer != MAP_FAILED) {
++		munmap(server.framebuffer, server.fb_size);
++		server.framebuffer = NULL;
++		server.fb_size = 0;
++	}
++	if (server.display_fd &gt;= 0) {
++		if (have_saved_vinfo)
++			(void)ioctl(server.display_fd, FBIOPUT_VSCREENINFO, &amp;saved_vinfo);
++		close(server.display_fd);
++		server.display_fd = -1;
++	}
++	have_saved_vinfo = 0;
++	printf("[BGCE] Display released.\n");
++}
+diff --git a/input.c b/input.c
+index cca0330..daaef12 100644
+--- a/input.c
++++ b/input.c
+@@ -24,6 +24,11 @@ int alt_down = 0;
+ int mouse_x;
+ int mouse_y;
+ 
++/* Accumulate REL/ABS until EV_SYN so the software cursor is painted once
++ * per hardware report, not once per axis. */
++static int pointer_dirty;
++static int skip_cursor_paint; /* set when a redraw will repaint the cursor */
++
+ size_t count;
+ struct pollfd fds[MAX_INPUT_DEVICES];
+ 
+@@ -150,8 +155,14 @@ static void apply_zoom_at_cursor(float factor) {
+ int init_input(void) {
+ 	count = 0;
+ 	drag.active = 0;
+-	mouse_x = server.display_w / 2;
+-	mouse_y = server.display_h / 2;
++	mouse_x = (int)server.display_w / 2;
++	mouse_y = (int)server.display_h / 2;
++	if (mouse_x &gt; (int)server.display_w - CURSOR_WIDTH)
++		mouse_x = (int)server.display_w - CURSOR_WIDTH;
++	if (mouse_y &gt; (int)server.display_h - CURSOR_HEIGHT)
++		mouse_y = (int)server.display_h - CURSOR_HEIGHT;
++	if (mouse_x &lt; 0) mouse_x = 0;
++	if (mouse_y &lt; 0) mouse_y = 0;
+ 	memset(dev_info, 0, sizeof(dev_info));
+ 
+ 	printf("[BGCE] Input: scanning %s for devices (max %d slots)\n",
+@@ -172,7 +183,7 @@ int init_input(void) {
+ 		char path[256 + 12];
+ 		snprintf(path, sizeof(path), "%s/%s", INPUT_DIR, ent-&gt;d_name);
+ 
+-		int fd = open(path, O_RDONLY | O_NONBLOCK);
++		int fd = open(path, O_RDONLY | O_CLOEXEC);
+ 		if (fd &lt; 0) {
+ 			fprintf(stderr, "[BGCE] Input: cannot open %s: %s%s\n",
+ 			        path, strerror(errno),
+@@ -612,29 +623,27 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		mouse_y += dy;
+ 
+ 		// Clamp mouse coordinates to screen boundaries
+-		if (mouse_x &lt; 0)
+-			mouse_x = 0;
+-		if (mouse_y &lt; 0)
+-			mouse_y = 0;
+-		if (mouse_x &gt; (int)server.display_w)
+-			mouse_x = (int)server.display_w;
+-		if (mouse_y &gt; (int)server.display_h)
+-			mouse_y = (int)server.display_h;
+-
+-		drmModeMoveCursor(
+-		        server.drm_fd,
+-		        server.crtc_id,
+-		        mouse_x,
+-		        mouse_y);
++		{
++			int max_x = (int)server.display_w - CURSOR_WIDTH;
++			int max_y = (int)server.display_h - CURSOR_HEIGHT;
++			if (max_x &lt; 0) max_x = 0;
++			if (max_y &lt; 0) max_y = 0;
++			if (mouse_x &lt; 0) mouse_x = 0;
++			if (mouse_y &lt; 0) mouse_y = 0;
++			if (mouse_x &gt; max_x) mouse_x = max_x;
++			if (mouse_y &gt; max_y) mouse_y = max_y;
++		}
++
++		pointer_dirty = 1;
+ 
+ 		if (drag.active) {
+ 			switch (drag.type) {
+ 			case DRAG_PAN: {
+-				/* Dragging the desktop: pan opposite to pointer motion */
+ 				float z = server.zoom &gt; 0.0f ? server.zoom : 1.0f;
+ 				server.pan_x -= (float)dx / z;
+ 				server.pan_y -= (float)dy / z;
+ 				clamp_viewport(&amp;server);
++				skip_cursor_paint = 1;
+ 				redraw_all(&amp;server);
+ 				break;
+ 			}
+@@ -646,6 +655,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 				screen_delta_to_world((float)dx, (float)dy,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				if (wdx || wdy) {
++					skip_cursor_paint = 1;
+ 					redraw_region(&amp;server, *c, wdx, wdy);
+ 					c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
+ 					c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
+@@ -664,6 +674,17 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			}
+ 			return 1;
+ 		}
++		return 0;
++	}
++
++	if (ev.type == EV_SYN &amp;&amp; ev.code == SYN_REPORT) {
++		if (pointer_dirty) {
++			if (!skip_cursor_paint)
++				set_cursor_pos(&amp;server, mouse_x, mouse_y);
++			pointer_dirty = 0;
++			skip_cursor_paint = 0;
++		}
++		return 0;
+ 	}
+ 
+ 	/* Absolute pointer events (touchpads, touchscreens, tablets) */
+@@ -692,16 +713,18 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		}
+ 
+ 		/* Clamp */
+-		if (mouse_x &lt; 0) mouse_x = 0;
+-		if (mouse_y &lt; 0) mouse_y = 0;
+-		if (mouse_x &gt; (int)server.display_w) mouse_x = (int)server.display_w;
+-		if (mouse_y &gt; (int)server.display_h) mouse_y = (int)server.display_h;
++		{
++			int max_x = (int)server.display_w - CURSOR_WIDTH;
++			int max_y = (int)server.display_h - CURSOR_HEIGHT;
++			if (max_x &lt; 0) max_x = 0;
++			if (max_y &lt; 0) max_y = 0;
++			if (mouse_x &lt; 0) mouse_x = 0;
++			if (mouse_y &lt; 0) mouse_y = 0;
++			if (mouse_x &gt; max_x) mouse_x = max_x;
++			if (mouse_y &gt; max_y) mouse_y = max_y;
++		}
+ 
+-		drmModeMoveCursor(
+-		        server.drm_fd,
+-		        server.crtc_id,
+-		        mouse_x,
+-		        mouse_y);
++		pointer_dirty = 1;
+ 
+ 		if (drag.active) {
+ 			int dx = mouse_x - old_x;
+@@ -713,6 +736,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 				server.pan_x -= (float)dx / z;
+ 				server.pan_y -= (float)dy / z;
+ 				clamp_viewport(&amp;server);
++				skip_cursor_paint = 1;
+ 				redraw_all(&amp;server);
+ 				break;
+ 			}
+@@ -724,6 +748,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 				screen_delta_to_world((float)dx, (float)dy,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				if (wdx || wdy) {
++					skip_cursor_paint = 1;
+ 					redraw_region(&amp;server, *c, wdx, wdy);
+ 					c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
+ 					c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
+@@ -793,14 +818,15 @@ void* input_loop(void* arg) {
+ 			if (n != sizeof(ev))
+ 				continue;
+ 
+-			if (handle_input_event(ev, i))
++			if (handle_input_event(ev, (int)i))
+ 				continue;
+ 
+ 			if (!server.focused_client)
+ 				continue;
++			if (ev.type == EV_SYN)
++				continue;
+ 
+ 			struct Client c = *server.focused_client;
+-
+ 			struct InputEvent e = {0};
+ 			e.type = ev.type;
+ 			e.device = server.input.devs[i];
+@@ -823,8 +849,6 @@ void* input_loop(void* arg) {
+ 				         wy &lt; (float)(c.y + c.height);
+ 				if (!in)
+ 					continue;
+-
+-				/* Client-local coordinates in buffer/world pixels */
+ 				e.x = (int32_t)(wx - (float)c.x);
+ 				e.y = (int32_t)(wy - (float)c.y);
+ 				break;
+@@ -833,7 +857,6 @@ void* input_loop(void* arg) {
+ 				continue;
+ 			}
+ 
+-			/* Send to focused client */
+ 			struct BGCEMessage msg;
+ 			msg.type = MSG_INPUT_EVENT;
+ 			msg.data.input_event = e;
+diff --git a/libbgce.c b/libbgce.c
+index bc633d4..1ec91fc 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -10,6 +10,25 @@
+ #include &lt;sys/un.h&gt;
+ #include &lt;unistd.h&gt;
+ 
++char *bgce_socket_path(char *buf, size_t buflen)
++{
++	const char *runtime;
++	int n;
++
++	if (!buf || buflen &lt; 16)
++		return NULL;
++
++	runtime = getenv("XDG_RUNTIME_DIR");
++	if (runtime &amp;&amp; runtime[0] == '/')
++		n = snprintf(buf, buflen, "%s/bgce.sock", runtime);
++	else
++		n = snprintf(buf, buflen, "/tmp/bgce-%ld.sock", (long)getuid());
++
++	if (n &lt; 0 || (size_t)n &gt;= buflen || (size_t)n &gt;= BGCE_SOCKPATH_MAX)
++		return NULL;
++	return buf;
++}
++
+ /* Write exactly 'size' bytes */
+ ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg) {
+ 	size_t size = sizeof(struct BGCEMessage);
+@@ -35,21 +54,28 @@ ssize_t bgce_recv_msg(int conn, struct BGCEMessage* msg) {
+ 
+ /* Connect to the BGCE server */
+ int bgce_connect(void) {
+-	int bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
++	char path[BGCE_SOCKPATH_MAX];
++	int bgce_fd;
++	struct sockaddr_un addr;
++
++	if (!bgce_socket_path(path, sizeof(path))) {
++		fprintf(stderr, "[BGCE] socket path too long\n");
++		return -1;
++	}
++
++	bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+ 	if (bgce_fd &lt; 0) {
+ 		perror("[BGCE] socket");
+ 		return -1;
+ 	}
+ 
+-	struct sockaddr_un addr;
+ 	memset(&amp;addr, 0, sizeof(addr));
+ 	addr.sun_family = AF_UNIX;
+-	strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
++	memcpy(addr.sun_path, path, strlen(path) + 1);
+ 
+ 	if (connect(bgce_fd, (struct sockaddr*)&amp;addr, sizeof(addr)) &lt; 0) {
+-		perror("[BGCE] connect");
++		fprintf(stderr, "[BGCE] connect %s: %s\n", path, strerror(errno));
+ 		close(bgce_fd);
+-		bgce_fd = -1;
+ 		return -2;
+ 	}
+ 	return bgce_fd;
+diff --git a/server.c b/server.c
+index 4fed9ef..97c7da7 100644
+--- a/server.c
++++ b/server.c
+@@ -24,8 +24,16 @@ static void ensure_dir(const char *path) {
+ 	mkdir(path, 0755);
+ }
+ 
++static char listen_sock_path[BGCE_SOCKPATH_MAX];
++
+ static void cleanup_and_exit(int sig) {
+ 	(void)sig;
++	if (listen_sock_path[0])
++		unlink(listen_sock_path);
++	if (server.server_fd &gt;= 0) {
++		close(server.server_fd);
++		server.server_fd = -1;
++	}
+ 	release_display();
+ 	_exit(0);
+ }
+@@ -79,10 +87,13 @@ int main(void) {
+ 	signal(SIGTERM, cleanup_and_exit);
+ 
+ 	memset(&amp;server, 0, sizeof(struct ServerState));
+-	server.drm_fd = -1;
++	server.display_fd = -1;
++	server.server_fd = -1;
+ 	server.framebuffer = NULL;
+-	server.crtc_id = 0;
++	server.display_pitch = 0;
++	server.fb_size = 0;
+ 	server.client_count = 0;
++	listen_sock_path[0] = '\0';
+ 
+ 	char* home = getenv("HOME");
+ 	if (home) {
+@@ -93,6 +104,11 @@ int main(void) {
+ 	printf("[BGCE] Loaded config type=%u, path=%s, mode=%u, shortcuts=%d\n",
+ 	       config.type, config.path, config.mode, config.shortcut_count);
+ 
++	if (!bgce_socket_path(listen_sock_path, sizeof(listen_sock_path))) {
++		fprintf(stderr, "[BGCE] socket path too long\n");
++		return 1;
++	}
++
+ 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+ 	if (fd &lt; 0) {
+ 		perror("[BGCE] socket");
+@@ -102,17 +118,29 @@ int main(void) {
+ 	struct sockaddr_un addr;
+ 	memset(&amp;addr, 0, sizeof(addr));
+ 	addr.sun_family = AF_UNIX;
+-	strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+-	unlink(SOCKET_PATH);
++	memcpy(addr.sun_path, listen_sock_path, strlen(listen_sock_path) + 1);
++
++	if (unlink(listen_sock_path) &lt; 0 &amp;&amp; errno != ENOENT) {
++		fprintf(stderr, "[BGCE] unlink %s: %s\n"
++		        "  (stale socket from another user? remove it as that user/root)\n",
++		        listen_sock_path, strerror(errno));
++		close(fd);
++		return 1;
++	}
+ 
+ 	if (bind(fd, (struct sockaddr*)&amp;addr, sizeof(addr)) &lt; 0) {
+-		perror("[BGCE] bind");
++		fprintf(stderr, "[BGCE] bind %s: %s\n", listen_sock_path, strerror(errno));
++		if (errno == EADDRINUSE)
++			fprintf(stderr, "  another bgce is already running for this user "
++			        "(killall bgce &amp;&amp; rm -f %s)\n", listen_sock_path);
+ 		close(fd);
+ 		return 1;
+ 	}
++	chmod(listen_sock_path, 0600);
+ 
+ 	if (listen(fd, 8) &lt; 0) {
+ 		perror("[BGCE] listen");
++		unlink(listen_sock_path);
+ 		close(fd);
+ 		return 1;
+ 	}
+@@ -175,7 +203,7 @@ int main(void) {
+ 	}
+ 	pthread_detach(input_thread);
+ 
+-	printf("[BGCE] Server listening on %s\n", SOCKET_PATH);
++	printf("[BGCE] Server listening on %s\n", listen_sock_path);
+ 
+ 	while (1) {
+ 		int client_fd = accept(fd, NULL, NULL);
+@@ -206,7 +234,5 @@ int main(void) {
+ 	}
+ 
+ 	release_display();
+-	free(server.framebuffer);
+-
+ 	return 0;
+ }
+diff --git a/server.h b/server.h
+index e8abc08..e63ebe3 100644
+--- a/server.h
++++ b/server.h
+@@ -4,21 +4,9 @@
+ #define _XOPEN_SOURCE 700
+ #include "bgce.h"
+ 
+-#if defined(__has_include)
+-#  if __has_include(&lt;libdrm/drm_mode.h&gt;)
+-#    include &lt;libdrm/drm_mode.h&gt;
+-#  elif __has_include(&lt;drm/drm_mode.h&gt;)
+-#    include &lt;drm/drm_mode.h&gt;
+-#  else
+-#    include &lt;drm/drm_mode.h&gt;
+-#  endif
+-#else
+-#  include &lt;drm/drm_mode.h&gt;
+-#endif
+ #include &lt;pthread.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;sys/types.h&gt;
+-#include &lt;xf86drmMode.h&gt;
+ 
+ #define MAX_PATH_LEN 512
+ 
+@@ -62,12 +50,16 @@ struct InputState {
+ 
+ struct ServerState {
+ 	int server_fd;
+-	int drm_fd;
+-	uint32_t crtc_id;
++	int display_fd;          /* /dev/fb* or /dev/dri/card* */
+ 	uint32_t display_w;
+ 	uint32_t display_h;
+ 	uint32_t display_bpp;
++	uint32_t display_pitch;  /* bytes per row */
++	size_t fb_size;
+ 	void* framebuffer;
++#ifdef BGCE_USE_DRM
++	uint32_t crtc_id;
++#endif
+ 
+ 	/* Virtual desktop / viewport (see BGCE_WORLD_SCALE) */
+ 	uint32_t virtual_w;
+@@ -155,8 +147,8 @@ int apply_background(struct config* config, uint32_t* buffer, uint32_t width, ui
+  * Cursor
+  * ---------------------------- */
+ 
+-#define CURSOR_WIDTH 64
+-#define CURSOR_HEIGHT 64
++#define CURSOR_WIDTH 32
++#define CURSOR_HEIGHT 32
+ #define CURSOR_HOTSPOT_X 0
+ #define CURSOR_HOTSPOT_Y 0
+ 
+@@ -171,7 +163,13 @@ int init_display();
+ 
+ void release_display(void);
+ 
+-void set_drm_cursor(struct ServerState* srv, int x, int y);
++void set_cursor_pos(struct ServerState* srv, int x, int y);
++
++int setup_vt_handling(void);
++void release_vt(void);
++int display_cursor_init(void);
++void display_cursor_fini(void);
++void display_cursor_refresh(void);
+ 
+ void set_cursor_type(enum BGCECursorType type);
+ 
+</pre>

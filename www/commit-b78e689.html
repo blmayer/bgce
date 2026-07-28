@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce b78e689</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit b78e689
+parent <a href=commit-9629059.html>9629059</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-12-23T08:55:19-03:00
+
+    added config section
+
+<a href=tree-b78e689.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/www/index.html b/www/index.html
+index f0cbe0b..0a02d7c 100644
+--- a/www/index.html
++++ b/www/index.html
+@@ -40,6 +40,14 @@ The system is split into two components:
+ To keep track of the develoment check the commit log
+ on the &lt;a href=feed.xml&gt;feed&lt;/a&gt;.
+ 
++ 
++&lt;i&gt;Goals&lt;/i&gt;
++
++- Minimal, understandable graphics stack in C
++- No external dependencies like OpenGL, X11 etc
++- Educational reference for framebuffer-based
++  compositing and IPC
++
+ 
+ &lt;b&gt;Build Instructions&lt;/b&gt;
+ 
+@@ -49,8 +57,53 @@ on the &lt;a href=feed.xml&gt;feed&lt;/a&gt;.
+ 	./bgce   # run server
+ 	./client # run test client (in another TTY)
+ 
++  
++&lt;b&gt;Configuration&lt;/b&gt;
++
++BGCE supports configuration for the background through a config file. By default, it looks for `~/.config/bgce.conf`.
++
++&lt;i&gt;Config File Format&lt;/i&gt;
++
++```ini
++[background]
++# Background type: "color" or "image"
++type = color
++
++# For color background:
++color = #RRGGBB   # Hex color code (e.g., #FF0000 for red)
++# or
++color = #RRGGBBAA # Hex color with alpha (e.g., #FF000080 for semi-transparent red)
++
++# For image background:
++#path = /path/to/image.png
++#mode = tiled     # or "scaled"
++```
++
++
++&lt;i&gt;Example Config File&lt;/i&gt;
++
++```ini
++[background]
++type = color
++color = #336699
++```
+ 
+-&lt;i&gt;Developing client applications&lt;/i&gt;
++or
++
++```ini
++[background]
++type = image
++path = /usr/share/backgrounds/default.png
++mode = scaled
++```
++
++
++&lt;i&gt;Notes&lt;/i&gt;
++
++- Scaled images look horrible.
++
++
++&lt;b&gt;Developing client applications&lt;/b&gt;
+ 
+ BGCE clients should write directly to the buffer
+ and call draw(), so the server will draw it to the
+@@ -64,15 +117,6 @@ know if the most common ones can directly handle
+ buffers. So I am creating a toolkit: &lt;a href=/bgtk/index.html&gt;BGTK&lt;/a&gt;, check it
+ out if you want.
+ 
+- 
+-&lt;b&gt;Goals&lt;/b&gt;
+-
+-- Minimal, understandable graphics stack in C
+-- No external dependencies like OpenGL, X11 etc
+-- Educational reference for framebuffer-based
+-  compositing and IPC
+-
+-
+ &lt;b&gt;License&lt;/b&gt;
+ 
+ BSD 2-clause license.
+</pre>

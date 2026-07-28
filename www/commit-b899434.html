@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce b899434</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit b899434
+parent <a href=commit-018b9aa.html>018b9aa</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-08T11:38:09-03:00
+
+    Scale buffer requests by zoom; speed up compositor blits.
+
+    Treat client width/height as logical screen pixels and convert to world
+    size via 1/zoom so windows keep on-screen size when zoomed. bgce_get_buffer
+    now takes a BufferRequest pointer and writes back actual dimensions.
+    
+    Replace the per-pixel float NN path with 1:1 row memcpy at zoom≈1 and a
+    fixed-point nearest-neighbour blit (run-length fill when magnifying).
+
+<a href=tree-b899434.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/bgce.h b/bgce.h
+index a43a282..6ab92f1 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -150,9 +150,13 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
+ 
+ /**
+  * Request a shared memory buffer from the server.
++ * req-&gt;width/height are logical (screen-normal) pixels: the server treats the
++ * current zoom as 100% and may return a different world-pixel size in *req
++ * (and in the internal reply) so the window appears at the requested on-screen
++ * size. On success, *req is updated to the actual buffer dimensions.
+  * Returns a mapped buffer pointer on success, or NULL on failure.
+  */
+-void* bgce_get_buffer(int conn, const struct BufferRequest req);
++void* bgce_get_buffer(int conn, struct BufferRequest *req);
+ 
+ /**
+  * Shared pixel buffers (server creates, client maps by token in BufferReply.shm_name).
+diff --git a/client.c b/client.c
+index b333dd2..6196925 100644
+--- a/client.c
++++ b/client.c
+@@ -51,13 +51,16 @@ int main(void) {
+ 		       info.devices[i].type_mask);
+ 	}
+ 
+-	struct BufferRequest req = {.width = w, .height = h};
+-	buf = bgce_get_buffer(conn, req);
++	struct BufferRequest req = {.width = (uint32_t)w, .height = (uint32_t)h};
++	buf = bgce_get_buffer(conn, &amp;req);
+ 	if (!buf) {
+ 		fprintf(stderr, "[BGCE] Failed to get buffer\n");
+ 		return 3;
+ 	}
+-	printf("Client got buffer at: %p\n", buf);
++	/* Server may scale logical size by current zoom → use actual dims. */
++	w = (int)req.width;
++	h = (int)req.height;
++	printf("Client got buffer at: %p (%dx%d)\n", buf, w, h);
+ 
+ 	printf("[BGCE] Drawing gradient...\n");
+ 	draw_gradient();
+diff --git a/display.c b/display.c
+index 8452df0..4406cef 100644
+--- a/display.c
++++ b/display.c
+@@ -560,10 +560,158 @@ static void client_screen_bounds(const struct ServerState* srv, const struct Cli
+ 	*sy1 = (int)ceilf(fsy1);
+ }
+ 
++/*
++ * Fill a horizontal run of identical pixels (unrolled like blend_sq32).
++ */
++static inline void fill_u32(uint32_t *p, int n, uint32_t v)
++{
++	int i = 0;
++	for (; i + 8 &lt;= n; i += 8) {
++		p[i + 0] = v; p[i + 1] = v; p[i + 2] = v; p[i + 3] = v;
++		p[i + 4] = v; p[i + 5] = v; p[i + 6] = v; p[i + 7] = v;
++	}
++	for (; i &lt; n; i++)
++		p[i] = v;
++}
++
++/*
++ * 1:1 blit when zoom ≈ 1.  Nearest-neighbour is an integer offset only:
++ *   world = screen + floor(pan)
++ * so we row-memcpy (same spirit as the cursor gather/scatter path).
++ * Fractional pan is fine — no need for pan to be exactly integer.
++ */
++static void blit_client_1to1(uint32_t *dst, uint32_t screen_w,
++                             const uint32_t *src, int cw, int ch,
++                             int cli_x, int cli_y,
++                             int ox0, int oy0, int ox1, int oy1,
++                             float pan_x, float pan_y)
++{
++	int ipx = (int)floorf(pan_x);
++	int ipy = (int)floorf(pan_y);
++	int cx0 = cli_x, cy0 = cli_y;
++	int cx1 = cx0 + cw, cy1 = cy0 + ch;
++
++	int ix0 = (ox0 + ipx) &gt; cx0 ? (ox0 + ipx) : cx0;
++	int iy0 = (oy0 + ipy) &gt; cy0 ? (oy0 + ipy) : cy0;
++	int ix1 = (ox1 + ipx) &lt; cx1 ? (ox1 + ipx) : cx1;
++	int iy1 = (oy1 + ipy) &lt; cy1 ? (oy1 + ipy) : cy1;
++	if (ix0 &gt;= ix1 || iy0 &gt;= iy1)
++		return;
++
++	size_t row_bytes = (size_t)(ix1 - ix0) * sizeof(uint32_t);
++	for (int wy = iy0; wy &lt; iy1; wy++) {
++		int sy = wy - ipy;
++		uint32_t *drow = dst + sy * (int)screen_w + (ix0 - ipx);
++		const uint32_t *srow = src + (wy - cy0) * cw + (ix0 - cx0);
++		memcpy(drow, srow, row_bytes);
++	}
++}
++
++/*
++ * Fixed-point nearest-neighbour blit (16.16).
++ * - No float in the inner loops.
++ * - When magnifying (zoom &gt; 1), consecutive screen pixels often sample the
++ *   same source texel; those runs are written with fill_u32 (cursor-style).
++ * - X mapping is independent of Y: compute x0_fp once, reuse every row.
++ */
++static void blit_client_scaled(uint32_t *dst, uint32_t screen_w,
++                               const uint32_t *src, int cw, int ch,
++                               int cli_x, int cli_y,
++                               int ox0, int oy0, int ox1, int oy1,
++                               float pan_x, float pan_y, float zoom)
++{
++	const float inv_z = 1.0f / zoom;
++	const int32_t step_fp = (int32_t)(inv_z * 65536.0f + 0.5f);
++	/* world_x at sx=ox0, in 16.16, already minus cli_x so &gt;&gt;16 yields icx. */
++	const int32_t x0_fp = (int32_t)floorf(
++		((float)ox0 * inv_z + pan_x - (float)cli_x) * 65536.0f);
++	/* Same for Y: icy = (y_base + sy * step) &gt;&gt; 16, with y_base at sy=0. */
++	const int32_t y_step_fp = step_fp;
++	const int32_t y0_fp = (int32_t)floorf(
++		((float)oy0 * inv_z + pan_y - (float)cli_y) * 65536.0f);
++
++	const int magnify = (zoom &gt; 1.001f);
++	const int width = ox1 - ox0;
++
++	if (magnify) {
++		/* Run-length fill along X; Y still one source row at a time. */
++		int32_t y_fp = y0_fp;
++		for (int sy = oy0; sy &lt; oy1; sy++) {
++			int icy = y_fp &gt;&gt; 16;
++			y_fp += y_step_fp;
++			if ((unsigned)icy &gt;= (unsigned)ch)
++				continue;
++
++			uint32_t *drow = dst + sy * (int)screen_w + ox0;
++			const uint32_t *srow = src + icy * cw;
++			int32_t x_fp = x0_fp;
++			int sx = 0;
++			while (sx &lt; width) {
++				int icx = x_fp &gt;&gt; 16;
++				int run = 1;
++				int32_t probe = x_fp + step_fp;
++				while (sx + run &lt; width &amp;&amp; (probe &gt;&gt; 16) == icx) {
++					run++;
++					probe += step_fp;
++				}
++				if ((unsigned)icx &lt; (unsigned)cw)
++					fill_u32(drow + sx, run, srow[icx]);
++				sx += run;
++				x_fp = x0_fp + (int32_t)sx * step_fp;
++			}
++		}
++		return;
++	}
++
++	/* Minify / arbitrary zoom: one sample per screen pixel, fixed-point.
++	 * Precompute source-X for every column once (independent of Y). */
++	{
++		int stack_map[2048];
++		int *xmap = stack_map;
++		int heap = 0;
++
++		if (width &gt; (int)(sizeof(stack_map) / sizeof(stack_map[0]))) {
++			xmap = malloc((size_t)width * sizeof(int));
++			if (!xmap)
++				return;
++			heap = 1;
++		}
++		{
++			int32_t x_fp = x0_fp;
++			for (int i = 0; i &lt; width; i++) {
++				xmap[i] = x_fp &gt;&gt; 16;
++				x_fp += step_fp;
++			}
++		}
++
++		int32_t y_fp = y0_fp;
++		for (int sy = oy0; sy &lt; oy1; sy++) {
++			int icy = y_fp &gt;&gt; 16;
++			y_fp += y_step_fp;
++			if ((unsigned)icy &gt;= (unsigned)ch)
++				continue;
++
++			uint32_t *drow = dst + sy * (int)screen_w + ox0;
++			const uint32_t *srow = src + icy * cw;
++			for (int i = 0; i &lt; width; i++) {
++				int icx = xmap[i];
++				if ((unsigned)icx &lt; (unsigned)cw)
++					drow[i] = srow[icx];
++			}
++		}
++		if (heap)
++			free(xmap);
++	}
++}
++
+ /*
+  * Nearest-neighbour blit of a client into a screen-space damage rect.
+  * Client geometry is in world coordinates; the viewport (pan/zoom) maps
+  * world → screen.
++ *
++ * Paths (fastest first):
++ *  1. zoom ≈ 1  → 1:1 row memcpy (skips all scaling)
++ *  2. otherwise → fixed-point NN, with run-fills when zoomed in
+  */
+ static void blit_client_overlap(struct ServerState* srv, const struct Client* cli,
+                                 int rx0, int ry0, int rx1, int ry1) {
+@@ -593,62 +741,25 @@ static void blit_client_overlap(struct ServerState* srv, const struct Client* cl
+ 		return;
+ 
+ 	uint32_t screen_w = display_stride_px(srv);
+-	uint32_t* dst = (uint32_t*)srv-&gt;framebuffer;
+-	uint32_t* src = (uint32_t*)cli-&gt;buffer;
++	uint32_t *dst = (uint32_t *)srv-&gt;framebuffer;
++	const uint32_t *src = (const uint32_t *)cli-&gt;buffer;
+ 	const int cw = (int)cli-&gt;width;
+ 	const int ch = (int)cli-&gt;height;
+-	const float inv_z = 1.0f / srv-&gt;zoom;
+ 	const float pan_x = srv-&gt;pan_x;
+ 	const float pan_y = srv-&gt;pan_y;
+-	const float cli_x = (float)cli-&gt;x;
+-	const float cli_y = (float)cli-&gt;y;
+-
+-	/* Fast path: identity transform (zoom≈1, pan integer, aligned). */
+-	if (fabsf(srv-&gt;zoom - 1.0f) &lt; 1e-6f &amp;&amp;
+-	    fabsf(pan_x - roundf(pan_x)) &lt; 1e-6f &amp;&amp;
+-	    fabsf(pan_y - roundf(pan_y)) &lt; 1e-6f) {
+-		int ipx = (int)roundf(pan_x);
+-		int ipy = (int)roundf(pan_y);
+-		int wox0 = ox0 + ipx;
+-		int woy0 = oy0 + ipy;
+-		int wox1 = ox1 + ipx;
+-		int woy1 = oy1 + ipy;
+-
+-		int cx0 = (int)cli-&gt;x;
+-		int cy0 = (int)cli-&gt;y;
+-		int cx1 = cx0 + cw;
+-		int cy1 = cy0 + ch;
+-
+-		int ix0 = wox0 &gt; cx0 ? wox0 : cx0;
+-		int iy0 = woy0 &gt; cy0 ? woy0 : cy0;
+-		int ix1 = wox1 &lt; cx1 ? wox1 : cx1;
+-		int iy1 = woy1 &lt; cy1 ? woy1 : cy1;
+-		if (ix0 &gt;= ix1 || iy0 &gt;= iy1)
+-			return;
+-
+-		for (int wy = iy0; wy &lt; iy1; wy++) {
+-			int sy = wy - ipy;
+-			uint32_t* drow = dst + sy * (int)screen_w + (ix0 - ipx);
+-			uint32_t* srow = src + (wy - cy0) * cw + (ix0 - cx0);
+-			memcpy(drow, srow, (size_t)(ix1 - ix0) * 4);
+-		}
++	const float zoom = srv-&gt;zoom &gt; 0.0f ? srv-&gt;zoom : 1.0f;
++
++	/* Identity zoom: pure memcpy rows — no NN sampling at all. */
++	if (fabsf(zoom - 1.0f) &lt; 1e-4f) {
++		blit_client_1to1(dst, screen_w, src, cw, ch,
++		                 (int)cli-&gt;x, (int)cli-&gt;y,
++		                 ox0, oy0, ox1, oy1, pan_x, pan_y);
+ 		return;
+ 	}
+ 
+-	for (int sy = oy0; sy &lt; oy1; sy++) {
+-		float wy = (float)sy * inv_z + pan_y;
+-		int icy = (int)floorf(wy - cli_y);
+-		if (icy &lt; 0 || icy &gt;= ch)
+-			continue;
+-		uint32_t* drow = dst + sy * (int)screen_w;
+-		uint32_t* srow = src + icy * cw;
+-		for (int sx = ox0; sx &lt; ox1; sx++) {
+-			float wx = (float)sx * inv_z + pan_x;
+-			int icx = (int)floorf(wx - cli_x);
+-			if (icx &gt;= 0 &amp;&amp; icx &lt; cw)
+-				drow[sx] = srow[icx];
+-		}
+-	}
++	blit_client_scaled(dst, screen_w, src, cw, ch,
++	                   (int)cli-&gt;x, (int)cli-&gt;y,
++	                   ox0, oy0, ox1, oy1, pan_x, pan_y, zoom);
+ }
+ 
+ static void composite_chain_to_rect(struct ServerState* srv, struct Client* first,
+diff --git a/libbgce.c b/libbgce.c
+index 34676f6..184fb21 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -261,14 +261,16 @@ int bgce_get_server_info(int conn, struct ServerInfo* info) {
+ 	return 0;
+ }
+ 
+-/* Public API: Get shared buffer */
+-void* bgce_get_buffer(int conn, struct BufferRequest req) {
+-	if (conn &lt; 0)
++/* Public API: Get shared buffer.
++ * req-&gt;width/height are logical sizes; on success they become the actual
++ * buffer (world) dimensions the client must use for drawing. */
++void* bgce_get_buffer(int conn, struct BufferRequest *req) {
++	if (conn &lt; 0 || !req)
+ 		return NULL;
+ 
+ 	struct BGCEMessage msg = {0};
+ 	msg.type = MSG_GET_BUFFER;
+-	msg.data.buffer_request = req;
++	msg.data.buffer_request = *req;
+ 
+ 	int code = bgce_send_msg(conn, &amp;msg);
+ 	if (code &lt;= 0)
+@@ -299,6 +301,8 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
+ 		return NULL;
+ 	}
+ 
++	req-&gt;width = reply.width;
++	req-&gt;height = reply.height;
+ 	return buf;
+ }
+ 
+diff --git a/loop.c b/loop.c
+index f4eba04..268fea6 100644
+--- a/loop.c
++++ b/loop.c
+@@ -86,11 +86,8 @@ void* client_thread(void* arg) {
+ 			void *map;
+ 			char old_name[64];
+ 			int had_buffer;
+-
+-			printf(
+-			        "[BGCE] Client requested buffer of size %dx%d\n",
+-			        req.width,
+-			        req.height);
++			uint32_t world_w, world_h;
++			float z;
+ 
+ 			reply.status = -1;
+ 			msg.type = MSG_GET_BUFFER;
+@@ -103,6 +100,25 @@ void* client_thread(void* arg) {
+ 				break;
+ 			}
+ 
++			/*
++			 * Client sizes are logical (screen-normal) pixels: the current
++			 * zoom is treated as 100%, so a window that "should look like
++			 * 800×600" occupies ~800×600 screen pixels at any zoom.
++			 * Convert to world pixels: world = logical / zoom.
++			 */
++			z = server.zoom &gt; 0.0f ? server.zoom : 1.0f;
++			world_w = (uint32_t)((float)req.width / z + 0.5f);
++			world_h = (uint32_t)((float)req.height / z + 0.5f);
++			if (world_w &lt; 1)
++				world_w = 1;
++			if (world_h &lt; 1)
++				world_h = 1;
++
++			printf(
++			        "[BGCE] Client requested buffer %ux%u logical → "
++			        "%ux%u world (zoom=%.2f)\n",
++			        req.width, req.height, world_w, world_h, (double)z);
++
+ 			/* Unmap and remember old token before creating a new one. */
+ 			had_buffer = client-&gt;buffer != NULL;
+ 			old_name[0] = '\0';
+@@ -114,7 +130,7 @@ void* client_thread(void* arg) {
+ 				old_name[sizeof(old_name) - 1] = '\0';
+ 			}
+ 
+-			buf_size = (size_t)req.width * req.height * 4;
++			buf_size = (size_t)world_w * world_h * 4;
+ 			shm_fd = bgce_buf_create(client-&gt;shm_name,
+ 			                         sizeof(client-&gt;shm_name), buf_size);
+ 			if (shm_fd &lt; 0) {
+@@ -144,8 +160,8 @@ void* client_thread(void* arg) {
+ 				bgce_buf_unlink(old_name);
+ 
+ 			client-&gt;buffer = map;
+-			client-&gt;width = req.width;
+-			client-&gt;height = req.height;
++			client-&gt;width = world_w;
++			client-&gt;height = world_h;
+ 			/* First buffer only: place at the current viewport so the window
+ 			 * appears on-screen even when the user has panned/zoomed. */
+ 			if (!had_buffer) {
+@@ -171,8 +187,9 @@ void* client_thread(void* arg) {
+ 			reply.status = 0;
+ 			strncpy(reply.shm_name, client-&gt;shm_name, sizeof(reply.shm_name) - 1);
+ 			reply.shm_name[sizeof(reply.shm_name) - 1] = '\0';
+-			reply.width = req.width;
+-			reply.height = req.height;
++			/* Reply carries the actual buffer (world) size for drawing/mmap. */
++			reply.width = world_w;
++			reply.height = world_h;
+ 			msg.data.buffer_reply = reply;
+ 			bgce_send_msg(client_fd, &amp;msg);
+ 			break;
+</pre>

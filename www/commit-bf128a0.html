@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce bf128a0</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit bf128a0
+parent <a href=commit-60d22ef.html>60d22ef</a> 
+author Brian Mayer &lt;brianmayer@Brians-MacBook-Pro.local&gt;
+date   2025-12-07T14:00:43-03:00
+
+    updated index page
+
+<a href=tree-bf128a0.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/www/index.html b/www/index.html
+index d864f4a..06f3e25 100644
+--- a/www/index.html
++++ b/www/index.html
+@@ -7,12 +7,18 @@
+ &lt;link rel=alternate type="application/rss+xml" title=log href=feed.xml /&gt;
+ &lt;style&gt;pre{width:52ch;margin:2ch auto}a{color:#ff00ff}&lt;/style&gt;
+ &lt;pre&gt;
+-	┌────────────────────────┐
+-	│                        │
+-	│ BGCE.                  │
+-	│     |\                 │
+-	│      ^                 │
+-	└────────────────────────┘
++	┌──────────────────────────────────────┐
++	│ BGCE.                                │
++	│     |\                               │
++	│      ^                               │
++	│                   ┌───────┐          │
++	│      ┌───────┐    │       │          │
++	│      │       │    │       │          │
++	│      │       │    │       │          │
++	│      │       │    │       │          │
++	│      └───────┘    └───────┘          │
++	│                                      │
++	└──────────────────────────────────────┘
+ 
+ &lt;i&gt;&lt;b&gt;BGCE: Brian's Graphical Computer Environment&lt;/b&gt;&lt;/i&gt;
+ 
+@@ -31,14 +37,16 @@ The system is split into two components:
+ - &lt;b&gt;Client:&lt;/b&gt; Applications that render to their own
+   buffers and request drawing through the server.
+ 
++To keep track of the develoment check the commit log
++on the &lt;a href=feed.xml&gt;feed&lt;/a&gt;.
+ 
+ &lt;b&gt;Build Instructions&lt;/b&gt;
+ 
+ 	git clone https://terminal.pink/bgce
+ 	cd bgce
+ 	make all client
+-	./bgce   # Start server
+-	./client  # Start test client
++	./bgce   # run server
++	./client # run test client (in another TTY)
+ 
+ 
+ &lt;b&gt;Goals&lt;/b&gt;
+</pre>

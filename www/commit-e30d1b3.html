@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce e30d1b3</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit e30d1b3
+parent <a href=commit-2b4ba9a.html>2b4ba9a</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-06-19T17:02:10-03:00
+
+    Added default cache log file, fixed DRM includes, improved input detection, and normalized logs
+
+    - Added default log file at $XDG_CACHE_HOME/bgce/bgce.log (or ~/.cache/bgce/bgce.log)
+    - Redirected stdout/stderr so all [BGCE] output is captured
+    - Added __has_include guards for &lt;drm/drm_mode.h&gt; and &lt;libdrm/drm_mode.h&gt;
+    - Improved init_input() with EV_ABS support, key/button qualification, and permission error hints
+    - Prefixed all remaining bare perror/printf/fprintf with [BGCE]
+    - Updated Makefile test targets with proper defaults
+    - Fixed hardcoded /dev/dri/card1 and added missing cur_w/cur_h
+
+<a href=tree-e30d1b3.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/Makefile b/Makefile
+index cde559d..7f68e71 100644
+--- a/Makefile
++++ b/Makefile
+@@ -36,6 +36,9 @@ install: bgce libbgce.so bgce.h
+ 	install -m 644 bgce.h $(INSTALL_INCLUDE)
+ 	ldconfig
+ 
++SERVER_LOG ?= server.log
++SERVER_PID ?= server.pid
++
+ .PHONY: test-server
+ test-server: bgce
+ 	@echo "[MAKE] Starting BGCE server..."
+@@ -53,6 +56,8 @@ test-server: bgce
+ 	@echo "=== SERVER LOG ==="
+ 	@tail -n 50 $(SERVER_LOG)
+ 
++CLIENT_LOG ?= client.log
++
+ test-client: client
+ 	@echo "[MAKE] Running test client..."
+ 	@LD_LIBRARY_PATH=. ./client &gt; $(CLIENT_LOG) 2&gt;&amp;1 || true
+diff --git a/README.md b/README.md
+index 1caf8e9..08dd178 100644
+--- a/README.md
++++ b/README.md
+@@ -92,6 +92,15 @@ make all client
+ 
+ BGCE supports configuration for the background through a config file. By default, it looks for `~/.config/bgce.conf`.
+ 
++## Logging
++
++All server messages are written to a default log file:
++
++- `$XDG_CACHE_HOME/bgce/bgce.log` (if `XDG_CACHE_HOME` is set)
++- otherwise `~/.cache/bgce/bgce.log`
++
++The path is printed to the terminal you used to start `bgce` so you know where to look (`tail -f` it, etc.). All `[BGCE]` output after that point goes into the log file.
++
+ 
+ ### Config File Format
+ 
+diff --git a/config.c b/config.c
+index b4a2c53..f0b704f 100644
+--- a/config.c
++++ b/config.c
+@@ -373,7 +373,7 @@ int apply_background(struct config* config, uint32_t* buffer, uint32_t width, ui
+ 		int img_width, img_height, img_channels;
+ 		unsigned char* img_data = stbi_load(config-&gt;path, &amp;img_width, &amp;img_height, &amp;img_channels, 4);
+ 		if (!img_data) {
+-			fprintf(stderr, "Failed to load image: %s\n", config-&gt;path);
++			fprintf(stderr, "[BGCE] Failed to load image: %s\n", config-&gt;path);
+ 			// Fallback to a default color (dark gray with full opacity)
+ 			fprintf(stderr, "[BGCE] Falling back to default color #333333\n");
+ 			for (uint32_t i = 0; i &lt; width * height; i++) {
+diff --git a/display.c b/display.c
+index 9517801..4c3326a 100644
+--- a/display.c
++++ b/display.c
+@@ -29,8 +29,28 @@
+ #include &lt;sys/ioctl.h&gt;
+ #include &lt;sys/mman.h&gt;
+ #include &lt;unistd.h&gt;
+-#include &lt;drm/drm.h&gt;
+-#include &lt;drm/drm_mode.h&gt;
++#if defined(__has_include)
++#  if __has_include(&lt;libdrm/drm.h&gt;)
++#    include &lt;libdrm/drm.h&gt;
++#  elif __has_include(&lt;drm/drm.h&gt;)
++#    include &lt;drm/drm.h&gt;
++#  else
++#    include &lt;drm/drm.h&gt;
++#  endif
++#else
++#  include &lt;drm/drm.h&gt;
++#endif
++#if defined(__has_include)
++#  if __has_include(&lt;libdrm/drm_mode.h&gt;)
++#    include &lt;libdrm/drm_mode.h&gt;
++#  elif __has_include(&lt;drm/drm_mode.h&gt;)
++#    include &lt;drm/drm_mode.h&gt;
++#  else
++#    include &lt;drm/drm_mode.h&gt;
++#  endif
++#else
++#  include &lt;drm/drm_mode.h&gt;
++#endif
+ #include &lt;xf86drm.h&gt;
+ #include &lt;xf86drmMode.h&gt;
+ #include &lt;stb_image_write.h&gt;
+@@ -42,6 +62,8 @@ uint32_t conn_id = 0;
+ uint32_t cur_fb = 0;
+ uint32_t cur_handle;
+ uint64_t cur_size;
++uint32_t cur_w = CURSOR_WIDTH;
++uint32_t cur_h = CURSOR_HEIGHT;
+ void* cur_map;
+ uint32_t scanout_handle;
+ uint64_t scanout_size;
+@@ -59,7 +81,7 @@ static int drm_create_dumb(int fd, uint32_t width, uint32_t height, uint32_t bpp
+ 	create-&gt;height = height;
+ 	create-&gt;bpp = bpp;
+ 	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, create) &lt; 0) {
+-		perror("DRM_IOCTL_MODE_CREATE_DUMB");
++		perror("[BGCE] DRM_IOCTL_MODE_CREATE_DUMB");
+ 		return -1;
+ 	}
+ 	return 0;
+@@ -69,7 +91,7 @@ static int drm_map_dumb(int fd, uint32_t handle, uint64_t* offset) {
+ 	struct drm_mode_map_dumb map = {0};
+ 	map.handle = handle;
+ 	if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &amp;map) &lt; 0) {
+-		perror("DRM_IOCTL_MODE_MAP_DUMB");
++		perror("[BGCE] DRM_IOCTL_MODE_MAP_DUMB");
+ 		return -1;
+ 	}
+ 	*offset = map.offset;
+@@ -80,7 +102,7 @@ static int drm_destroy_dumb(int fd, uint32_t handle) {
+ 	struct drm_mode_destroy_dumb dest = {0};
+ 	dest.handle = handle;
+ 	if (ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &amp;dest) &lt; 0) {
+-		perror("DRM_IOCTL_MODE_DESTROY_DUMB");
++		perror("[BGCE] DRM_IOCTL_MODE_DESTROY_DUMB");
+ 		return -1;
+ 	}
+ 	return 0;
+@@ -110,10 +132,17 @@ int init_display() {
+ 	drmModeModeInfo chosen_mode;
+ 	bool found = false;
+ 
+-	const char* dri_card = "/dev/dri/card1";
+-	drm_fd = open(dri_card, O_RDWR | O_CLOEXEC);
++	drm_fd = -1;
++	for (int card = 0; card &lt; 10; card++) {
++		char path[64];
++		snprintf(path, sizeof(path), "/dev/dri/card%d", card);
++		drm_fd = open(path, O_RDWR | O_CLOEXEC);
++		if (drm_fd &gt;= 0) {
++			break;
++		}
++	}
+ 	if (drm_fd &lt; 0) {
+-		perror("open drm device");
++		perror("[BGCE] open drm device (tried /dev/dri/card0..9)");
+ 		return 1;
+ 	}
+ 	server.drm_fd = drm_fd;
+@@ -125,7 +154,7 @@ int init_display() {
+ 
+ 	resources = drmModeGetResources(drm_fd);
+ 	if (!resources) {
+-		fprintf(stderr, "drmModeGetResources failed\n");
++		fprintf(stderr, "[BGCE] drmModeGetResources failed\n");
+ 		close(drm_fd);
+ 		return 1;
+ 	}
+@@ -147,7 +176,7 @@ int init_display() {
+ 	}
+ 
+ 	if (!found) {
+-		fprintf(stderr, "No connected connector with modes found\n");
++		fprintf(stderr, "[BGCE] No connected connector with modes found\n");
+ 		drmModeFreeResources(resources);
+ 		close(drm_fd);
+ 		return 1;
+@@ -180,7 +209,7 @@ int init_display() {
+ 	}
+ 
+ 	if (!crtc_id) {
+-		fprintf(stderr, "Failed to find a suitable CRTC\n");
++		fprintf(stderr, "[BGCE] Failed to find a suitable CRTC\n");
+ 		drmModeFreeConnector(connector);
+ 		drmModeFreeResources(resources);
+ 		close(drm_fd);
+@@ -190,7 +219,7 @@ int init_display() {
+ 	/* Save current CRTC to restore later */
+ 	saved_crtc = drmModeGetCrtc(drm_fd, crtc_id);
+ 	if (!saved_crtc) {
+-		fprintf(stderr, "drmModeGetCrtc failed\n");
++		fprintf(stderr, "[BGCE] drmModeGetCrtc failed\n");
+ 		/* continue anyway, but we'll try to restore nothing */
+ 	}
+ 
+@@ -208,7 +237,7 @@ int init_display() {
+ 	/* ---------- Create dumb scanout buffer ---------- */
+ 	struct drm_mode_create_dumb create = {0};
+ 	if (drm_create_dumb(drm_fd, width, height, bpp, &amp;create) &lt; 0) {
+-		fprintf(stderr, "Failed to create dumb buffer for scanout\n");
++		fprintf(stderr, "[BGCE] Failed to create dumb buffer for scanout\n");
+ 		return -1;
+ 	}
+ 	scanout_handle = create.handle;
+@@ -218,13 +247,13 @@ int init_display() {
+ 	/* allocate map */
+ 	uint64_t scanout_offset;
+ 	if (drm_map_dumb(drm_fd, scanout_handle, &amp;scanout_offset) &lt; 0) {
+-		fprintf(stderr, "Failed to map dumb buffer for scanout\n");
++		fprintf(stderr, "[BGCE] Failed to map dumb buffer for scanout\n");
+ 		return -1;
+ 	}
+ 
+ 	server.framebuffer = mmap(NULL, scanout_size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, scanout_offset);
+ 	if (server.framebuffer == MAP_FAILED) {
+-		perror("mmap scanout");
++		perror("[BGCE] mmap scanout");
+ 		return -1;
+ 	}
+ 
+@@ -255,7 +284,7 @@ int init_display() {
+ 		/* compute depth and bpp for legacy call */
+ 		uint32_t depth = 24;
+ 		if (drmModeAddFB(drm_fd, width, height, depth, bpp, scanout_pitch, scanout_handle, &amp;fb_id) != 0) {
+-			fprintf(stderr, "drmModeAddFB failed\n");
++			fprintf(stderr, "[BGCE] drmModeAddFB failed\n");
+ 			return -1;
+ 		}
+ 	}
+@@ -264,7 +293,7 @@ int init_display() {
+ 
+ 	struct drm_mode_create_dumb cur_create = {0};
+ 	if (drm_create_dumb(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, 32, &amp;cur_create) &lt; 0) {
+-		fprintf(stderr, "Failed to create dumb buffer for cursor\n");
++		fprintf(stderr, "[BGCE] Failed to create dumb buffer for cursor\n");
+ 		return -1;
+ 	}
+ 	cur_handle = cur_create.handle;
+@@ -273,12 +302,12 @@ int init_display() {
+ 	uint64_t cur_offset;
+ 	uint32_t cur_pitch = cur_create.pitch;
+ 	if (drm_map_dumb(drm_fd, cur_handle, &amp;cur_offset) &lt; 0) {
+-		fprintf(stderr, "Failed to map dumb cursor\n");
++		fprintf(stderr, "[BGCE] Failed to map dumb cursor\n");
+ 		return -1;
+ 	}
+ 	cur_map = mmap(NULL, cur_size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, cur_offset);
+ 	if (cur_map == MAP_FAILED) {
+-		perror("mmap cursor");
++		perror("[BGCE] mmap cursor");
+ 		return -1;
+ 	}
+ 	memset(cur_map, 0, cur_size);
+@@ -292,7 +321,7 @@ int init_display() {
+ 		uint32_t offsets[4] = {0, 0, 0, 0};
+ 		uint32_t format = DRM_FORMAT_ARGB8888;
+ 		if (drmModeAddFB2(drm_fd, cur_w, cur_h, format, handles, pitches, offsets, &amp;cur_fb, 0) != 0) {
+-			fprintf(stderr, "drmModeAddFB2 for cursor failed, trying legacy\n");
++			fprintf(stderr, "[BGCE] drmModeAddFB2 for cursor failed, trying legacy\n");
+ 			cur_fb = 0;
+ 		}
+ 	}
+@@ -301,25 +330,25 @@ int init_display() {
+ 		/* Legacy fb creation for cursor might not support alpha; still try */
+ 		uint32_t depth = 24;
+ 		if (drmModeAddFB(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, depth, 32, cur_pitch, cur_handle, &amp;cur_fb) != 0) {
+-			fprintf(stderr, "drmModeAddFB for cursor failed\n");
++			fprintf(stderr, "[BGCE] drmModeAddFB for cursor failed\n");
+ 			return -1;
+ 		}
+ 	}
+ 
+ 	/* ---------- Set CRTC (scanout) ---------- */
+ 	if (drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &amp;conn_id, 1, &amp;chosen_mode) != 0) {
+-		fprintf(stderr, "drmModeSetCrtc failed: %s\n", strerror(errno));
++		fprintf(stderr, "[BGCE] drmModeSetCrtc failed: %s\n", strerror(errno));
+ 		return -1;
+ 	}
+ 
+ 	/* ---------- Set cursor ---------- */
+ 	if (drmModeSetCursor(drm_fd, crtc_id, cur_handle, CURSOR_WIDTH, CURSOR_HEIGHT) != 0) {
+-		fprintf(stderr, "drmModeSetCursor failed: %s\n", strerror(errno));
++		fprintf(stderr, "[BGCE] drmModeSetCursor failed: %s\n", strerror(errno));
+ 		/* keep going — maybe hardware doesn't support cursor */
+ 	} else {
+ 		/* move cursor to near center */
+ 		if (drmModeMoveCursor(drm_fd, crtc_id, width / 2, height / 2) != 0) {
+-			fprintf(stderr, "drmModeMoveCursor failed\n");
++			fprintf(stderr, "[BGCE] drmModeMoveCursor failed\n");
+ 		}
+ 	}
+ 
+@@ -328,7 +357,7 @@ int init_display() {
+ 
+ void draw(struct ServerState* srv, struct Client cli) {
+ 	if (!srv || !srv-&gt;framebuffer || !cli.buffer) {
+-		fprintf(stderr, "Draw: Invalid server, framebuffer, or client buffer\n");
++		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
+ 		return;
+ 	}
+ 
+@@ -359,7 +388,7 @@ void draw(struct ServerState* srv, struct Client cli) {
+ 
+ 	/* Entire window is outside screen */
+ 	if (start_x &gt;= end_x || start_y &gt;= end_y) {
+-		fprintf(stderr, "Draw: Client entirely outside screen\n");
++		fprintf(stderr, "[BGCE] Draw: Client entirely outside screen\n");
+ 		return;
+ 	}
+ 
+@@ -462,7 +491,7 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
+  */
+ void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy) {
+ 	if (!srv || !srv-&gt;framebuffer) {
+-		fprintf(stderr, "Redraw: Invalid server, framebuffer, or client\n");
++		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
+ 		return;
+ 	}
+ 
+@@ -549,7 +578,7 @@ static void redraw_exposed_rect(struct ServerState* srv, const struct Client* re
+ 
+ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
+ 	if (!srv || !srv-&gt;framebuffer) {
+-		fprintf(stderr, "Redraw from resize: Invalid server or framebuffer\n");
++		fprintf(stderr, "[BGCE] Redraw from resize: Invalid server or framebuffer\n");
+ 		return;
+ 	}
+ 
+@@ -620,7 +649,7 @@ void release_display(void) {
+ 
+ int take_screenshot(const char* filename) {
+ 	if (!server.framebuffer) {
+-		fprintf(stderr, "No framebuffer available for screenshot.\n");
++		fprintf(stderr, "[BGCE] No framebuffer available for screenshot.\n");
+ 		return -1;
+ 	}
+ 
+@@ -639,10 +668,10 @@ int take_screenshot(const char* filename) {
+ 	);
+ 
+ 	if (!result) {
+-		fprintf(stderr, "Failed to save screenshot to %s.\n", filename);
++		fprintf(stderr, "[BGCE] Failed to save screenshot to %s.\n", filename);
+ 		return -1;
+ 	}
+ 
+-	printf("Screenshot saved to %s.\n", filename);
++	printf("[BGCE] Screenshot saved to %s.\n", filename);
+ 	return 0;
+ }
+diff --git a/input.c b/input.c
+index 46e888e..a45be53 100644
+--- a/input.c
++++ b/input.c
+@@ -53,20 +53,20 @@ int resize_buffer(struct Client* c, int dx, int dy) {
+ 	         "bgce_buf_%d_%ld", getpid(), time(NULL));
+ 	int shm_fd = shm_open(c-&gt;shm_name, O_CREAT | O_RDWR, 0600);
+ 	if (shm_fd &lt; 0) {
+-		perror("shm_open for resize");
++		perror("[BGCE] shm_open for resize");
+ 		return 0;
+ 	}
+ 
+ 	size_t buf_size = (c-&gt;width + dx) * (c-&gt;height + dy) * BGCE_BYTES_PER_PIXEL;
+ 	if (ftruncate(shm_fd, buf_size) &lt; 0) {
+-		perror("ftruncate for resize");
++		perror("[BGCE] ftruncate for resize");
+ 		close(shm_fd);
+ 		return 0;
+ 	}
+ 
+ 	c-&gt;buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+ 	if (c-&gt;buffer == MAP_FAILED) {
+-		perror("mmap for resize");
++		perror("[BGCE] mmap for resize");
+ 		close(shm_fd);
+ 		return 0;
+ 	}
+@@ -117,9 +117,13 @@ int init_input(void) {
+ 		char path[256 + 12];
+ 		snprintf(path, sizeof(path), "%s/%s", INPUT_DIR, ent-&gt;d_name);
+ 
+-		int fd = open(path, O_RDONLY);
+-		if (fd &lt; 0)
++		int fd = open(path, O_RDONLY | O_NONBLOCK);
++		if (fd &lt; 0) {
++			if (errno == EACCES || errno == EPERM) {
++				fprintf(stderr, "[BGCE] Permission denied for %s (try adding your user to the 'input' group)\n", path);
++			}
+ 			continue; // skip inaccessible devices
++		}
+ 
+ 		unsigned long ev_bits[(EV_MAX + 7) / 8] = {0};
+ 		if (ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) &lt; 0) {
+@@ -127,10 +131,33 @@ int init_input(void) {
+ 			continue;
+ 		}
+ 
+-		// Filter for useful input types
+ 		int has_key = test_bit(EV_KEY, ev_bits);
+ 		int has_rel = test_bit(EV_REL, ev_bits);
+-		if (!has_key &amp;&amp; !has_rel) {
++		int has_abs = test_bit(EV_ABS, ev_bits);
++
++		if (!has_key &amp;&amp; !has_rel &amp;&amp; !has_abs) {
++			close(fd);
++			continue;
++		}
++
++		// Read detailed key bits for qualification
++		unsigned long key_bits[(KEY_MAX + 7) / 8] = {0};
++		if (has_key) {
++			ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits);
++		}
++
++		int has_mouse_btn = test_bit(BTN_LEFT, key_bits) || test_bit(BTN_RIGHT, key_bits) ||
++		                    test_bit(BTN_MIDDLE, key_bits) || test_bit(BTN_MOUSE, key_bits);
++		int has_kbd_key   = test_bit(KEY_A, key_bits) || test_bit(KEY_B, key_bits) ||
++		                    test_bit(KEY_SPACE, key_bits) || test_bit(KEY_ENTER, key_bits) ||
++		                    test_bit(KEY_ESC, key_bits);
++
++		// Accept mice (rel + or without explicit btn), touchpads (abs+btn), keyboards
++		int accept = 0;
++		if (has_rel) accept = 1;                         // mice, trackballs etc.
++		if (has_abs &amp;&amp; has_mouse_btn) accept = 1;        // many touchpads / absolute pointers
++		if (has_key &amp;&amp; (has_kbd_key || has_mouse_btn)) accept = 1;
++		if (!accept) {
+ 			close(fd);
+ 			continue;
+ 		}
+@@ -148,17 +175,20 @@ int init_input(void) {
+ 
+ 		count++;
+ 
+-		printf("[BGCE] Input device accepted: %s (%s)%s%s\n",
++		printf("[BGCE] Input device accepted: %s (%s)%s%s%s\n",
+ 		       path, name,
+ 		       has_key ? " [KEY]" : "",
+-		       has_rel ? " [REL]" : "");
++		       has_rel ? " [REL]" : "",
++		       has_abs ? " [ABS]" : "");
+ 	}
+ 
+ 	closedir(dir);
+ 
+ 	if (count == 0) {
+-		fprintf(stderr, "[BGCE] No suitable input devices found\n");
+-		return -1;
++		fprintf(stderr, "[BGCE] No suitable input devices found (mouse/keyboard input will be unavailable)\n");
++		/* Do not fail hard: server can still run for drawing clients */
++		server.input.count = 0;
++		return 0;
+ 	}
+ 	server.input.count = count;
+ 
+@@ -418,11 +448,17 @@ static int handle_input_event(struct input_event ev) {
+ void* input_loop(void* arg) {
+ 	(void)arg;
+ 
++	if (count == 0) {
++		/* No input devices; park the thread */
++		while (1) pause();
++		return NULL;
++	}
++
+ 	while (1) {
+ 		int ret = poll(fds, count, -1);
+ 		if (ret &lt; 0) {
+ 			if (errno == EINTR) {
+-				printf("EINTR\n");
++				printf("[BGCE] EINTR\n");
+ 				continue;
+ 			}
+ 			perror("[BGCE] poll");
+@@ -439,7 +475,7 @@ void* input_loop(void* arg) {
+ 						perror("[BGCE] read input");
+ 						break;
+ 					}
+-					perror("read input");
++					perror("[BGCE] read input");
+ 					break;
+ 				}
+ 				if (n != sizeof(ev))
+diff --git a/libbgce.c b/libbgce.c
+index b077bca..4718ecb 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -17,7 +17,7 @@ ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg) {
+ 	ssize_t n = write(conn, msg, size);
+ 	if (n &lt; 0) {
+ 		if (errno == EINTR)
+-			perror("write");
++			perror("[BGCE] write");
+ 		return -1;
+ 	}
+ 	return n;
+@@ -27,7 +27,7 @@ ssize_t bgce_recv_msg(int conn, struct BGCEMessage* msg) {
+ 	ssize_t n = read(conn, msg, sizeof(struct BGCEMessage));
+ 	if (n &lt; 0) {
+ 		if (errno == EINTR)
+-			perror("read");
++			perror("[BGCE] read");
+ 		return -1;
+ 	}
+ 	return n;
+@@ -37,7 +37,7 @@ ssize_t bgce_recv_msg(int conn, struct BGCEMessage* msg) {
+ int bgce_connect(void) {
+ 	int bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+ 	if (bgce_fd &lt; 0) {
+-		perror("socket");
++		perror("[BGCE] socket");
+ 		return -1;
+ 	}
+ 
+@@ -47,7 +47,7 @@ int bgce_connect(void) {
+ 	strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+ 
+ 	if (connect(bgce_fd, (struct sockaddr*)&amp;addr, sizeof(addr)) &lt; 0) {
+-		perror("connect");
++		perror("[BGCE] connect");
+ 		close(bgce_fd);
+ 		bgce_fd = -1;
+ 		return -2;
+@@ -96,13 +96,13 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
+ 	size_t size = reply.width * reply.height * 4;
+ 	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
+ 	if (shm_fd &lt; 0) {
+-		perror("shm_open (client)");
++		perror("[BGCE] shm_open (client)");
+ 		return NULL;
+ 	}
+ 
+ 	void* buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+ 	if (buf == MAP_FAILED) {
+-		perror("mmap (client)");
++		perror("[BGCE] mmap (client)");
+ 		close(shm_fd);
+ 		return NULL;
+ 	}
+diff --git a/loop.c b/loop.c
+index 24c69c6..0804d1a 100644
+--- a/loop.c
++++ b/loop.c
+@@ -21,7 +21,7 @@ void* client_thread(void* arg) {
+ 	// Allocate memory for the client
+ 	struct Client* client = calloc(1, sizeof(struct Client));
+ 	if (!client) {
+-		perror("Failed to allocate memory for client");
++		perror("[BGCE] Failed to allocate memory for client");
+ 		close(client_fd);
+ 		return NULL;
+ 	}
+@@ -89,13 +89,13 @@ void* client_thread(void* arg) {
+ 
+ 			int shm_fd = shm_open(client-&gt;shm_name, O_CREAT | O_RDWR, 0600);
+ 			if (shm_fd &lt; 0) {
+-				perror("shm_open");
++				perror("[BGCE] shm_open");
+ 				break;
+ 			}
+ 
+ 			size_t buf_size = req.width * req.height * 4;
+ 			if (ftruncate(shm_fd, buf_size) &lt; 0) {
+-				perror("ftruncate");
++				perror("[BGCE] ftruncate");
+ 				close(shm_fd);
+ 				break;
+ 			}
+diff --git a/server.c b/server.c
+index 7e1c29a..5f3b974 100644
+--- a/server.c
++++ b/server.c
+@@ -2,19 +2,66 @@
+ #include "bgce.h"
+ 
+ #include &lt;errno.h&gt;
++#include &lt;fcntl.h&gt;
+ #include &lt;pthread.h&gt;
+ #include &lt;signal.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+ #include &lt;sys/socket.h&gt;
++#include &lt;sys/stat.h&gt;
+ #include &lt;sys/un.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+ struct ServerState server = {}; /* Global server state */
+ struct config config = {};            /* Global config (background + shortcuts) */
+ 
++static void ensure_dir(const char *path) {
++	struct stat st;
++	if (stat(path, &amp;st) == 0 &amp;&amp; S_ISDIR(st.st_mode))
++		return;
++	/* Try to create; ignore errors (parent may not exist, we'll fail open later) */
++	mkdir(path, 0755);
++}
++
++static void setup_log_file(void) {
++	const char *xdg = getenv("XDG_CACHE_HOME");
++	const char *home = getenv("HOME");
++	char dir[512];
++
++	if (xdg &amp;&amp; xdg[0]) {
++		snprintf(dir, sizeof(dir), "%s/bgce", xdg);
++		ensure_dir(xdg);
++		ensure_dir(dir);
++	} else if (home &amp;&amp; home[0]) {
++		char dotcache[512];
++		snprintf(dotcache, sizeof(dotcache), "%s/.cache", home);
++		snprintf(dir, sizeof(dir), "%s/.cache/bgce", home);
++		ensure_dir(dotcache);
++		ensure_dir(dir);
++	} else {
++		return;
++	}
++
++	char log_path[512];
++	snprintf(log_path, sizeof(log_path), "%s/bgce.log", dir);
++
++	int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
++	if (fd &lt; 0)
++		return;
++
++	/* Tell the user (on their original terminal) where logs are going */
++	dprintf(STDERR_FILENO, "[BGCE] Logging to %s\n", log_path);
++
++	/* Redirect all future stdout/stderr output into the log file */
++	dup2(fd, STDOUT_FILENO);
++	dup2(fd, STDERR_FILENO);
++	close(fd);
++}
++
+ int main(void) {
++	setup_log_file();
++
+ 	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
+ 	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
+ 
+@@ -38,7 +85,7 @@ int main(void) {
+ 
+ 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+ 	if (fd &lt; 0) {
+-		perror("socket");
++		perror("[BGCE] socket");
+ 		return 1;
+ 	}
+ 
+@@ -49,13 +96,13 @@ int main(void) {
+ 	unlink(SOCKET_PATH);
+ 
+ 	if (bind(fd, (struct sockaddr*)&amp;addr, sizeof(addr)) &lt; 0) {
+-		perror("bind");
++		perror("[BGCE] bind");
+ 		close(fd);
+ 		return 1;
+ 	}
+ 
+ 	if (listen(fd, 8) &lt; 0) {
+-		perror("listen");
++		perror("[BGCE] listen");
+ 		close(fd);
+ 		return 1;
+ 	}
+@@ -63,7 +110,7 @@ int main(void) {
+ 	server.server_fd = fd;
+ 
+ 	if (init_display() != 0) {
+-		fprintf(stderr, "display init failed\n");
++		fprintf(stderr, "[BGCE] display init failed\n");
+ 		release_display();
+ 		return 1;
+ 	}
+@@ -105,7 +152,7 @@ int main(void) {
+ 	while (1) {
+ 		int client_fd = accept(fd, NULL, NULL);
+ 		if (client_fd &lt; 0) {
+-			perror("accept");
++			perror("[BGCE] accept");
+ 			continue;
+ 		}
+ 
+@@ -114,14 +161,14 @@ int main(void) {
+ 		pthread_t tid;
+ 		int* arg = malloc(sizeof(int));
+ 		if (!arg) {
+-			perror("malloc");
++			perror("[BGCE] malloc");
+ 			close(client_fd);
+ 			continue;
+ 		}
+ 
+ 		*arg = client_fd;
+ 		if (pthread_create(&amp;tid, NULL, client_thread, arg) != 0) {
+-			perror("pthread_create input thread");
++			perror("[BGCE] pthread_create client thread");
+ 			free(arg);
+ 			close(client_fd);
+ 			continue;
+diff --git a/server.h b/server.h
+index 63c21ef..ba883fa 100644
+--- a/server.h
++++ b/server.h
+@@ -4,7 +4,17 @@
+ #define _XOPEN_SOURCE 700
+ #include "bgce.h"
+ 
+-#include &lt;drm/drm_mode.h&gt;
++#if defined(__has_include)
++#  if __has_include(&lt;libdrm/drm_mode.h&gt;)
++#    include &lt;libdrm/drm_mode.h&gt;
++#  elif __has_include(&lt;drm/drm_mode.h&gt;)
++#    include &lt;drm/drm_mode.h&gt;
++#  else
++#    include &lt;drm/drm_mode.h&gt;
++#  endif
++#else
++#  include &lt;drm/drm_mode.h&gt;
++#endif
+ #include &lt;pthread.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;sys/types.h&gt;
+</pre>

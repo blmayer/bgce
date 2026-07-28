@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce d9032c6</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit d9032c6
+parent <a href=commit-4b05df2.html>4b05df2</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-06-20T18:52:02-03:00
+
+    display: switched VT to KD_GRAPHICS to suppress keystroke echo
+
+    Added setup_vt_handling() to set KD_GRAPHICS on the active tty during
+    init, and restore KD_TEXT in release_display(). Added SIGINT/SIGTERM
+    handler in server.c to ensure cleanup runs on termination.
+
+<a href=tree-d9032c6.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/display.c b/display.c
+index 4c3326a..75935f9 100644
+--- a/display.c
++++ b/display.c
+@@ -21,6 +21,8 @@
+ #include "server.h"
+ #include &lt;errno.h&gt;
+ #include &lt;fcntl.h&gt;
++#include &lt;linux/kd.h&gt;
++#include &lt;linux/vt.h&gt;
+ #include &lt;stdbool.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;stdio.h&gt;
+@@ -57,6 +59,8 @@
+ 
+ extern struct ServerState server;
+ 
++static int vt_fd = -1;
++
+ int drm_fd = -1;
+ uint32_t conn_id = 0;
+ uint32_t cur_fb = 0;
+@@ -127,6 +131,43 @@ static void draw_cursor(uint8_t* buf, uint32_t stride, uint32_t w, uint32_t h) {
+ 	}
+ }
+ 
++int setup_vt_handling(void) {
++	/* Try the current tty first, then fall back to /dev/tty0 */
++	vt_fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
++	if (vt_fd &lt; 0)
++		vt_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
++	if (vt_fd &lt; 0) {
++		fprintf(stderr, "[BGCE] VT: cannot open tty: %s "
++		        "(keystrokes will echo on the console)\n",
++		        strerror(errno));
++		return -1;
++	}
++
++	if (ioctl(vt_fd, KDSETMODE, KD_GRAPHICS) &lt; 0) {
++		fprintf(stderr, "[BGCE] VT: KDSETMODE KD_GRAPHICS failed: %s "
++		        "(keystrokes will echo on the console)\n",
++		        strerror(errno));
++		close(vt_fd);
++		vt_fd = -1;
++		return -1;
++	}
++
++	printf("[BGCE] VT: switched to KD_GRAPHICS mode\n");
++	return 0;
++}
++
++static void release_vt(void) {
++	if (vt_fd &lt; 0)
++		return;
++	if (ioctl(vt_fd, KDSETMODE, KD_TEXT) &lt; 0)
++		fprintf(stderr, "[BGCE] VT: KDSETMODE KD_TEXT failed: %s\n",
++		        strerror(errno));
++	else
++		printf("[BGCE] VT: restored KD_TEXT mode\n");
++	close(vt_fd);
++	vt_fd = -1;
++}
++
+ int init_display() {
+ 	uint32_t crtc_id = 0;
+ 	drmModeModeInfo chosen_mode;
+@@ -147,10 +188,7 @@ int init_display() {
+ 	}
+ 	server.drm_fd = drm_fd;
+ 
+-	// if (setup_vt_handling() &lt; 0) {
+-	//	close(server-&gt;drm_fd);
+-	//	return -1;
+-	// }
++	setup_vt_handling();
+ 
+ 	resources = drmModeGetResources(drm_fd);
+ 	if (!resources) {
+@@ -643,6 +681,8 @@ void release_display(void) {
+ 	if (encoder)
+ 		drmModeFreeEncoder(encoder);
+ 
++	release_vt();
++
+ 	close(drm_fd);
+ 	printf("[BGCE] Display released.\n");
+ }
+diff --git a/server.c b/server.c
+index 5f3b974..a629947 100644
+--- a/server.c
++++ b/server.c
+@@ -24,6 +24,12 @@ static void ensure_dir(const char *path) {
+ 	mkdir(path, 0755);
+ }
+ 
++static void cleanup_and_exit(int sig) {
++	printf("[BGCE] Caught signal %d, cleaning up\n", sig);
++	release_display();
++	_exit(0);
++}
++
+ static void setup_log_file(void) {
+ 	const char *xdg = getenv("XDG_CACHE_HOME");
+ 	const char *home = getenv("HOME");
+@@ -68,6 +74,10 @@ int main(void) {
+ 	/* Auto-reap child processes so command shortcuts don't leave zombies */
+ 	signal(SIGCHLD, SIG_IGN);
+ 
++	/* Ensure VT is restored on termination signals */
++	signal(SIGINT, cleanup_and_exit);
++	signal(SIGTERM, cleanup_and_exit);
++
+ 	memset(&amp;server, 0, sizeof(struct ServerState));
+ 	server.drm_fd = -1;
+ 	server.framebuffer = NULL;
+</pre>

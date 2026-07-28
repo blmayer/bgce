@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce bff2274</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit bff2274
+parent <a href=commit-dd06a93.html>dd06a93</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-14T18:44:29-03:00
+
+    Simplify MOVE damage: named rects and world-space trail.
+
+    Replace the opaque expose arrays and double-subtract path with struct rect
+    helpers (old/new world, trail = old\new, screen map). Underlay paints trail
+    strips only; mover is new footprint only. Add a 1px-left pixel headless test.
+
+<a href=tree-bff2274.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/display.c b/display.c
+index 1b2bf3e..1fc2466 100644
+--- a/display.c
++++ b/display.c
+@@ -1577,107 +1577,159 @@ static void composite_all_except(struct ServerState *srv,
+ }
+ 
+ /*
+- * Window move — design (initial BGCE model; do not “optimize” with FB scroll
+- * of the whole window or full-stack recompose of old∪new):
+- *
+- * Caller: `c` is still at the OLD world position; apply (wdx,wdy) after.
+- *
+- *   1. Expose = old screen rect minus new screen rect (L-shape when the
+- *      box only translates; general difference if size changes).  Exact
+- *      rect_subtract — not ad-hoc strips (strips can miss pixels when
+- *      integer world→screen bounds shift, leaving old window content on
+- *      the wallpaper).
+- *   2. For each expose piece only: composite bottom → top every client
+- *      *except* the mover (wallpaper + windows under + windows above that
+- *      cover the hole).  Overwrites the trail; never leaves mover pixels.
+- *   3. Blit the mover FULL from its buffer at the NEW position only —
+- *      do not re-stack under that body.
+- *   4. Re-blit windows stacked above the mover over old∪new (mover blit
+- *      may have covered them).
+- *
+- * Forbidden regressions:
+- *   - fb_copy_rect_delta / FB scroll of the window body.
+- *   - composite_chain over the entire union of old and new for a move.
+- *   - Expose underlay that skips the wallpaper (c-&gt;next-only when the
+- *     chain is wrong) — leaves “L of old window” on the desktop.
++ * Half-open rectangle: pixels x in [x0, x1), y in [y0, y1).
++ * Used for move damage (world and screen space).
+  */
+-/* Args for parallel MOVE underlay / mover blit (stack-local, join before return). */
+-struct move_underlay_args {
+-	struct ServerState *srv;
+-	const struct Client *skip;
++struct rect {
+ 	int x0, y0, x1, y1;
+ };
+ 
+-struct move_blit_args {
+-	struct ServerState *srv;
+-	const struct Client *cli;
+-	int x0, y0, x1, y1;
+-};
++#define MOVE_TRAIL_MAX 4
+ 
+-static void move_underlay_task(void *arg)
++static struct rect rect_make(int x0, int y0, int x1, int y1)
+ {
+-	struct move_underlay_args *a = arg;
+-	struct Client *stack_dbg;
+-	int nstack = 0;
++	struct rect r = { x0, y0, x1, y1 };
++	return r;
++}
+ 
+-	/* worker id comes from claim hand-out TLS */
+-	bgce_comp_damage_log("underlay", a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1, -1);
+-	if (bgce_comp_debug()) {
+-		for (stack_dbg = a-&gt;srv-&gt;clients; stack_dbg; stack_dbg = stack_dbg-&gt;next) {
+-			if (stack_dbg == a-&gt;skip || !stack_dbg-&gt;buffer)
+-				continue;
+-			nstack++;
+-		}
+-		printf("[BGCE] underlay: composite %d layer(s) except skip "
+-		       "id=%u into %dx%d\n",
+-		       nstack,
+-		       a-&gt;skip ? (unsigned)a-&gt;skip-&gt;id : 0,
+-		       a-&gt;x1 - a-&gt;x0, a-&gt;y1 - a-&gt;y0);
+-		fflush(stdout);
+-	}
+-	composite_all_except(a-&gt;srv, a-&gt;skip, a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1);
++static int rect_empty(struct rect r)
++{
++	return r.x0 &gt;= r.x1 || r.y0 &gt;= r.y1;
+ }
+ 
+-static void move_blit_task(void *arg)
++static struct rect rect_union(struct rect a, struct rect b)
+ {
+-	struct move_blit_args *a = arg;
+-	const struct Client *cli = a-&gt;cli;
+-
+-	bgce_comp_damage_log("mover", a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1, -1);
+-	if (bgce_comp_debug() &amp;&amp; cli) {
+-		uint32_t ww = cli-&gt;world_w ? cli-&gt;world_w : cli-&gt;width;
+-		uint32_t wh = cli-&gt;world_h ? cli-&gt;world_h : cli-&gt;height;
+-
+-		printf("[BGCE] mover: blit id=%u app='%s' world=(%u,%u) %ux%u "
+-		       "screen=(%d,%d)-(%d,%d) %dx%d\n",
+-		       (unsigned)cli-&gt;id,
+-		       cli-&gt;app_id[0] ? cli-&gt;app_id : "?",
+-		       cli-&gt;x, cli-&gt;y, ww, wh,
+-		       a-&gt;x0, a-&gt;y0,
+-		       a-&gt;x1 &gt; a-&gt;x0 ? a-&gt;x1 - 1 : a-&gt;x0,
+-		       a-&gt;y1 &gt; a-&gt;y0 ? a-&gt;y1 - 1 : a-&gt;y0,
+-		       a-&gt;x1 - a-&gt;x0, a-&gt;y1 - a-&gt;y0);
+-		fflush(stdout);
+-	}
+-	blit_client_overlap(a-&gt;srv, a-&gt;cli, a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1);
++	return rect_make(a.x0 &lt; b.x0 ? a.x0 : b.x0,
++	                 a.y0 &lt; b.y0 ? a.y0 : b.y0,
++	                 a.x1 &gt; b.x1 ? a.x1 : b.x1,
++	                 a.y1 &gt; b.y1 ? a.y1 : b.y1);
+ }
+ 
++static struct rect rect_grow1(struct rect r, int max_x, int max_y)
++{
++	if (r.x0 &gt; 0)
++		r.x0--;
++	if (r.y0 &gt; 0)
++		r.y0--;
++	if (r.x1 &lt; max_x)
++		r.x1++;
++	if (r.y1 &lt; max_y)
++		r.y1++;
++	return r;
++}
++
++/* Clip to display; returns empty rect if nothing remains. */
++static struct rect rect_clip(const struct ServerState *srv, struct rect r)
++{
++	if (r.x0 &lt; 0)
++		r.x0 = 0;
++	if (r.y0 &lt; 0)
++		r.y0 = 0;
++	if (r.x1 &gt; (int)srv-&gt;display_w)
++		r.x1 = (int)srv-&gt;display_w;
++	if (r.y1 &gt; (int)srv-&gt;display_h)
++		r.y1 = (int)srv-&gt;display_h;
++	if (rect_empty(r))
++		return rect_make(0, 0, 0, 0);
++	return r;
++}
++
++/* Same ceil mapping as client_screen_bounds. */
++static struct rect rect_world_to_screen(const struct ServerState *srv,
++                                       struct rect world)
++{
++	int z = zoom_pct_of(srv);
++	struct rect s;
++
++	s.x0 = (world.x0 * z + 99) / 100 - srv-&gt;pan_x;
++	s.y0 = (world.y0 * z + 99) / 100 - srv-&gt;pan_y;
++	s.x1 = (world.x1 * z + 99) / 100 - srv-&gt;pan_x;
++	s.y1 = (world.y1 * z + 99) / 100 - srv-&gt;pan_y;
++	if (s.x1 &lt;= s.x0)
++		s.x1 = s.x0 + 1;
++	if (s.y1 &lt;= s.y0)
++		s.y1 = s.y0 + 1;
++	return s;
++}
++
++/* a \ b → up to 4 pieces in out[]; returns count. */
++static int rect_minus(struct rect a, struct rect b,
++                      struct rect *out, int out_max)
++{
++	int raw[4][4];
++	int n, i;
++
++	n = rect_subtract(a.x0, a.y0, a.x1, a.y1,
++	                  b.x0, b.y0, b.x1, b.y1, raw, out_max &lt; 4 ? out_max : 4);
++	for (i = 0; i &lt; n; i++)
++		out[i] = rect_make(raw[i][0], raw[i][1], raw[i][2], raw[i][3]);
++	return n;
++}
++
++static void rect_log(const char *tag, struct rect r)
++{
++	if (!bgce_comp_debug() || rect_empty(r))
++		return;
++	printf("[BGCE] move: %s [%d,%d)×[%d,%d) %dx%d\n",
++	       tag, r.x0, r.x1, r.y0, r.y1, r.x1 - r.x0, r.y1 - r.y0);
++	fflush(stdout);
++}
++
++/*
++ * Worker args: paint one screen rect (underlay stack or mover blit).
++ * Lifetime: stack of redraw_region until parallel join returns.
++ */
++struct move_paint_job {
++	struct ServerState *srv;
++	const struct Client *client; /* mover, or skip-id for underlay */
++	struct rect area;
++	int is_underlay; /* 1 = composite everyone except client */
++};
++
++static void move_paint_worker(void *arg)
++{
++	struct move_paint_job *job = arg;
++
++	bgce_comp_damage_log(job-&gt;is_underlay ? "underlay" : "mover",
++	                     job-&gt;area.x0, job-&gt;area.y0,
++	                     job-&gt;area.x1, job-&gt;area.y1, -1);
++	if (job-&gt;is_underlay)
++		composite_all_except(job-&gt;srv, job-&gt;client,
++		                     job-&gt;area.x0, job-&gt;area.y0,
++		                     job-&gt;area.x1, job-&gt;area.y1);
++	else
++		blit_client_overlap(job-&gt;srv, job-&gt;client,
++		                    job-&gt;area.x0, job-&gt;area.y0,
++		                    job-&gt;area.x1, job-&gt;area.y1);
++}
++
++/*
++ * Window move.  `c` is still at the OLD world position.
++ *
++ *   trail  = old_world \ new_world     (L-shape on a pure translate)
++ *   underlay each trail strip on screen (wallpaper + other windows)
++ *   blit mover on new_screen only
++ *   re-blit any windows above over old_screen ∪ new_screen
++ *
++ * Example: (1000,500) 200×200, left 1 → (999,500):
++ *   old_world  [1000,1200)×[500,700)
++ *   new_world  [999,1199)×[500,700)
++ *   trail      [1199,1200)×[500,700)   underlay 1×200
++ *   mover      [999,1199)×[500,700)    200×200  (no shared column)
++ */
+ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ {
+-	struct Client moved;
+-	struct Client *p;
+-	int ox0, oy0, ox1, oy1;
+-	int nx0, ny0, nx1, ny1;
+-	int ux0, uy0, ux1, uy1;
+-	int bx0, by0, bx1, by1;
+-	int expose[8][4];
+-	int nexp;
+-	int i;
+-	int same_bounds;
+-	struct move_underlay_args uargs[2];
+-	struct move_blit_args bargs;
+-	void (*f0)(void *) = NULL, (*f1)(void *) = NULL, (*f2)(void *) = NULL;
+-	void *a0 = NULL, *a1 = NULL, *a2 = NULL;
++	struct Client at_new;
++	struct Client *above;
++	struct rect old_world, new_world;
++	struct rect old_screen, new_screen;
++	struct rect trail_world[MOVE_TRAIL_MAX];
++	struct rect trail_screen[MOVE_TRAIL_MAX];
++	struct move_paint_job underlay_job[2];
++	struct move_paint_job mover_job;
++	int width, height;
++	int n_trail, n_screen, i, j;
++	int z1x;
+ 
+ 	if (!srv || !srv-&gt;framebuffer || !c) {
+ 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
+@@ -1686,206 +1738,154 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ 	if (wdx == 0 &amp;&amp; wdy == 0)
+ 		return;
+ 
+-	client_screen_bounds(srv, c, &amp;ox0, &amp;oy0, &amp;ox1, &amp;oy1);
+-	moved = *c;
+-	moved.x = (uint32_t)((int)c-&gt;x + wdx);
+-	moved.y = (uint32_t)((int)c-&gt;y + wdy);
+-	client_screen_bounds(srv, &amp;moved, &amp;nx0, &amp;ny0, &amp;nx1, &amp;ny1);
++	width = (int)(c-&gt;world_w ? c-&gt;world_w : c-&gt;width);
++	height = (int)(c-&gt;world_h ? c-&gt;world_h : c-&gt;height);
++	if (width &lt; 1 || height &lt; 1)
++		return;
++
++	old_world = rect_make((int)c-&gt;x, (int)c-&gt;y,
++	                      (int)c-&gt;x + width, (int)c-&gt;y + height);
++	new_world = rect_make(old_world.x0 + wdx, old_world.y0 + wdy,
++	                      old_world.x1 + wdx, old_world.y1 + wdy);
+ 
+-	same_bounds = (ox0 == nx0 &amp;&amp; oy0 == ny0 &amp;&amp; ox1 == nx1 &amp;&amp; oy1 == ny1);
++	at_new = *c;
++	at_new.x = (uint32_t)new_world.x0;
++	at_new.y = (uint32_t)new_world.y0;
++
++	old_screen = rect_world_to_screen(srv, old_world);
++	new_screen = rect_world_to_screen(srv, new_world);
+ 
+ 	cursor_fb_begin();
+ 	(void)cursor_lift_all_ret();
+ 
+-	/*
+-	 * When zoomed out (or at awkward zoom percents), a 1-world-pixel move
+-	 * often leaves the integer screen rect unchanged.  The buffer mapping
+-	 * still shifts, so we must re-blit the mover — skipping here left
+-	 * stale edge samples that looked like soft / missing borders.
+-	 */
+-	if (same_bounds) {
+-		bx0 = nx0;
+-		by0 = ny0;
+-		bx1 = nx1;
+-		by1 = ny1;
+-		if (clip_to_display(srv, &amp;bx0, &amp;by0, &amp;bx1, &amp;by1)) {
+-			bgce_comp_damage_log("mover-same", bx0, by0, bx1, by1, -1);
+-			blit_client_overlap(srv, &amp;moved, bx0, by0, bx1, by1);
+-			for (p = srv-&gt;clients; p &amp;&amp; p != c; p = p-&gt;next)
+-				blit_client_overlap(srv, p, bx0, by0, bx1, by1);
++	/* Zoomed out: screen rect may not move; still re-sample the buffer. */
++	if (old_screen.x0 == new_screen.x0 &amp;&amp; old_screen.y0 == new_screen.y0 &amp;&amp;
++	    old_screen.x1 == new_screen.x1 &amp;&amp; old_screen.y1 == new_screen.y1) {
++		struct rect area = rect_clip(srv, new_screen);
++
++		if (!rect_empty(area)) {
++			bgce_comp_damage_log("mover-same", area.x0, area.y0,
++			                     area.x1, area.y1, -1);
++			blit_client_overlap(srv, &amp;at_new,
++			                    area.x0, area.y0, area.x1, area.y1);
++			for (above = srv-&gt;clients; above &amp;&amp; above != c;
++			     above = above-&gt;next)
++				blit_client_overlap(srv, above,
++				                    area.x0, area.y0,
++				                    area.x1, area.y1);
+ 		}
+ 		cursor_fb_end(1);
+ 		return;
+ 	}
+ 
++	/* Trail behind the window = old minus new (world pixels). */
++	n_trail = rect_minus(old_world, new_world, trail_world, MOVE_TRAIL_MAX);
++
+ 	/*
+-	 * 1. Exact expose = old \ new (half-open screen rects).
+-	 *
+-	 * Example at zoom 100%, size 800×600, move (1044,594)→(1043,594):
+-	 *   old = [1044,1844)×[594,1194), new = [1043,1843)×[594,1194)
+-	 *   expose = [1843,1844)×[594,1194)  — one column, the old right edge
+-	 * Mover paints only `new`.  Those sets are adjacent, not overlapping;
+-	 * a shared column would mean both underlay and mover write the same
+-	 * pixels (tear).  Never inflate old before subtract at 1×.
+-	 *
+-	 * At zoom ≠ 100%, grow each expose piece by 1px for rounding gaps.
++	 * Map trail strips to screen.  At zoom ≠ 100%, pad 1px for ceil gaps
++	 * then cut new_screen back out so we never underlay the mover body.
+ 	 */
+-	{
+-		int raw[8][4];
+-		int nraw;
+-		int e2[8][4];
+-		int ne2;
+-		int j;
+-
+-		nraw = rect_subtract(ox0, oy0, ox1, oy1, nx0, ny0, nx1, ny1,
+-		                     raw, 8);
+-		nexp = 0;
+-		for (i = 0; i &lt; nraw; i++) {
+-			/*
+-			 * Belt-and-suspenders: keep only (old\new) \ new so
+-			 * expose never intersects the mover’s new footprint.
+-			 */
+-			ne2 = rect_subtract(raw[i][0], raw[i][1], raw[i][2],
+-			                    raw[i][3], nx0, ny0, nx1, ny1, e2, 8);
+-			for (j = 0; j &lt; ne2 &amp;&amp; nexp &lt; 8; j++) {
+-				expose[nexp][0] = e2[j][0];
+-				expose[nexp][1] = e2[j][1];
+-				expose[nexp][2] = e2[j][2];
+-				expose[nexp][3] = e2[j][3];
+-				nexp++;
+-			}
++	z1x = (zoom_pct_of(srv) == BGCE_ZOOM_PCT_1X);
++	n_screen = 0;
++	for (i = 0; i &lt; n_trail &amp;&amp; n_screen &lt; MOVE_TRAIL_MAX; i++) {
++		struct rect s = rect_clip(srv,
++		                          rect_world_to_screen(srv, trail_world[i]));
++
++		if (rect_empty(s))
++			continue;
++		if (z1x) {
++			trail_screen[n_screen++] = s;
++			continue;
+ 		}
+-		if (zoom_pct_of(srv) != BGCE_ZOOM_PCT_1X) {
+-			for (i = 0; i &lt; nexp; i++) {
+-				if (expose[i][0] &gt; 0)
+-					expose[i][0]--;
+-				if (expose[i][1] &gt; 0)
+-					expose[i][1]--;
+-				if (expose[i][2] &lt; (int)srv-&gt;display_w)
+-					expose[i][2]++;
+-				if (expose[i][3] &lt; (int)srv-&gt;display_h)
+-					expose[i][3]++;
+-			}
+-			/*
+-			 * After inflate, clip away new again so we still do not
+-			 * underlay under the mover body.
+-			 */
+-			nraw = nexp;
+-			for (i = 0; i &lt; nraw; i++) {
+-				raw[i][0] = expose[i][0];
+-				raw[i][1] = expose[i][1];
+-				raw[i][2] = expose[i][2];
+-				raw[i][3] = expose[i][3];
+-			}
+-			nexp = 0;
+-			for (i = 0; i &lt; nraw; i++) {
+-				ne2 = rect_subtract(raw[i][0], raw[i][1],
+-				                    raw[i][2], raw[i][3],
+-				                    nx0, ny0, nx1, ny1, e2, 8);
+-				for (j = 0; j &lt; ne2 &amp;&amp; nexp &lt; 8; j++) {
+-					expose[nexp][0] = e2[j][0];
+-					expose[nexp][1] = e2[j][1];
+-					expose[nexp][2] = e2[j][2];
+-					expose[nexp][3] = e2[j][3];
+-					nexp++;
+-				}
++		{
++			struct rect padded = rect_grow1(s, (int)srv-&gt;display_w,
++			                                (int)srv-&gt;display_h);
++			struct rect pieces[MOVE_TRAIL_MAX];
++			int np = rect_minus(padded, new_screen, pieces,
++			                    MOVE_TRAIL_MAX);
++
++			for (j = 0; j &lt; np &amp;&amp; n_screen &lt; MOVE_TRAIL_MAX; j++) {
++				struct rect clipped = rect_clip(srv, pieces[j]);
++
++				if (!rect_empty(clipped))
++					trail_screen[n_screen++] = clipped;
+ 			}
+ 		}
+ 	}
+ 
+-	/* Mover paints only the new footprint. */
+-	bx0 = nx0;
+-	by0 = ny0;
+-	bx1 = nx1;
+-	by1 = ny1;
+-	if (!clip_to_display(srv, &amp;bx0, &amp;by0, &amp;bx1, &amp;by1)) {
+-		bx0 = by0 = bx1 = by1 = 0;
++	if (bgce_comp_debug()) {
++		printf("[BGCE] move: delta=(%d,%d) size=%dx%d\n",
++		       wdx, wdy, width, height);
++		rect_log("old_world", old_world);
++		rect_log("new_world", new_world);
++		for (i = 0; i &lt; n_trail; i++)
++			rect_log("trail_world", trail_world[i]);
++		for (i = 0; i &lt; n_screen; i++)
++			rect_log("trail_screen", trail_screen[i]);
++		rect_log("mover_screen", new_screen);
++	}
++
++	/* Underlay trail first (up to 2 strips in parallel), then mover. */
++	{
++		void (*fn0)(void *) = NULL, (*fn1)(void *) = NULL;
++		void *arg0 = NULL, *arg1 = NULL;
++
++		if (n_screen &gt; 0) {
++			underlay_job[0].srv = srv;
++			underlay_job[0].client = c;
++			underlay_job[0].area = trail_screen[0];
++			underlay_job[0].is_underlay = 1;
++			fn0 = move_paint_worker;
++			arg0 = &amp;underlay_job[0];
++		}
++		if (n_screen &gt; 1) {
++			underlay_job[1].srv = srv;
++			underlay_job[1].client = c;
++			underlay_job[1].area = trail_screen[1];
++			underlay_job[1].is_underlay = 1;
++			fn1 = move_paint_worker;
++			arg1 = &amp;underlay_job[1];
++		}
++		bgce_comp_parallel3(fn0, arg0, fn1, arg1, NULL, NULL);
++
++		for (i = 2; i &lt; n_screen; i++) {
++			underlay_job[0].area = trail_screen[i];
++			move_paint_worker(&amp;underlay_job[0]);
++		}
+ 	}
+ 
+-	/*
+-	 * Phase A — underlay expose strips only (parallel among strips).
+-	 * Phase B — mover at new (after underlays join).
+-	 *
+-	 * Do NOT run underlay ∥ mover: a 1px shared column (off-by-one or
+-	 * race) makes two workers write the same pixels and tear.
+-	 */
+-	f0 = f1 = f2 = NULL;
+-	a0 = a1 = a2 = NULL;
+-	if (nexp &gt; 0) {
+-		uargs[0].srv = srv;
+-		uargs[0].skip = c;
+-		uargs[0].x0 = expose[0][0];
+-		uargs[0].y0 = expose[0][1];
+-		uargs[0].x1 = expose[0][2];
+-		uargs[0].y1 = expose[0][3];
+-		f0 = move_underlay_task;
+-		a0 = &amp;uargs[0];
+-	}
+-	if (nexp &gt; 1) {
+-		uargs[1].srv = srv;
+-		uargs[1].skip = c;
+-		uargs[1].x0 = expose[1][0];
+-		uargs[1].y0 = expose[1][1];
+-		uargs[1].x1 = expose[1][2];
+-		uargs[1].y1 = expose[1][3];
+-		f1 = move_underlay_task;
+-		a1 = &amp;uargs[1];
+-	}
+-	/* Only underlay slots in this batch (tags underlay0/underlay1). */
+-	bgce_comp_parallel3(f0, a0, f1, a1, NULL, NULL);
+-
+-	/* Extra expose pieces beyond the first two. */
+-	for (i = 2; i &lt; nexp; i++) {
+-		bgce_comp_damage_log("underlay", expose[i][0], expose[i][1],
+-		                     expose[i][2], expose[i][3], -1);
+-		composite_all_except(srv, c, expose[i][0], expose[i][1],
+-		                     expose[i][2], expose[i][3]);
+-	}
+-
+-	/* Phase B: full blit of mover at new place only. */
+-	if (bx1 &gt; bx0 &amp;&amp; by1 &gt; by0) {
+-		bargs.srv = srv;
+-		bargs.cli = &amp;moved;
+-		bargs.x0 = bx0;
+-		bargs.y0 = by0;
+-		bargs.x1 = bx1;
+-		bargs.y1 = by1;
+-		move_blit_task(&amp;bargs);
+-	}
+-
+-	/* 4. Windows above: redraw over old∪new (serial, z-order). */
+-	ux0 = ox0 &lt; nx0 ? ox0 : nx0;
+-	uy0 = oy0 &lt; ny0 ? oy0 : ny0;
+-	ux1 = ox1 &gt; nx1 ? ox1 : nx1;
+-	uy1 = oy1 &gt; ny1 ? oy1 : ny1;
+-	if (zoom_pct_of(srv) != BGCE_ZOOM_PCT_1X) {
+-		if (ux0 &gt; 0)
+-			ux0--;
+-		if (uy0 &gt; 0)
+-			uy0--;
+-		if (ux1 &lt; (int)srv-&gt;display_w)
+-			ux1++;
+-		if (uy1 &lt; (int)srv-&gt;display_h)
+-			uy1++;
+-	}
+-	if (clip_to_display(srv, &amp;ux0, &amp;uy0, &amp;ux1, &amp;uy1)) {
+-		bgce_comp_damage_log("above", ux0, uy0, ux1, uy1, -1);
+-		if (bgce_comp_debug()) {
+-			int nabove = 0;
+-			for (p = srv-&gt;clients; p &amp;&amp; p != c; p = p-&gt;next)
+-				if (p-&gt;buffer)
+-					nabove++;
+-			printf("[BGCE] above: re-blit %d window(s) over "
+-			       "screen=(%d,%d)-(%d,%d) %dx%d (mover id=%u)\n",
+-			       nabove, ux0, uy0,
+-			       ux1 &gt; ux0 ? ux1 - 1 : ux0,
+-			       uy1 &gt; uy0 ? uy1 - 1 : uy0,
+-			       ux1 - ux0, uy1 - uy0,
+-			       (unsigned)c-&gt;id);
+-			fflush(stdout);
++	{
++		struct rect mover_area = rect_clip(srv, new_screen);
++
++		if (!rect_empty(mover_area)) {
++			mover_job.srv = srv;
++			mover_job.client = &amp;at_new;
++			mover_job.area = mover_area;
++			mover_job.is_underlay = 0;
++			move_paint_worker(&amp;mover_job);
+ 		}
+-		for (p = srv-&gt;clients; p &amp;&amp; p != c; p = p-&gt;next)
+-			blit_client_overlap(srv, p, ux0, uy0, ux1, uy1);
++	}
++
++	/* Windows above the mover cover old∪new (list is top → bottom). */
++	for (above = srv-&gt;clients; above &amp;&amp; above != c; above = above-&gt;next) {
++		struct rect cover;
++
++		if (!above-&gt;buffer)
++			continue;
++		cover = rect_clip(srv, rect_union(old_screen, new_screen));
++		if (!z1x)
++			cover = rect_clip(srv,
++			                  rect_grow1(cover, (int)srv-&gt;display_w,
++			                             (int)srv-&gt;display_h));
++		if (rect_empty(cover))
++			break;
++		bgce_comp_damage_log("above", cover.x0, cover.y0,
++		                     cover.x1, cover.y1, -1);
++		for (; above &amp;&amp; above != c; above = above-&gt;next)
++			blit_client_overlap(srv, above,
++			                    cover.x0, cover.y0,
++			                    cover.x1, cover.y1);
++		break;
+ 	}
+ 
+ 	cursor_fb_end(1);
+diff --git a/test/headless.c b/test/headless.c
+index 9fc51a1..b733c8b 100644
+--- a/test/headless.c
++++ b/test/headless.c
+@@ -353,6 +353,82 @@ int main(void)
+ 		}
+ 	}
+ 
++	/*
++	 * 1px left at 100% zoom (user example shape: (x,y) 200×200 → left 1):
++	 *   old [100,300), new [99,299)
++	 *   underlay column 299 only (1×200); mover exactly 200×200
++	 *   not 201-wide (that is only old∪new for windows above)
++	 */
++	{
++		const uint32_t win = 0xFF112233u;
++		const uint32_t bg = 0xFF336699u; /* mock.c config.color */
++		uint32_t *fb;
++		uint32_t stride;
++		const int x0 = 100, y0 = 80, w = 200;
++		int fails = 0;
++
++		bgce_mock_fini();
++		if (bgce_mock_init(640, 480) != 0) {
++			fprintf(stderr, "headless: 1px-left re-init failed\n");
++			return 1;
++		}
++		a = bgce_mock_add_client((uint32_t)x0, (uint32_t)y0,
++		                         (uint32_t)w, 200, win);
++		if (!a) {
++			fprintf(stderr, "headless: 1px-left client failed\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		/* No cache restore / remember — pin world pos. */
++		a-&gt;app_id[0] = '\0';
++		a-&gt;x = (uint32_t)x0;
++		a-&gt;y = (uint32_t)y0;
++		bgce_mock_set_viewport(100, 0, 0);
++		bgce_mock_draw(a);
++		bgce_mock_move(a, -1, 0);
++
++		fb = (uint32_t *)server.framebuffer;
++		stride = server.display_w;
++		if (a-&gt;x != (uint32_t)(x0 - 1) || a-&gt;y != (uint32_t)y0) {
++			fprintf(stderr, "headless: 1px-left pos got %u,%u\n",
++			        a-&gt;x, a-&gt;y);
++			fails++;
++		}
++		/* trail: last column of old window → background */
++		if (fb[y0 * (int)stride + (x0 + w - 1)] != bg) {
++			fprintf(stderr,
++			        "headless: trail col %d not bg (0x%08x)\n",
++			        x0 + w - 1,
++			        fb[y0 * (int)stride + (x0 + w - 1)]);
++			fails++;
++		}
++		if (fb[y0 * (int)stride + (x0 + w)] != bg) {
++			fprintf(stderr, "headless: col %d past old end not bg\n",
++			        x0 + w);
++			fails++;
++		}
++		if (fb[y0 * (int)stride + (x0 - 1)] != win) {
++			fprintf(stderr, "headless: new left col %d not win\n",
++			        x0 - 1);
++			fails++;
++		}
++		if (fb[y0 * (int)stride + (x0 + w - 2)] != win) {
++			fprintf(stderr, "headless: new right col %d not win\n",
++			        x0 + w - 2);
++			fails++;
++		}
++		if (bgce_mock_fb_matches_full_redraw() != 0) {
++			fprintf(stderr, "headless: 1px-left full-redraw mismatch\n");
++			fails++;
++		}
++		if (bgce_mock_screenshot("headless_16_1px_left.png") != 0)
++			return 1;
++		if (fails) {
++			bgce_mock_fini();
++			return 1;
++		}
++	}
++
+ 	printf("headless complete. PNG frames written.\n");
+ 	bgce_mock_fini();
+ 	return 0;
+</pre>

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 60d22ef</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 60d22ef
+parent <a href=commit-8ff522a.html>8ff522a</a> 
+author Brian Mayer &lt;brianmayer@Brians-MacBook-Pro.local&gt;
+date   2025-12-07T12:33:52-03:00
+
+    changed license to bsd
+
+<a href=tree-60d22ef.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/README.md b/README.md
+index a200b10..c905cca 100644
+--- a/README.md
++++ b/README.md
+@@ -7,7 +7,7 @@ BGCE is a minimal graphical environment for Linux written in C. It acts as a bar
+ The system is split into two components:
+ 
+ - **Server:** Manages video buffer, input events, and window stacking.
+-- **Client:** Applications that render to their own buffers and request drawing through the server.
++- **Client:** Sample application that renders its own buffer by requesting the server.
+ 
+ The server maintains:
+ - A **real display buffer** (the VGA framebuffer)
+@@ -20,9 +20,7 @@ The client communicates with the server via a shared library exposing these APIs
+ ```c
+ ServerInfo getServerInfo(); // Returns buffer resolution, color depth, etc.
+ Buffer* getBuffer(int width, int height); // Returns a pointer to the client’s buffer
+-void draw(int x, int y, int z); // Requests server to draw client buffer at position
+-bool getFocus(); // Checks if this client has input focus
+-void resizeBuffer(int width, int height); // Optional: resize client buffer
++void draw(); // Requests server to draw the client buffer
+ ```
+ 
+ ### Input
+@@ -46,7 +44,7 @@ void resizeBuffer(int width, int height); // Optional: resize client buffer
+ ```bash
+ git clone &lt;repo-url&gt;
+ cd BGCE
+-make
++make all client
+ ./bgce   # Start server
+ ./client  # Start test client
+ ```
+@@ -59,4 +57,4 @@ make
+ 
+ ## License
+ 
+-MIT License
++BSD 2-clause.
+diff --git a/www/index.html b/www/index.html
+index 6506956..d864f4a 100644
+--- a/www/index.html
++++ b/www/index.html
+@@ -11,7 +11,7 @@
+ 	│                        │
+ 	│ BGCE.                  │
+ 	│     |\                 │
+-	│                        │
++	│      ^                 │
+ 	└────────────────────────┘
+ 
+ &lt;i&gt;&lt;b&gt;BGCE: Brian's Graphical Computer Environment&lt;/b&gt;&lt;/i&gt;
+@@ -36,7 +36,7 @@ The system is split into two components:
+ 
+ 	git clone https://terminal.pink/bgce
+ 	cd bgce
+-	make
++	make all client
+ 	./bgce   # Start server
+ 	./client  # Start test client
+ 
+@@ -51,5 +51,5 @@ The system is split into two components:
+ 
+ &lt;b&gt;License&lt;/b&gt;
+ 
+-MIT License
++BSD 2-clause license.
+ &lt;/pre&gt;
+</pre>

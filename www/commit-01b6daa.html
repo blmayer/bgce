@@ -1,0 +1,1059 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 01b6daa</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 01b6daa
+parent <a href=commit-742c283.html>742c283</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-10-24T17:40:55-03:00
+
+    renamed files
+
+<a href=tree-01b6daa.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/bgce.h b/bgce.h
+index 64ec25a..0fbcb02 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -1,58 +1,93 @@
+ #ifndef BGCE_H
+ #define BGCE_H
+ 
++#define _XOPEN_SOURCE 700
++#include &lt;stddef.h&gt;
+ #include &lt;stdint.h&gt;
++#include &lt;sys/types.h&gt;
+ 
+-#define BGCE_SOCKET_PATH "/tmp/bgce_socket"
+-
+-/* Message types for the binary protocol */
+-typedef enum {
+-	MSG_GET_SERVER_INFO = 1,
+-	MSG_GET_BUFFER      = 2,
+-	MSG_DRAW            = 3
+-} MessageType;
+-
+-/* Fixed-size message header */
+-typedef struct {
+-	uint32_t type;
+-	uint32_t length;
+-	uint8_t  data[256];   /* Inline payload (small messages only) */
+-} BGCEMessage;
+-
+-/* Server global state */
+-typedef struct {
+-	int width;
+-	int height;
+-	int color_depth;
+-	uint8_t *framebuffer;
+-} ServerState;
+-
+-/* Client state (used per connection) */
+-typedef struct {
+-	int fd;
+-	char shm_name[64];
+-	uint8_t *buffer;
+-	int width;
+-	int height;
+-} Client;
+-
+-/* Structures for specific message payloads */
+-typedef struct {
+-	int width;
+-	int height;
+-} ClientBufferRequest;
+-
+-typedef struct {
+-	char shm_name[64];
+-	int width;
+-	int height;
+-} ClientBufferReply;
+-
+-typedef struct {
+-	int width;
+-	int height;
+-	int color_depth;
+-} ServerInfo;
++/* ---------------------------------------------------------------------
++ * BGCE – Basic Graphics Compositing Engine
++ * Public API (libbgce)
++ *
++ * This header defines the client-facing interface used to communicate
++ * with a running BGCE server over a UNIX socket, request buffers,
++ * and send draw commands.
++ * ------------------------------------------------------------------ */
++
++/* ----------------------------
++ * Protocol Message Types
++ * ---------------------------- */
++enum {
++    MSG_GET_SERVER_INFO = 1,
++    MSG_GET_BUFFER,
++    MSG_DRAW,
++    MSG_INPUT_EVENT,
++    MSG_FOCUS_CHANGE
++};
++
++/* ----------------------------
++ * Data Structures
++ * ---------------------------- */
++
++struct BGCEMessage {
++    uint32_t type;
++    uint32_t length;
++    char data[0]; /* Flexible array member */
++};
++
++struct ServerInfo {
++    uint32_t width;
++    uint32_t height;
++    uint32_t color_depth;
++};
++
++struct ClientBufferRequest {
++    uint32_t width;
++    uint32_t height;
++};
++
++struct ClientBufferReply {
++    char shm_name[64];
++    uint32_t width;
++    uint32_t height;
++};
++
++/* ----------------------------
++ * API Functions
++ * ---------------------------- */
++
++/**
++ * Connect to a BGCE server socket.
++ * Returns a file descriptor, or -1 on error.
++ */
++int bgce_connect(const char *socket_path);
++
++/**
++ * Request server info (width, height, color depth).
++ * Returns 0 on success, -1 on failure.
++ */
++int bgce_get_server_info(int fd, struct ServerInfo *out_info);
++
++/**
++ * Request a shared memory buffer from the server.
++ * Fills in the reply structure with shm name and dimensions.
++ * Returns 0 on success, -1 on failure.
++ */
++void *bgce_get_buffer(const struct ClientBufferRequest *req,
++                        struct ClientBufferReply *reply);
++
++/**
++ * Send a draw command to the server, telling it to blit the
++ * shared memory contents to the framebuffer.
++ * Returns 0 on success, -1 on failure.
++ */
++int bgce_draw(int fd);
++
++/**
++ * Gracefully close connection and unmap any buffer.
++ */
++void bgce_close(int fd, void *mapped_buffer, size_t size);
+ 
+ #endif /* BGCE_H */
+ 
+diff --git a/bgce_client_handler.c b/bgce_client_handler.c
+deleted file mode 100644
+index 524945b..0000000
+--- a/bgce_client_handler.c
++++ /dev/null
+@@ -1,102 +0,0 @@
+-#define _XOPEN_SOURCE 700
+-
+-#include "bgce.h"
+-#include "bgce_shared.h"
+-
+-#include &lt;stdio.h&gt;
+-#include &lt;stdlib.h&gt;
+-#include &lt;string.h&gt;
+-#include &lt;unistd.h&gt;
+-#include &lt;fcntl.h&gt;
+-#include &lt;sys/mman.h&gt;
+-#include &lt;sys/stat.h&gt;
+-#include &lt;sys/types.h&gt;
+-#include &lt;time.h&gt;
+-
+-/* Handle a single connected client */
+-void handle_client(int client_fd, ServerState *server)
+-{
+-	Client client = {0};
+-	client.fd = client_fd;
+-
+-	printf("[BGCE] Client connected (fd=%d)\n", client_fd);
+-
+-	while (1) {
+-		BGCEMessage msg;
+-		ssize_t rc = bgce_recv_msg(client_fd, &amp;msg);
+-		if (rc &lt;= 0) {
+-			printf("[BGCE] Client disconnected (fd=%d)\n", client_fd);
+-			break;
+-		}
+-
+-		switch (msg.type) {
+-		case MSG_GET_SERVER_INFO: {
+-			ServerInfo info = {
+-				.width = server-&gt;width,
+-				.height = server-&gt;height,
+-				.color_depth = server-&gt;color_depth
+-			};
+-			bgce_send_data(client_fd, &amp;info, sizeof(info));
+-			break;
+-		}
+-
+-		case MSG_GET_BUFFER: {
+-			if (msg.length &lt; sizeof(ClientBufferRequest)) {
+-				fprintf(stderr, "[BGCE] Invalid buffer request size\n");
+-				break;
+-			}
+-			ClientBufferRequest req;
+-			memcpy(&amp;req, msg.data, sizeof(req));
+-
+-			snprintf(client.shm_name, sizeof(client.shm_name),
+-				 "/bgce_buf_%d_%ld", getpid(), time(NULL));
+-
+-			int shm_fd = shm_open(client.shm_name, O_CREAT | O_RDWR, 0600);
+-			if (shm_fd &lt; 0) {
+-				perror("shm_open");
+-				break;
+-			}
+-
+-			size_t buf_size = req.width * req.height * 3;
+-			if (ftruncate(shm_fd, buf_size) &lt; 0) {
+-				perror("ftruncate");
+-				close(shm_fd);
+-				break;
+-			}
+-
+-			client.buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+-			client.width = req.width;
+-			client.height = req.height;
+-			close(shm_fd);
+-
+-			ClientBufferReply reply = {0};
+-			strncpy(reply.shm_name, client.shm_name, sizeof(reply.shm_name));
+-			reply.width = req.width;
+-			reply.height = req.height;
+-			bgce_send_data(client_fd, &amp;reply, sizeof(reply));
+-			break;
+-		}
+-
+-		case MSG_DRAW: {
+-			if (!client.buffer) {
+-				fprintf(stderr, "[BGCE] Client has no buffer!\n");
+-				break;
+-			}
+-			printf("[BGCE] Drawing from client %d\n", client_fd);
+-			bgce_blit_to_framebuffer(server, &amp;client);
+-			break;
+-		}
+-
+-		default:
+-			fprintf(stderr, "[BGCE] Unknown message type %d\n", msg.type);
+-			break;
+-		}
+-	}
+-
+-	if (client.buffer) {
+-		munmap(client.buffer, client.width * client.height * 3);
+-		shm_unlink(client.shm_name);
+-	}
+-	close(client_fd);
+-}
+-
+diff --git a/bgce_server.c b/bgce_server.c
+deleted file mode 100644
+index 64d1683..0000000
+--- a/bgce_server.c
++++ /dev/null
+@@ -1,69 +0,0 @@
+-#define _XOPEN_SOURCE 700
+-
+-#include "bgce.h"
+-#include "bgce_shared.h"
+-#include "bgce_client_handler.c"
+-
+-#include &lt;stdio.h&gt;
+-#include &lt;stdlib.h&gt;
+-#include &lt;string.h&gt;
+-#include &lt;sys/socket.h&gt;
+-#include &lt;sys/un.h&gt;
+-#include &lt;unistd.h&gt;
+-#include &lt;fcntl.h&gt;
+-#include &lt;sys/mman.h&gt;
+-
+-int main(void)
+-{
+-	ServerState server;
+-	server.width = 640;
+-	server.height = 480;
+-	server.color_depth = 24;
+-	server.framebuffer = calloc(server.width * server.height * 3, 1);
+-
+-	int srv_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+-	if (srv_fd &lt; 0) {
+-		perror("socket");
+-		exit(1);
+-	}
+-
+-	struct sockaddr_un addr;
+-	memset(&amp;addr, 0, sizeof(addr));
+-	addr.sun_family = AF_UNIX;
+-	strncpy(addr.sun_path, BGCE_SOCKET_PATH, sizeof(addr.sun_path)-1);
+-	unlink(BGCE_SOCKET_PATH);
+-
+-	if (bind(srv_fd, (struct sockaddr *)&amp;addr, sizeof(addr)) &lt; 0) {
+-		perror("bind");
+-		exit(1);
+-	}
+-
+-	if (listen(srv_fd, 4) &lt; 0) {
+-		perror("listen");
+-		exit(1);
+-	}
+-
+-	printf("[BGCE] Server listening on %s\n", BGCE_SOCKET_PATH);
+-
+-	while (1) {
+-		int client_fd = accept(srv_fd, NULL, NULL);
+-		if (client_fd &lt; 0) {
+-			perror("accept");
+-			continue;
+-		}
+-
+-		pid_t pid = fork();
+-		if (pid == 0) {
+-			close(srv_fd);
+-			handle_client(client_fd, &amp;server);
+-			exit(0);
+-		}
+-		close(client_fd);
+-	}
+-
+-	free(server.framebuffer);
+-	close(srv_fd);
+-	unlink(BGCE_SOCKET_PATH);
+-	return 0;
+-}
+-
+diff --git a/bgce_shared.c b/bgce_shared.c
+deleted file mode 100644
+index 9385903..0000000
+--- a/bgce_shared.c
++++ /dev/null
+@@ -1,74 +0,0 @@
+-#include "bgce_shared.h"
+-#include &lt;stdio.h&gt;
+-#include &lt;stdlib.h&gt;
+-#include &lt;string.h&gt;
+-
+-/* Write exactly len bytes */
+-ssize_t bgce_send_data(int fd, const void *buf, size_t len)
+-{
+-	const uint8_t *p = buf;
+-	size_t total = 0;
+-	while (total &lt; len) {
+-		ssize_t n = write(fd, p + total, len - total);
+-		if (n &lt;= 0) return n;
+-		total += n;
+-	}
+-	return total;
+-}
+-
+-/* Read exactly len bytes */
+-ssize_t bgce_recv_data(int fd, void *buf, size_t len)
+-{
+-	uint8_t *p = buf;
+-	size_t total = 0;
+-	while (total &lt; len) {
+-		ssize_t n = read(fd, p + total, len - total);
+-		if (n &lt;= 0) return n;
+-		total += n;
+-	}
+-	return total;
+-}
+-
+-/* Send a structured message */
+-ssize_t bgce_send_msg(int fd, const BGCEMessage *msg)
+-{
+-	return bgce_send_data(fd, msg, sizeof(uint32_t)*2 + msg-&gt;length);
+-}
+-
+-/* Receive a structured message */
+-ssize_t bgce_recv_msg(int fd, BGCEMessage *msg)
+-{
+-	ssize_t n = bgce_recv_data(fd, msg, sizeof(uint32_t)*2);
+-	if (n &lt;= 0) return n;
+-	if (msg-&gt;length &gt; sizeof(msg-&gt;data)) {
+-		fprintf(stderr, "[BGCE] Invalid message length: %u\n", msg-&gt;length);
+-		return -1;
+-	}
+-	if (msg-&gt;length &gt; 0)
+-		n = bgce_recv_data(fd, msg-&gt;data, msg-&gt;length);
+-	return n;
+-}
+-
+-/* Copy one client's buffer to the global framebuffer */
+-void bgce_blit_to_framebuffer(ServerState *server, Client *client)
+-{
+-	int w = client-&gt;width;
+-	int h = client-&gt;height;
+-	if (!server-&gt;framebuffer || !client-&gt;buffer)
+-		return;
+-
+-	for (int y = 0; y &lt; h &amp;&amp; y &lt; server-&gt;height; y++) {
+-		uint8_t *src = client-&gt;buffer + y * w * 3;
+-		uint8_t *dst = server-&gt;framebuffer + y * server-&gt;width * 3;
+-		memcpy(dst, src, w * 3);
+-	}
+-
+-	/* Save global frame to file for debugging */
+-	FILE *f = fopen("/tmp/bgce_frame.ppm", "wb");
+-	if (f) {
+-		fprintf(f, "P6\n%d %d\n255\n", server-&gt;width, server-&gt;height);
+-		fwrite(server-&gt;framebuffer, 1, server-&gt;width * server-&gt;height * 3, f);
+-		fclose(f);
+-	}
+-}
+-
+diff --git a/bgce_shared.h b/bgce_shared.h
+deleted file mode 100644
+index 4f17968..0000000
+--- a/bgce_shared.h
++++ /dev/null
+@@ -1,17 +0,0 @@
+-#ifndef BGCE_SHARED_H
+-#define BGCE_SHARED_H
+-
+-#define _XOPEN_SOURCE 700
+-#include "bgce.h"
+-#include &lt;unistd.h&gt;
+-#include &lt;sys/types.h&gt;
+-
+-ssize_t bgce_send_data(int fd, const void *buf, size_t len);
+-ssize_t bgce_recv_data(int fd, void *buf, size_t len);
+-ssize_t bgce_send_msg(int fd, const BGCEMessage *msg);
+-ssize_t bgce_recv_msg(int fd, BGCEMessage *msg);
+-
+-void bgce_blit_to_framebuffer(ServerState *server, Client *client);
+-
+-#endif /* BGCE_SHARED_H */
+-
+diff --git a/libbgce.c b/libbgce.c
+index 498832e..e6a877e 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -10,16 +10,10 @@
+ #include &lt;fcntl.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+-static int bgce_fd = -1;
+-static int shm_fd = -1;
+-static void *shared_buf = NULL;
+-
+ /* Connect to the BGCE server */
+-static int bgce_connect(void)
++int bgce_connect(void)
+ {
+-	if (bgce_fd &gt;= 0) return bgce_fd;
+-
+-	bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
++	int bgce_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+ 	if (bgce_fd &lt; 0) {
+ 		perror("socket");
+ 		return -1;
+@@ -40,27 +34,27 @@ static int bgce_connect(void)
+ }
+ 
+ /* Public API: Get server info */
+-int getServerInfo(ServerInfo *info)
++int getServerInfo(int conn, ServerInfo *info)
+ {
+-	if (bgce_connect() &lt; 0) return -1;
++	if (conn &lt; 0) return -1;
+ 
+ 	BGCEMessage msg = {0};
+ 	msg.type = MSG_GET_SERVER_INFO;
+ 	msg.length = 0;
+ 
+-	if (bgce_send_msg(bgce_fd, &amp;msg) &lt;= 0)
++	if (bgce_send_msg(conn, &amp;msg) &lt;= 0)
+ 		return -1;
+ 
+-	if (bgce_recv_data(bgce_fd, info, sizeof(ServerInfo)) &lt;= 0)
++	if (bgce_recv_data(conn, info, sizeof(ServerInfo)) &lt;= 0)
+ 		return -1;
+ 
+ 	return 0;
+ }
+ 
+ /* Public API: Get shared buffer */
+-void *getBuffer(int width, int height)
++void *bgce_get_buffer(int conn, int width, int height)
+ {
+-	if (bgce_connect() &lt; 0) return NULL;
++	if (conn &lt; 0) return NULL;
+ 
+ 	ClientBufferRequest req = { .width = width, .height = height };
+ 
+@@ -69,59 +63,50 @@ void *getBuffer(int width, int height)
+ 	msg.length = sizeof(req);
+ 	memcpy(msg.data, &amp;req, sizeof(req));
+ 
+-	if (bgce_send_msg(bgce_fd, &amp;msg) &lt;= 0)
++	if (bgce_send_msg(conn, &amp;msg) &lt;= 0)
+ 		return NULL;
+ 
+ 	ClientBufferReply reply;
+-	if (bgce_recv_data(bgce_fd, &amp;reply, sizeof(reply)) &lt;= 0)
++	if (bgce_recv_data(conn, &amp;reply, sizeof(reply)) &lt;= 0)
+ 		return NULL;
+ 
+ 	size_t size = reply.width * reply.height * 3;
+-	shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
++	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
+ 	if (shm_fd &lt; 0) {
+ 		perror("shm_open (client)");
+ 		return NULL;
+ 	}
+ 
+-	shared_buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+-	if (shared_buf == MAP_FAILED) {
++	void *buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++	if (buf == MAP_FAILED) {
+ 		perror("mmap (client)");
+ 		close(shm_fd);
+ 		return NULL;
+ 	}
+ 
+-	return shared_buf;
++	return buf;
+ }
+ 
+ /* Public API: Draw current buffer */
+-int draw(void)
++int draw(int conn)
+ {
+-	if (bgce_connect() &lt; 0) return -1;
++	if (conn &lt; 0) return -1;
+ 
+ 	BGCEMessage msg = {0};
+ 	msg.type = MSG_DRAW;
+ 	msg.length = 0;
+ 
+-	if (bgce_send_msg(bgce_fd, &amp;msg) &lt;= 0)
++	if (bgce_send_msg(conn, &amp;msg) &lt;= 0)
+ 		return -1;
+ 
+ 	return 0;
+ }
+ 
+ /* Public API: Disconnect */
+-void bgce_close(void)
++void bgce_close(conn)
+ {
+-	if (shared_buf) {
+-		munmap(shared_buf, 0);
+-		shared_buf = NULL;
+-	}
+-	if (shm_fd &gt;= 0) {
+-		close(shm_fd);
+-		shm_fd = -1;
+-	}
+ 	if (bgce_fd &gt;= 0) {
+-		close(bgce_fd);
+-		bgce_fd = -1;
++		close(conn);
+ 	}
+ }
+ 
+diff --git a/server.c b/server.c
+new file mode 100644
+index 0000000..7dbb943
+--- /dev/null
++++ b/server.c
+@@ -0,0 +1,90 @@
++#define _XOPEN_SOURCE 700
++
++#include "bgce_shared.h"
++#include "bgce_client_handler.h"
++
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;unistd.h&gt;
++#include &lt;sys/socket.h&gt;
++#include &lt;sys/un.h&gt;
++#include &lt;pthread.h&gt;
++#include &lt;signal.h&gt;
++
++struct ServerState server;   /* Global server state */
++int focused_client_fd = -1;  /* Currently focused client */
++
++/* Cleanup on Ctrl+C */
++static void handle_sigint(int sig)
++{
++    (void)sig;
++    unlink(SOCKET_PATH);
++    printf("\n[BGCE] Server terminated.\n");
++    exit(0);
++}
++
++int main(void)
++{
++    signal(SIGINT, handle_sigint);
++    memset(&amp;server, 0, sizeof(server));
++
++    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (fd &lt; 0) {
++        perror("socket");
++        return 1;
++    }
++
++    struct sockaddr_un addr;
++    memset(&amp;addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
++    unlink(SOCKET_PATH);
++
++    if (bind(fd, (struct sockaddr*)&amp;addr, sizeof(addr)) &lt; 0) {
++        perror("bind");
++        close(fd);
++        return 1;
++    }
++
++    if (listen(fd, 8) &lt; 0) {
++        perror("listen");
++        close(fd);
++        return 1;
++    }
++
++    server.server_fd = fd;
++    printf("[BGCE] Server listening on %s\n", SOCKET_PATH);
++
++    while (1) {
++        int client_fd = accept(fd, NULL, NULL);
++        if (client_fd &lt; 0) {
++            perror("accept");
++            continue;
++        }
++
++        printf("[BGCE] Client connected (fd=%d)\n", client_fd);
++
++        pthread_t tid;
++        int *arg = malloc(sizeof(int));
++        if (!arg) {
++            perror("malloc");
++            close(client_fd);
++            continue;
++        }
++
++        *arg = client_fd;
++        if (pthread_create(&amp;tid, NULL, client_thread_main, arg) != 0) {
++            perror("pthread_create");
++            free(arg);
++            close(client_fd);
++            continue;
++        }
++
++        pthread_detach(tid);
++        focused_client_fd = client_fd; /* last connected client gets focus */
++    }
++
++    return 0;
++}
++
+diff --git a/server.h b/server.h
+new file mode 100644
+index 0000000..6ea200b
+--- /dev/null
++++ b/server.h
+@@ -0,0 +1,68 @@
++#ifndef BGCE_SERVER_H
++#define BGCE_SERVER_H
++
++#define _XOPEN_SOURCE 700
++#include &lt;pthread.h&gt;
++#include &lt;stdint.h&gt;
++#include &lt;sys/types.h&gt;
++
++#define SOCKET_PATH "/tmp/bgce_server.sock"
++
++/* ----------------------------
++ * Client Representation
++ * ---------------------------- */
++
++struct Client {
++    int fd;
++    pid_t pid;
++    char shm_name[64];
++    void *buffer;
++    uint32_t width;
++    uint32_t height;
++    struct Client *next;
++};
++
++
++/* ----------------------------
++ * Server State
++ * ---------------------------- */
++
++struct ServerState {
++    int server_fd;
++    int width;
++    int height;
++    int color_depth;
++
++    struct Client *clients;
++    int client_count;
++
++    struct Client *focused_client;
++};
++
++/* ----------------------------
++ * Server Functions
++ * ---------------------------- */
++
++/**
++ * Initialize the BGCE server socket.
++ * Returns 0 on success, -1 on error.
++ */
++int bgce_server_init(struct ServerState *srv, const char *socket_path);
++
++/**
++ * Run the main accept loop — listens for incoming clients and spawns threads.
++ */
++void bgce_server_run(struct ServerState *srv);
++
++/**
++ * Clean up sockets and client buffers.
++ */
++void bgce_server_shutdown(struct ServerState *srv);
++
++/**
++ * Handle a single connected client (thread function).
++ */
++void *bgce_handle_client(void *arg);
++
++#endif /* BGCE_SERVER_H */
++
+diff --git a/server_handler.c b/server_handler.c
+new file mode 100644
+index 0000000..423f7ec
+--- /dev/null
++++ b/server_handler.c
+@@ -0,0 +1,120 @@
++#define _XOPEN_SOURCE 700
++
++#include "bgce_shared.h"
++#include "bgce_client_handler.h"
++
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;unistd.h&gt;
++#include &lt;sys/mman.h&gt;
++#include &lt;fcntl.h&gt;
++#include &lt;time.h&gt;
++
++/* Externs from bgce_server.c */
++extern struct ServerState server;
++extern int focused_client_fd;
++
++void *client_thread_main(void *arg) {
++    int client_fd = *(int *)arg;
++    free(arg);
++
++    Client client = {0};
++    client.fd = client_fd;
++
++    printf("[BGCE] Thread started for client fd=%d\n", client_fd);
++
++    while (1) {
++        BGCEMessage msg;
++        ssize_t rc = bgce_recv_msg(client_fd, &amp;msg);
++        if (rc &lt;= 0) {
++            printf("[BGCE] Client disconnected (fd=%d)\n", client_fd);
++            break;
++        }
++
++        switch (msg.type) {
++        case MSG_GET_SERVER_INFO: {
++            ServerInfo info = {
++                .width = server.width,
++                .height = server.height,
++                .color_depth = server.color_depth
++            };
++            bgce_send_data(client_fd, &amp;info, sizeof(info));
++            break;
++        }
++
++        case MSG_GET_BUFFER: {
++            if (msg.length &lt; sizeof(ClientBufferRequest)) {
++                fprintf(stderr, "[BGCE] Invalid buffer request size\n");
++                break;
++            }
++
++            ClientBufferRequest req;
++            memcpy(&amp;req, msg.data, sizeof(req));
++
++            snprintf(client.shm_name, sizeof(client.shm_name),
++                     "/bgce_buf_%d_%ld", getpid(), time(NULL));
++
++            int shm_fd = shm_open(client.shm_name, O_CREAT | O_RDWR, 0600);
++            if (shm_fd &lt; 0) {
++                perror("shm_open");
++                break;
++            }
++
++            size_t buf_size = req.width * req.height * 3;
++            if (ftruncate(shm_fd, buf_size) &lt; 0) {
++                perror("ftruncate");
++                close(shm_fd);
++                break;
++            }
++
++            client.buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++            client.width = req.width;
++            client.height = req.height;
++            close(shm_fd);
++
++            ClientBufferReply reply = {0};
++            strncpy(reply.shm_name, client.shm_name, sizeof(reply.shm_name));
++            reply.width = req.width;
++            reply.height = req.height;
++            bgce_send_data(client_fd, &amp;reply, sizeof(reply));
++            break;
++        }
++
++        case MSG_DRAW: {
++            if (client_fd == focused_client_fd) {
++                if (!client.buffer) {
++                    fprintf(stderr, "[BGCE] Client has no buffer!\n");
++                    break;
++                }
++                printf("[BGCE] Drawing from focused client %d\n", client_fd);
++                bgce_blit_to_framebuffer(&amp;server, &amp;client);
++            } else {
++                printf("[BGCE] Ignoring draw from unfocused client %d\n", client_fd);
++            }
++            break;
++        }
++
++        case MSG_SET_FOCUS: {
++            /* Any client can request focus, in this simple model */
++            focused_client_fd = client_fd;
++            printf("[BGCE] Focus set to client %d\n", client_fd);
++            break;
++        }
++
++        default:
++            fprintf(stderr, "[BGCE] Unknown message type %d\n", msg.type);
++            break;
++        }
++    }
++
++    if (client.buffer) {
++        munmap(client.buffer, client.width * client.height * 3);
++        shm_unlink(client.shm_name);
++    }
++    close(client_fd);
++
++    printf("[BGCE] Thread exiting for client fd=%d\n", client_fd);
++    return NULL;
++}
++
+diff --git a/shared.c b/shared.c
+new file mode 100644
+index 0000000..ffab70b
+--- /dev/null
++++ b/shared.c
+@@ -0,0 +1,111 @@
++#define _XOPEN_SOURCE 700
++#include "bgce_shared.h"
++#include "bgce_server.h"
++
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;errno.h&gt;
++#include &lt;sys/mman.h&gt;
++#include &lt;fcntl.h&gt;
++#include &lt;unistd.h&gt;
++
++/* ============================================================
++ *  LOW-LEVEL SOCKET UTILITIES
++ * ============================================================ */
++
++/* Write exactly 'size' bytes */
++ssize_t bgce_send_data(int fd, const void *data, size_t size)
++{
++    const char *buf = data;
++    size_t total = 0;
++    while (total &lt; size) {
++        ssize_t n = write(fd, buf + total, size - total);
++        if (n &lt; 0) {
++            if (errno == EINTR)
++                continue;
++            perror("write");
++            return -1;
++        }
++        if (n == 0)
++            break;
++        total += n;
++    }
++    return (ssize_t)total;
++}
++
++/* Read exactly 'size' bytes */
++ssize_t bgce_recv_data(int fd, void *data, size_t size)
++{
++    char *buf = data;
++    size_t total = 0;
++    while (total &lt; size) {
++        ssize_t n = read(fd, buf + total, size - total);
++        if (n &lt; 0) {
++            if (errno == EINTR)
++                continue;
++            perror("read");
++            return -1;
++        }
++        if (n == 0)
++            break;
++        total += n;
++    }
++    return (ssize_t)total;
++}
++
++/* ============================================================
++ *  MESSAGE HELPERS
++ * ============================================================ */
++
++ssize_t bgce_send_msg(int fd, const struct BGCEMessage *msg)
++{
++    size_t len = sizeof(msg-&gt;type) + sizeof(msg-&gt;length) + msg-&gt;length;
++    return bgce_send_data(fd, msg, len);
++}
++
++ssize_t bgce_recv_msg(int fd, struct BGCEMessage *msg)
++{
++    ssize_t n = bgce_recv_data(fd, msg, sizeof(uint32_t) * 2);
++    if (n &lt;= 0)
++        return n;
++
++    if (msg-&gt;length &gt; 0) {
++        ssize_t d = bgce_recv_data(fd, msg-&gt;data, msg-&gt;length);
++        if (d &lt; 0)
++            return -1;
++        n += d;
++    }
++    return n;
++}
++
++/* ============================================================
++ *  FRAMEBUFFER UTILITY
++ * ============================================================ */
++
++/*
++ * Writes the active client’s buffer to /tmp/bgce_frame.ppm
++ * Each client overwrites sequentially.
++ */
++void bgce_blit_to_framebuffer(struct ServerState *server, struct Client *client)
++{
++    if (!client-&gt;buffer)
++        return;
++
++    char *buf = client-&gt;buffer;
++    size_t buf_size = (size_t)client-&gt;width * client-&gt;height * 3;
++
++    FILE *fp = fopen("/tmp/bgce_frame.ppm", "wb");
++    if (!fp) {
++        perror("fopen");
++        return;
++    }
++
++    fprintf(fp, "P6\n%d %d\n255\n", client-&gt;width, client-&gt;height);
++    fwrite(buf, 1, buf_size, fp);
++    fclose(fp);
++
++    printf("[BGCE] Frame written from client fd=%d (%ux%u)\n",
++           client-&gt;fd, client-&gt;width, client-&gt;height);
++}
++
+diff --git a/shared.h b/shared.h
+new file mode 100644
+index 0000000..0063559
+--- /dev/null
++++ b/shared.h
+@@ -0,0 +1,55 @@
++#ifndef BGCE_SHARED_H
++#define BGCE_SHARED_H
++
++#define _XOPEN_SOURCE 700
++#include &lt;sys/types.h&gt;
++#include &lt;stdint.h&gt;
++#include &lt;unistd.h&gt;
++#include &lt;stddef.h&gt;
++
++/* ----------------------------
++ * Message Structure
++ * ---------------------------- */
++
++struct BGCEMessage {
++    uint32_t type;
++    uint32_t length;
++    char data[0];
++};
++
++/* ----------------------------
++ * Shared Utilities
++ * ---------------------------- */
++
++/**
++ * Send raw data over a socket (blocking until all bytes sent).
++ * Returns number of bytes written, or -1 on error.
++ */
++ssize_t bgce_send_data(int fd, const void *data, size_t size);
++
++/**
++ * Receive raw data over a socket (blocking until full message read).
++ * Returns number of bytes read, or -1 on error.
++ */
++ssize_t bgce_recv_data(int fd, void *data, size_t size);
++
++/**
++ * Send a structured BGCE message.
++ * Returns total bytes sent, or -1 on error.
++ */
++ssize_t bgce_send_msg(int fd, const struct BGCEMessage *msg);
++
++/**
++ * Receive a structured BGCE message.
++ * Returns total bytes read, or -1 on error.
++ */
++ssize_t bgce_recv_msg(int fd, struct BGCEMessage *msg);
++
++/**
++ * Blit a client's buffer into the main framebuffer.
++ * (Server-side only.)
++ */
++void bgce_blit_to_framebuffer(struct ServerState *server, struct Client *client);
++
++#endif /* BGCE_SHARED_H */
++
+</pre>

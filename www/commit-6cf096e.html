@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 6cf096e</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 6cf096e
+parent <a href=commit-939bf65.html>939bf65</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-14T20:48:04-03:00
+
+    Zoom in by scaling the framebuffer crop, not recompositing clients.
+
+    Map the new viewport into the old view’s screen rect, NN-scale that crop
+    to the full display (COMP_ZOOM). Zoom out or an out-of-frame crop still
+    uses full stack recompose. Coalesce ZOOM/FULL so wheel bursts stay cheap.
+
+<a href=tree-6cf096e.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/compositor.c b/compositor.c
+index 940e4ac..b53408c 100644
+--- a/compositor.c
++++ b/compositor.c
+@@ -29,6 +29,7 @@ enum comp_op {
+ 	COMP_PAN,
+ 	COMP_ERASE,
+ 	COMP_FULL,
++	COMP_ZOOM, /* viewport change: FB crop+scale when zooming in */
+ 	COMP_CURSOR,
+ 	COMP_QUIT
+ };
+@@ -41,6 +42,9 @@ struct comp_job {
+ 	int sdx, sdy;
+ 	int cursor_x, cursor_y;
+ 	uint32_t erase_x, erase_y, erase_ww, erase_wh;
++	/* COMP_ZOOM: old → new viewport (zoom percent + screen pan) */
++	int zoom_old, zoom_new;
++	int pan_old_x, pan_old_y, pan_new_x, pan_new_y;
+ };
+ 
+ struct paint_task {
+@@ -92,6 +96,7 @@ static const char *op_name(enum comp_op op)
+ 	case COMP_PAN:    return "PAN";
+ 	case COMP_ERASE:  return "ERASE";
+ 	case COMP_FULL:   return "FULL";
++	case COMP_ZOOM:   return "ZOOM";
+ 	case COMP_CURSOR: return "CURSOR";
+ 	case COMP_QUIT:   return "QUIT";
+ 	default:          return "?";
+@@ -242,6 +247,14 @@ static void run_job(const struct comp_job *job)
+ 			       server.zoom_pct, server.pan_x, server.pan_y,
+ 			       server.display_w, server.display_h);
+ 			break;
++		case COMP_ZOOM:
++			printf("[BGCE] comp: run job=%llu ZOOM %d%%→%d%% "
++			       "pan (%d,%d)-&gt;(%d,%d)\n",
++			       (unsigned long long)job-&gt;job_id,
++			       job-&gt;zoom_old, job-&gt;zoom_new,
++			       job-&gt;pan_old_x, job-&gt;pan_old_y,
++			       job-&gt;pan_new_x, job-&gt;pan_new_y);
++			break;
+ 		case COMP_CURSOR:
+ 			printf("[BGCE] comp: run job=%llu CURSOR screen=(%d,%d) "
+ 			       "zoom=%d%% pan=(%d,%d)\n",
+@@ -297,6 +310,12 @@ static void run_job(const struct comp_job *job)
+ 		redraw_all(&amp;server);
+ 		break;
+ 
++	case COMP_ZOOM:
++		redraw_zoom_viewport(&amp;server,
++		                     job-&gt;zoom_old, job-&gt;pan_old_x, job-&gt;pan_old_y,
++		                     job-&gt;zoom_new, job-&gt;pan_new_x, job-&gt;pan_new_y);
++		break;
++
+ 	case COMP_CURSOR:
+ 		set_cursor_pos(&amp;server, job-&gt;cursor_x, job-&gt;cursor_y);
+ 		break;
+@@ -482,19 +501,37 @@ static int try_coalesce_locked(const struct comp_job *job)
+ 	struct comp_job *pending = NULL;
+ 
+ 	if (job-&gt;op != COMP_MOVE &amp;&amp; job-&gt;op != COMP_CURSOR &amp;&amp;
+-	    job-&gt;op != COMP_PAN)
++	    job-&gt;op != COMP_PAN &amp;&amp; job-&gt;op != COMP_ZOOM &amp;&amp;
++	    job-&gt;op != COMP_FULL)
+ 		return 0;
+ 
+ 	n = q_count;
+ 	for (i = 0; i &lt; n; i++) {
+ 		idx = (q_head + i) % COMP_QUEUE_CAP;
++		/*
++		 * FULL absorbs a later ZOOM (full recompose already correct).
++		 * ZOOM absorbs another ZOOM (earliest old → latest new).
++		 * A pending ZOOM is replaced by FULL.
++		 */
++		if (job-&gt;op == COMP_FULL) {
++			if (queue[idx].op == COMP_FULL ||
++			    queue[idx].op == COMP_ZOOM)
++				pending = &amp;queue[idx];
++			continue;
++		}
++		if (job-&gt;op == COMP_ZOOM) {
++			if (queue[idx].op == COMP_FULL)
++				return 1; /* pending FULL already covers us */
++			if (queue[idx].op == COMP_ZOOM)
++				pending = &amp;queue[idx];
++			continue;
++		}
+ 		if (queue[idx].op != job-&gt;op)
+ 			continue;
+ 		if (job-&gt;op == COMP_MOVE &amp;&amp;
+ 		    queue[idx].client_id != job-&gt;client_id)
+ 			continue;
+ 		pending = &amp;queue[idx];
+-		/* keep scanning so we fold into the newest match */
+ 	}
+ 	if (!pending)
+ 		return 0;
+@@ -522,7 +559,7 @@ static int try_coalesce_locked(const struct comp_job *job)
+ 			       pending-&gt;cursor_x, pending-&gt;cursor_y, q_count);
+ 			debug_fflush();
+ 		}
+-	} else { /* COMP_PAN */
++	} else if (job-&gt;op == COMP_PAN) {
+ 		pending-&gt;sdx += job-&gt;sdx;
+ 		pending-&gt;sdy += job-&gt;sdy;
+ 		if (bgce_debug) {
+@@ -532,6 +569,29 @@ static int try_coalesce_locked(const struct comp_job *job)
+ 			       pending-&gt;sdx, pending-&gt;sdy, q_count);
+ 			debug_fflush();
+ 		}
++	} else if (job-&gt;op == COMP_ZOOM) {
++		/* Keep earliest old viewport; take latest new. */
++		pending-&gt;zoom_new = job-&gt;zoom_new;
++		pending-&gt;pan_new_x = job-&gt;pan_new_x;
++		pending-&gt;pan_new_y = job-&gt;pan_new_y;
++		if (bgce_debug) {
++			printf("[BGCE] comp: coalesce ZOOM job=%llu "
++			       "%d%%→%d%% pan (%d,%d)-&gt;(%d,%d) q=%d\n",
++			       (unsigned long long)pending-&gt;job_id,
++			       pending-&gt;zoom_old, pending-&gt;zoom_new,
++			       pending-&gt;pan_old_x, pending-&gt;pan_old_y,
++			       pending-&gt;pan_new_x, pending-&gt;pan_new_y,
++			       q_count);
++			debug_fflush();
++		}
++	} else if (job-&gt;op == COMP_FULL) {
++		/* Upgrade ZOOM slot to FULL, or no-op on existing FULL. */
++		pending-&gt;op = COMP_FULL;
++		if (bgce_debug) {
++			printf("[BGCE] comp: coalesce FULL job=%llu q=%d\n",
++			       (unsigned long long)pending-&gt;job_id, q_count);
++			debug_fflush();
++		}
+ 	}
+ 	return 1;
+ }
+@@ -858,6 +918,27 @@ void bgce_comp_submit_full(void)
+ 	enqueue(&amp;j);
+ }
+ 
++void bgce_comp_submit_zoom(int old_z, int old_pan_x, int old_pan_y,
++                           int new_z, int new_pan_x, int new_pan_y)
++{
++	struct comp_job j;
++
++	if (!comp_inited) {
++		redraw_zoom_viewport(&amp;server, old_z, old_pan_x, old_pan_y,
++		                     new_z, new_pan_x, new_pan_y);
++		return;
++	}
++	memset(&amp;j, 0, sizeof(j));
++	j.op = COMP_ZOOM;
++	j.zoom_old = old_z;
++	j.zoom_new = new_z;
++	j.pan_old_x = old_pan_x;
++	j.pan_old_y = old_pan_y;
++	j.pan_new_x = new_pan_x;
++	j.pan_new_y = new_pan_y;
++	enqueue(&amp;j);
++}
++
+ void bgce_comp_submit_cursor(int x, int y)
+ {
+ 	struct comp_job j;
+diff --git a/compositor.h b/compositor.h
+index 906d4f1..eeffcfe 100644
+--- a/compositor.h
++++ b/compositor.h
+@@ -11,8 +11,9 @@ struct Client;
+  * - Async mode: orchestrator pops jobs (DRAW/MOVE/PAN/CURSOR/…).
+  *   A pool of 3 blit workers runs fine-grained MOVE tasks FCFS.
+  *   Input never paints — it only enqueues (including mouse motion).
+- * - Pending MOVE (same client), CURSOR, and PAN jobs coalesce so a fast
+- *   drag paints one big step instead of flooding the queue.
++ * - Pending MOVE (same client), CURSOR, PAN, ZOOM, and FULL jobs coalesce
++ *   so a fast drag/zoom does not flood the queue.
++ * - Zoom in uses FB crop+scale (COMP_ZOOM); zoom out falls back to FULL.
+  * - Sync mode (headless): submit runs on the caller; parallel tasks serial.
+  *
+  * Debug: BGCE_DEBUG=1 — op names, enqueue/run/done, which worker took each
+@@ -48,9 +49,17 @@ void bgce_comp_submit_pan(int sdx, int sdy);
+ void bgce_comp_submit_erase(uint32_t x, uint32_t y, uint32_t world_w,
+                             uint32_t world_h);
+ 
+-/** Full-scene recomposite (zoom, Alt+Tab viewport, hard invalidate). */
++/** Full-scene recomposite (Alt+Tab viewport, hard invalidate, zoom-out). */
+ void bgce_comp_submit_full(void);
+ 
++/**
++ * Viewport zoom/pan change.  Zoom in: scale the old view’s crop from the FB.
++ * Zoom out or invalid crop: same as full recompose.  old_* is the viewport
++ * that is currently (or was last) painted in the FB.
++ */
++void bgce_comp_submit_zoom(int old_z, int old_pan_x, int old_pan_y,
++                           int new_z, int new_pan_x, int new_pan_y);
++
+ /**
+  * Software cursor move — input enqueues this; compositor paints the glyph.
+  * Screen pixel coordinates (top-left of 32×32 tile).
+diff --git a/display.c b/display.c
+index f080f59..70fd799 100644
+--- a/display.c
++++ b/display.c
+@@ -1224,6 +1224,112 @@ void redraw_all(struct ServerState* srv) {
+ 	cursor_fb_end(1);
+ }
+ 
++/*
++ * Zoom-in path: the FB already holds the old picture.  Map the new viewport
++ * into that picture (screen rect), then NN-scale that rect to the full
++ * display.  No client iteration — only works when the new view is a subset
++ * of the old (zoom in).  Zoom out / bad crop → full recompose.
++ */
++void redraw_zoom_viewport(struct ServerState *srv,
++                          int old_z, int old_pan_x, int old_pan_y,
++                          int new_z, int new_pan_x, int new_pan_y)
++{
++	int W, H;
++	int64_t z0, z1;
++	int64_t sx0_64, sy0_64, sx1_64, sy1_64;
++	int sx0, sy0, sx1, sy1;
++	int src_w, src_h;
++	uint32_t stride;
++	uint32_t *fb;
++	uint32_t *src_copy;
++	int x, y;
++
++	if (!srv || !srv-&gt;framebuffer)
++		return;
++
++	W = (int)srv-&gt;display_w;
++	H = (int)srv-&gt;display_h;
++	if (W &lt; 1 || H &lt; 1)
++		return;
++
++	z0 = old_z &gt; 0 ? old_z : BGCE_ZOOM_PCT_1X;
++	z1 = new_z &gt; 0 ? new_z : BGCE_ZOOM_PCT_1X;
++
++	/* Zoom out or unchanged: need world outside the old frame. */
++	if (z1 &lt;= z0) {
++		redraw_all(srv);
++		return;
++	}
++
++	/*
++	 * New screen pixel (sx,sy) samples the same world as old screen
++	 *   sx_old = (sx + new_pan) * old_z / new_z - old_pan
++	 * Full new viewport [0,W)×[0,H) → old rect [sx0,sx1)×[sy0,sy1).
++	 */
++	sx0_64 = ((int64_t)new_pan_x * z0) / z1 - old_pan_x;
++	sy0_64 = ((int64_t)new_pan_y * z0) / z1 - old_pan_y;
++	sx1_64 = (((int64_t)W + new_pan_x) * z0) / z1 - old_pan_x;
++	sy1_64 = (((int64_t)H + new_pan_y) * z0) / z1 - old_pan_y;
++
++	if (sx0_64 &lt; 0 || sy0_64 &lt; 0 || sx1_64 &gt; W || sy1_64 &gt; H ||
++	    sx1_64 &lt;= sx0_64 || sy1_64 &lt;= sy0_64) {
++		/* Crop not fully inside the old picture — recompose. */
++		redraw_all(srv);
++		return;
++	}
++
++	sx0 = (int)sx0_64;
++	sy0 = (int)sy0_64;
++	sx1 = (int)sx1_64;
++	sy1 = (int)sy1_64;
++	src_w = sx1 - sx0;
++	src_h = sy1 - sy0;
++	if (src_w &lt; 1 || src_h &lt; 1) {
++		redraw_all(srv);
++		return;
++	}
++
++	stride = display_stride_px(srv);
++	fb = (uint32_t *)srv-&gt;framebuffer;
++
++	/* Snapshot the crop; dest overlaps the live FB. */
++	src_copy = malloc((size_t)src_w * (size_t)src_h * sizeof(uint32_t));
++	if (!src_copy) {
++		redraw_all(srv);
++		return;
++	}
++	for (y = 0; y &lt; src_h; y++) {
++		memcpy(src_copy + y * src_w,
++		       fb + (sy0 + y) * (int)stride + sx0,
++		       (size_t)src_w * sizeof(uint32_t));
++	}
++
++	cursor_fb_begin();
++	(void)cursor_lift_all_ret();
++
++	/* NN scale crop → full viewport. */
++	for (y = 0; y &lt; H; y++) {
++		int sy = y * src_h / H;
++		const uint32_t *srow = src_copy + sy * src_w;
++		uint32_t *drow = fb + y * (int)stride;
++
++		for (x = 0; x &lt; W; x++)
++			drow[x] = srow[x * src_w / W];
++	}
++
++	free(src_copy);
++
++	if (bgce_comp_debug()) {
++		printf("[BGCE] zoom-in FB scale: crop=[%d,%d)×[%d,%d) %dx%d → "
++		       "%dx%d  %d%%→%d%%\n",
++		       sx0, sx1, sy0, sy1, src_w, src_h, W, H,
++		       (int)z0, (int)z1);
++		fflush(stdout);
++	}
++
++	cursor_fb_end(1);
++}
++
+ void erase_client(struct ServerState* srv, const struct Client* gone) {
+ 	int sx0, sy0, sx1, sy1;
+ 	int lifted;
+diff --git a/input.c b/input.c
+index b2ad3ef..f94a365 100644
+--- a/input.c
++++ b/input.c
+@@ -177,7 +177,9 @@ static void screen_delta_to_world(int sdx, int sdy, float speed,
+ 
+ static void apply_zoom_at_cursor(int dir)
+ {
+-	int old_pct = server.zoom_pct;
++	int old_pct = server.zoom_pct &gt; 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
++	int old_pan_x = server.pan_x;
++	int old_pan_y = server.pan_y;
+ 	int wx, wy;
+ 	int z;
+ 
+@@ -192,7 +194,12 @@ static void apply_zoom_at_cursor(int dir)
+ 	server.pan_x = wx * z / 100 - mouse_x;
+ 	server.pan_y = wy * z / 100 - mouse_y;
+ 	clamp_viewport(&amp;server);
+-	bgce_comp_submit_full();
++	/*
++	 * Zoom in: crop+scale the already-composited FB (no client walk).
++	 * Zoom out: COMP_ZOOM falls back to full recompose inside display.
++	 */
++	bgce_comp_submit_zoom(old_pct, old_pan_x, old_pan_y,
++	                      z, server.pan_x, server.pan_y);
+ 	bgce_comp_submit_cursor(mouse_x, mouse_y);
+ 	printf("[BGCE] Zoom: %d%%  pan=(%d, %d)  was %d%%\n",
+ 	       server.zoom_pct, server.pan_x, server.pan_y, old_pct);
+diff --git a/mock.c b/mock.c
+index 5b36ea9..47790f1 100644
+--- a/mock.c
++++ b/mock.c
+@@ -301,6 +301,9 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
+ {
+ 	int wx, wy;
+ 	int z;
++	int old_z = server.zoom_pct &gt; 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
++	int old_px = server.pan_x;
++	int old_py = server.pan_y;
+ 
+ 	screen_to_world(&amp;server, sx, sy, &amp;wx, &amp;wy);
+ 	if (!bgce_zoom_set(&amp;server, zoom_pct)) {
+@@ -309,7 +312,8 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
+ 		server.pan_x = wx * z / 100 - sx;
+ 		server.pan_y = wy * z / 100 - sy;
+ 		clamp_viewport(&amp;server);
+-		bgce_comp_submit_full();
++		bgce_comp_submit_zoom(old_z, old_px, old_py, z, server.pan_x,
++		                      server.pan_y);
+ 		return;
+ 	}
+ 	z = server.zoom_pct &gt; 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+@@ -317,7 +321,8 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
+ 	server.pan_x = wx * z / 100 - sx;
+ 	server.pan_y = wy * z / 100 - sy;
+ 	clamp_viewport(&amp;server);
+-	bgce_comp_submit_full();
++	bgce_comp_submit_zoom(old_z, old_px, old_py, z, server.pan_x,
++	                      server.pan_y);
+ }
+ 
+ void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y)
+diff --git a/server.h b/server.h
+index 388a31d..0d7d2f9 100644
+--- a/server.h
++++ b/server.h
+@@ -251,6 +251,15 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
+ /** Full-scene recomposite (used after zoom and other full invalidations). */
+ void redraw_all(struct ServerState* srv);
+ 
++/**
++ * Viewport change from (old_z, old_pan) → (new_z, new_pan).
++ * Zoom in: crop the old view’s rect from the live FB and scale it to the
++ * full display (no client walk).  Zoom out or invalid crop: redraw_all().
++ */
++void redraw_zoom_viewport(struct ServerState *srv,
++                          int old_z, int old_pan_x, int old_pan_y,
++                          int new_z, int new_pan_x, int new_pan_y);
++
+ /**
+  * After a client is removed from the list: repaint only its former screen
+  * footprint from the remaining stack (background + windows that were under
+</pre>

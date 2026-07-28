@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 64c7e57</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 64c7e57
+parent <a href=commit-461fce0.html>461fce0</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-08T20:31:52-03:00
+
+    Add headless mock compositor with PNG screenshot tests.
+
+    BGTK-style workflow: in-memory framebuffer, injectable actions, and
+    make headless producing inspectable PNGs. compat/linux stubs allow
+    building tests on macOS without kernel headers.
+
+<a href=tree-64c7e57.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/.gitignore b/.gitignore
+index 282ed2e..9884873 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -5,3 +5,5 @@
+ bgce
+ libbgce.so
+ client
++headless
++headless_*.png
+diff --git a/AGENTS.md b/AGENTS.md
+index 3543d7a..9855ec3 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -26,12 +26,29 @@ Implement a minimal Linux graphical environment that runs without root, manages
+   - Minimal window manager support
+ 
+ 
++## Headless / mock tests (like BGTK)
++
++No framebuffer or input devices required. Develop and verify compositor
++behaviour by inspecting PNGs:
++
++```bash
++make headless &amp;&amp; ./headless
++# writes headless_00_bg.png … headless_07_panned.png
++```
++
++API (see `mock.h`): `bgce_mock_init`, `bgce_mock_add_client`, `bgce_mock_draw`,
++`bgce_mock_click`, `bgce_mock_move`, `bgce_mock_screenshot`, `bgce_mock_fini`.
++
++On macOS, `compat/linux/` provides stub headers so headless builds without
++kernel headers. Real `bgce` still requires Linux.
++
+ ## Current Milestone
+ 
+ ### High-evel features
+ [X] Implement config file
+ [X] Implement taking screenshots
+ [X] Implement zoomable/pannable virtual desktop (4× area, zoom 50%–400%)
++[X] Headless mock + screenshot tests (`make headless`)
+ [ ] Implement a cache file to memorize the last location of clients, in order to reopen them on the same place
+ 
+ ### Protocol features
+@@ -41,6 +58,7 @@ Implement a minimal Linux graphical environment that runs without root, manages
+ ### Internal stuff
+ [ ] Create more tests
+   - [ ] test if events go to the correct client and only the one
++  - [X] headless stacking / move / erase screenshots
+ 
+ ### Zoom / pan controls
+ - **Alt + scroll**: zoom in/out toward the cursor (range 0.5×–4.0×)
+diff --git a/Makefile b/Makefile
+index 7ec239e..e3aeb35 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,5 +1,6 @@
+ CC ?= cc
+ BACKEND ?= fbdev
++UNAME_S := $(shell uname -s)
+ 
+ # No default -g: some small linkers reject STABS (.rela.stab) and fail with
+ # "Invalid relocation entry ... .rela.stab". For local debugging:
+@@ -7,10 +8,17 @@ BACKEND ?= fbdev
+ CFLAGS ?= -Wall -O1 -std=c99 -fPIC -I.
+ LDFLAGS ?= -lm -lpthread
+ 
++# Non-Linux: use in-tree linux/*.h stubs for headless builds
++ifneq ($(UNAME_S),Linux)
++  CFLAGS += -Icompat
++endif
++
+ ifeq ($(BACKEND),drm)
+ CFLAGS += -DBGCE_USE_DRM -I/include/libdrm
+ LDFLAGS += -ldrm
+ DISPLAY_OBJ = display_drm.o
++else ifeq ($(BACKEND),mock)
++DISPLAY_OBJ = display_mock.o
+ else
+ DISPLAY_OBJ = display_fbdev.o
+ endif
+@@ -18,6 +26,9 @@ endif
+ SERVER_OBJS = server.o loop.o libbgce.so input.o display.o $(DISPLAY_OBJ) config.o
+ LIB_OBJS = libbgce.o
+ 
++# Headless mock compositor (no fbdev/input) — works on macOS + Linux
++HEADLESS_OBJS = display.o display_mock.o config.o mock.o input_headless.o
++
+ all: bgce libbgce.so
+ 
+ bgce: $(SERVER_OBJS)
+@@ -29,11 +40,15 @@ libbgce.so: $(LIB_OBJS)
+ client: client.c bgce.h
+ 	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce
+ 
++# BGTK-style mock tests: in-memory FB + PNG screenshots
++headless: test/headless.c $(HEADLESS_OBJS)
++	$(CC) $(CFLAGS) -o $@ test/headless.c $(HEADLESS_OBJS) $(LDFLAGS)
++
+ %.o: %.c
+ 	$(CC) $(CFLAGS) -c $&lt; -o $@
+ 
+ clean:
+-	rm -f *.o bgce libbgce.so client app
++	rm -f *.o bgce libbgce.so client app headless headless_*.png
+ 
+ INSTALL_BIN = /bin
+ INSTALL_LIB = /lib
+diff --git a/README.md b/README.md
+index 46a7b1b..9b9b859 100644
+--- a/README.md
++++ b/README.md
+@@ -128,6 +128,20 @@ make install
+ ./client  # Start test client
+ ```
+ 
++### Headless mock tests (no display / input)
++
++Same idea as BGTK: in-memory framebuffer and PNG screenshots for visual checks.
++Works on macOS and Linux:
++
++```bash
++make headless
++./headless
++# inspect headless_*.png
++```
++
++See `mock.h` and `test/headless.c` for the API and a sample scenario
++(stacking, move, erase, zoom, pan).
++
+ Default build needs only kernel headers (`linux/fb.h`) and `/dev/fb0`
+ (DRM fbdev emulation is fine). `BACKEND=drm` needs libdrm.
+ 
+diff --git a/compat/linux/input.h b/compat/linux/input.h
+new file mode 100644
+index 0000000..b38adff
+--- /dev/null
++++ b/compat/linux/input.h
+@@ -0,0 +1,155 @@
++/* compat/linux_input.h
++ *
++ * Minimal set of linux/input.h constants so BGTK (and its mock tests)
++ * can be compiled on non-Linux systems (e.g. macOS) for development and
++ * headless PNG-based testing.
++ *
++ * Only the values actually used by the widget/input handling code are
++ * provided. On real Linux the native &lt;linux/input.h&gt; is preferred.
++ */
++
++#ifndef BGTK_COMPAT_LINUX_INPUT_H
++#define BGTK_COMPAT_LINUX_INPUT_H
++
++/* Event types */
++#define EV_KEY 1
++#define EV_REL 2
++#define EV_ABS 3
++
++/* Relative axes */
++#define REL_X     0
++#define REL_Y     1
++#define REL_WHEEL 8
++
++/* Buttons (normally BTN_LEFT etc.) */
++#define BTN_LEFT  0x110
++#define BTN_RIGHT 0x111
++#define BTN_MISC  0x100
++
++/* A selection of common keys used in text input + special handling.
++ * Values match the Linux kernel input-event-codes.h on typical platforms.
++ */
++#define KEY_RESERVED          0
++#define KEY_ESC               1
++#define KEY_1                 2
++#define KEY_2                 3
++#define KEY_3                 4
++#define KEY_4                 5
++#define KEY_5                 6
++#define KEY_6                 7
++#define KEY_7                 8
++#define KEY_8                 9
++#define KEY_9                 10
++#define KEY_0                 11
++#define KEY_MINUS             12
++#define KEY_EQUAL             13
++#define KEY_BACKSPACE         14
++#define KEY_TAB               15
++#define KEY_Q                 16
++#define KEY_W                 17
++#define KEY_E                 18
++#define KEY_R                 19
++#define KEY_T                 20
++#define KEY_Y                 21
++#define KEY_U                 22
++#define KEY_I                 23
++#define KEY_O                 24
++#define KEY_P                 25
++#define KEY_LEFTBRACE         26
++#define KEY_RIGHTBRACE        27
++#define KEY_ENTER             28
++#define KEY_LEFTCTRL          29
++#define KEY_A                 30
++#define KEY_S                 31
++#define KEY_D                 32
++#define KEY_F                 33
++#define KEY_G                 34
++#define KEY_H                 35
++#define KEY_J                 36
++#define KEY_K                 37
++#define KEY_L                 38
++#define KEY_SEMICOLON         39
++#define KEY_APOSTROPHE        40
++#define KEY_GRAVE             41
++#define KEY_LEFTSHIFT         42
++#define KEY_BACKSLASH         43
++#define KEY_Z                 44
++#define KEY_X                 45
++#define KEY_C                 46
++#define KEY_V                 47
++#define KEY_B                 48
++#define KEY_N                 49
++#define KEY_M                 50
++#define KEY_COMMA             51
++#define KEY_DOT               52
++#define KEY_SLASH             53
++#define KEY_RIGHTSHIFT        54
++#define KEY_KPASTERISK        55
++#define KEY_LEFTALT           56
++#define KEY_SPACE             57
++#define KEY_CAPSLOCK          58
++#define KEY_F1                59
++#define KEY_F2                60
++#define KEY_F3                61
++#define KEY_F4                62
++#define KEY_F5                63
++#define KEY_F6                64
++#define KEY_F7                65
++#define KEY_F8                66
++#define KEY_F9                67
++#define KEY_F10               68
++#define KEY_NUMLOCK           69
++#define KEY_SCROLLLOCK        70
++#define KEY_KP7               71
++#define KEY_KP8               72
++#define KEY_KP9               73
++#define KEY_KPMINUS           74
++#define KEY_KP4               75
++#define KEY_KP5               76
++#define KEY_KP6               77
++#define KEY_KPPLUS            78
++#define KEY_KP1               79
++#define KEY_KP2               80
++#define KEY_KP3               81
++#define KEY_KP0               82
++#define KEY_KPDOT             83
++#define KEY_ZENKAKUHANKAKU    85
++#define KEY_102ND             86
++#define KEY_F11               87
++#define KEY_F12               88
++#define KEY_RO                89
++#define KEY_KATAKANA          90
++#define KEY_HIRAGANA          91
++#define KEY_HENKAN            92
++#define KEY_KATAKANAHIRAGANA  93
++#define KEY_MUHENKAN          94
++#define KEY_KPJPCOMMA         95
++#define KEY_KPENTER           96
++#define KEY_RIGHTCTRL         97
++#define KEY_KPSLASH           98
++#define KEY_SYSRQ             99
++#define KEY_RIGHTALT          100
++#define KEY_LINEFEED          101
++#define KEY_HOME              102
++#define KEY_UP                103
++#define KEY_PAGEUP            104
++#define KEY_LEFT              105
++#define KEY_RIGHT             106
++#define KEY_END               107
++#define KEY_DOWN              108
++#define KEY_PAGEDOWN          109
++#define KEY_INSERT            110
++#define KEY_DELETE            111
++#define KEY_MACRO             112
++#define KEY_MUTE              113
++#define KEY_VOLUMEDOWN        114
++#define KEY_VOLUMEUP          115
++#define KEY_POWER             116
++#define KEY_KPEQUAL           117
++#define KEY_KPPLUSMINUS       118
++#define KEY_PAUSE             119
++#define KEY_SCALE             120
++
++/* Add more here only if new key handling is added to the widget code. */
++
++#endif /* BGTK_COMPAT_LINUX_INPUT_H */
+diff --git a/compat/linux/kd.h b/compat/linux/kd.h
+new file mode 100644
+index 0000000..be4c569
+--- /dev/null
++++ b/compat/linux/kd.h
+@@ -0,0 +1,14 @@
++/* Minimal linux/kd.h for non-Linux headless builds. */
++#ifndef BGCE_COMPAT_LINUX_KD_H
++#define BGCE_COMPAT_LINUX_KD_H
++
++#define KDSETMODE  0x4B3A
++#define KDGETMODE  0x4B3B
++#define KD_TEXT    0x00
++#define KD_GRAPHICS 0x01
++#define KDGKBMODE  0x4B44
++#define KDSKBMODE  0x4B45
++#define K_XLATE    0x00
++#define K_OFF      0x04
++
++#endif
+diff --git a/display_mock.c b/display_mock.c
+new file mode 100644
+index 0000000..0e1169e
+--- /dev/null
++++ b/display_mock.c
+@@ -0,0 +1,62 @@
++/*
++ * display_mock.c — in-memory framebuffer for headless/mock tests.
++ * Selected with BACKEND=mock (or linked instead of display_fbdev.o).
++ * No /dev/fb0, DRM, or VT.
++ */
++
++#include "server.h"
++
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++
++extern struct ServerState server;
++
++int init_display(void)
++{
++	uint32_t w = 800;
++	uint32_t h = 600;
++	const char *ew = getenv("BGCE_MOCK_WIDTH");
++	const char *eh = getenv("BGCE_MOCK_HEIGHT");
++
++	if (ew &amp;&amp; ew[0])
++		w = (uint32_t)atoi(ew);
++	if (eh &amp;&amp; eh[0])
++		h = (uint32_t)atoi(eh);
++	if (w &lt; 64)
++		w = 64;
++	if (h &lt; 64)
++		h = 64;
++
++	server.display_fd = -1;
++	server.display_w = w;
++	server.display_h = h;
++	server.display_bpp = 32;
++	server.display_pitch = w * 4;
++	server.fb_size = (size_t)w * h * 4;
++	server.framebuffer = calloc(1, server.fb_size);
++	if (!server.framebuffer) {
++		perror("[BGCE] mock framebuffer");
++		return 1;
++	}
++
++	printf("[BGCE] mock display %ux%u (in-memory)\n", w, h);
++
++	if (display_cursor_init() != 0) {
++		fprintf(stderr, "[BGCE] mock cursor init failed\n");
++		free(server.framebuffer);
++		server.framebuffer = NULL;
++		return 1;
++	}
++	return 0;
++}
++
++void release_display(void)
++{
++	display_cursor_fini();
++	free(server.framebuffer);
++	server.framebuffer = NULL;
++	server.fb_size = 0;
++	server.display_fd = -1;
++	printf("[BGCE] mock display released\n");
++}
+diff --git a/input_headless.c b/input_headless.c
+new file mode 100644
+index 0000000..5d91ee1
+--- /dev/null
++++ b/input_headless.c
+@@ -0,0 +1,70 @@
++/*
++ * input_headless.c — stubs for headless/mock builds (no /dev/input).
++ * Provides pick_client (geometry only) and no-op input loop.
++ */
++
++#include "server.h"
++
++#include &lt;math.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++
++extern struct ServerState server;
++
++int mouse_x;
++int mouse_y;
++int ctrl_down;
++int alt_down;
++int shift_down;
++
++int init_input(void)
++{
++	mouse_x = (int)server.display_w / 2;
++	mouse_y = (int)server.display_h / 2;
++	printf("[BGCE] headless input (no devices)\n");
++	return 0;
++}
++
++void *input_loop(void *arg)
++{
++	(void)arg;
++	return NULL;
++}
++
++void client_disconnected(struct Client *c)
++{
++	(void)c;
++}
++
++void deliver_interrupt_to_focus(void)
++{
++}
++
++int resize_buffer(struct Client *c, int dx, int dy)
++{
++	(void)c;
++	(void)dx;
++	(void)dy;
++	return 0;
++}
++
++struct Client *pick_client(int x, int y)
++{
++	float wx, wy;
++	struct Client *c;
++	struct Client *picked = NULL;
++
++	screen_to_world(&amp;server, (float)x, (float)y, &amp;wx, &amp;wy);
++	c = server.clients;
++	while (c) {
++		uint32_t ww = c-&gt;world_w ? c-&gt;world_w : c-&gt;width;
++		uint32_t wh = c-&gt;world_h ? c-&gt;world_h : c-&gt;height;
++		if (wx &gt;= (float)c-&gt;x &amp;&amp; wx &lt; (float)(c-&gt;x + ww) &amp;&amp;
++		    wy &gt;= (float)c-&gt;y &amp;&amp; wy &lt; (float)(c-&gt;y + wh)) {
++			picked = c;
++			break;
++		}
++		c = c-&gt;next;
++	}
++	return (picked &amp;&amp; picked-&gt;z &gt; 0) ? picked : NULL;
++}
+diff --git a/mock.c b/mock.c
+new file mode 100644
+index 0000000..3768d64
+--- /dev/null
++++ b/mock.c
+@@ -0,0 +1,303 @@
++/*
++ * mock.c — headless compositor harness (BGTK-style mock + screenshots).
++ */
++
++#include "mock.h"
++
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++
++/* Headless binary does not link server.o — own the globals here. */
++struct ServerState server;
++struct config config;
++
++/* From input_headless / input */
++struct Client *pick_client(int x, int y);
++
++static struct Client *bg_client;
++static int mock_active;
++
++static void fill_u32(uint32_t *buf, size_t n, uint32_t v)
++{
++	size_t i;
++	for (i = 0; i &lt; n; i++)
++		buf[i] = v;
++}
++
++int bgce_mock_init(uint32_t width, uint32_t height)
++{
++	char wbuf[16], hbuf[16];
++
++	if (mock_active)
++		bgce_mock_fini();
++
++	snprintf(wbuf, sizeof(wbuf), "%u", width ? width : 800);
++	snprintf(hbuf, sizeof(hbuf), "%u", height ? height : 600);
++	setenv("BGCE_MOCK_WIDTH", wbuf, 1);
++	setenv("BGCE_MOCK_HEIGHT", hbuf, 1);
++
++	memset(&amp;server, 0, sizeof(server));
++	server.display_fd = -1;
++	server.server_fd = -1;
++
++	memset(&amp;config, 0, sizeof(config));
++	config.type = BG_COLOR;
++	config.color = 0xFF336699;
++	config.mode = IMAGE_SCALED;
++	config.move_speed = 1.0f;
++	config.pan_speed = 1.0f;
++
++	if (init_display() != 0)
++		return -1;
++
++	server.virtual_w = server.display_w * BGCE_WORLD_SCALE;
++	server.virtual_h = server.display_h * BGCE_WORLD_SCALE;
++	server.zoom = 1.0f;
++	server.pan_x = 0.0f;
++	server.pan_y = 0.0f;
++	server.client_count = 0;
++	server.focused_client = NULL;
++
++	bg_client = calloc(1, sizeof(*bg_client));
++	if (!bg_client) {
++		release_display();
++		return -1;
++	}
++	bg_client-&gt;z = 0;
++	bg_client-&gt;fd = -1;
++	bg_client-&gt;width = server.virtual_w;
++	bg_client-&gt;height = server.virtual_h;
++	bg_client-&gt;world_w = server.virtual_w;
++	bg_client-&gt;world_h = server.virtual_h;
++	bg_client-&gt;buffer = malloc((size_t)server.virtual_w * server.virtual_h * 4);
++	if (!bg_client-&gt;buffer) {
++		free(bg_client);
++		bg_client = NULL;
++		release_display();
++		return -1;
++	}
++	apply_background(&amp;config, bg_client-&gt;buffer,
++	                 server.virtual_w, server.virtual_h,
++	                 server.virtual_w, server.virtual_h);
++	server.clients = bg_client;
++
++	init_input();
++	redraw_all(&amp;server);
++	mock_active = 1;
++	printf("[BGCE] mock init %ux%u virtual %ux%u\n",
++	       server.display_w, server.display_h,
++	       server.virtual_w, server.virtual_h);
++	return 0;
++}
++
++void bgce_mock_fini(void)
++{
++	struct Client *c;
++
++	if (!mock_active)
++		return;
++
++	c = server.clients;
++	while (c) {
++		struct Client *n = c-&gt;next;
++		if (c-&gt;buffer)
++			free(c-&gt;buffer);
++		if (c != bg_client)
++			free(c);
++		c = n;
++	}
++	if (bg_client) {
++		/* buffer already freed in loop if bg was in list */
++		free(bg_client);
++		bg_client = NULL;
++	}
++	server.clients = NULL;
++	server.focused_client = NULL;
++	release_display();
++	mock_active = 0;
++}
++
++struct Client *bgce_mock_add_client(uint32_t x, uint32_t y,
++                                    uint32_t w, uint32_t h, uint32_t argb)
++{
++	struct Client *c;
++	size_t n;
++
++	if (!mock_active || w == 0 || h == 0)
++		return NULL;
++
++	c = calloc(1, sizeof(*c));
++	if (!c)
++		return NULL;
++	n = (size_t)w * h;
++	c-&gt;buffer = malloc(n * 4);
++	if (!c-&gt;buffer) {
++		free(c);
++		return NULL;
++	}
++	fill_u32((uint32_t *)c-&gt;buffer, n, argb);
++	c-&gt;width = w;
++	c-&gt;height = h;
++	c-&gt;world_w = w;
++	c-&gt;world_h = h;
++	c-&gt;x = x;
++	c-&gt;y = y;
++	c-&gt;fd = -1;
++	c-&gt;next = server.clients;
++	c-&gt;z = server.clients ? server.clients-&gt;z + 1 : 1;
++	server.clients = c;
++	server.client_count++;
++	server.focused_client = c;
++	return c;
++}
++
++void bgce_mock_fill_client(struct Client *c, uint32_t argb)
++{
++	if (!c || !c-&gt;buffer)
++		return;
++	fill_u32((uint32_t *)c-&gt;buffer, (size_t)c-&gt;width * c-&gt;height, argb);
++	bgce_mock_draw(c);
++}
++
++void bgce_mock_draw(struct Client *c)
++{
++	if (!c)
++		return;
++	draw(&amp;server, *c);
++}
++
++void bgce_mock_remove_client(struct Client *c)
++{
++	struct Client *prev = NULL;
++	struct Client *curr;
++
++	if (!c || c == bg_client)
++		return;
++
++	curr = server.clients;
++	while (curr) {
++		if (curr == c) {
++			if (prev)
++				prev-&gt;next = curr-&gt;next;
++			else
++				server.clients = curr-&gt;next;
++			break;
++		}
++		prev = curr;
++		curr = curr-&gt;next;
++	}
++	if (server.focused_client == c)
++		server.focused_client = NULL;
++
++	erase_client(&amp;server, c);
++	if (c-&gt;buffer)
++		free(c-&gt;buffer);
++	free(c);
++	if (server.client_count &gt; 0)
++		server.client_count--;
++}
++
++void bgce_mock_focus(struct Client *c)
++{
++	struct Client *prev;
++	struct Client *curr;
++
++	if (!c || c == bg_client)
++		return;
++
++	/* Raise to head of list (top). */
++	if (c != server.clients) {
++		prev = NULL;
++		curr = server.clients;
++		while (curr &amp;&amp; curr != c) {
++			prev = curr;
++			curr = curr-&gt;next;
++		}
++		if (curr &amp;&amp; prev) {
++			prev-&gt;next = curr-&gt;next;
++			curr-&gt;next = server.clients;
++			server.clients = curr;
++		}
++	}
++	if (server.focused_client)
++		c-&gt;z = server.focused_client-&gt;z + 1;
++	server.focused_client = c;
++	draw(&amp;server, *c);
++}
++
++struct Client *bgce_mock_click(int screen_x, int screen_y)
++{
++	struct Client *c = pick_client(screen_x, screen_y);
++	if (c)
++		bgce_mock_focus(c);
++	else
++		server.focused_client = NULL;
++	set_cursor_pos(&amp;server, screen_x, screen_y);
++	return c;
++}
++
++void bgce_mock_move(struct Client *c, int wdx, int wdy)
++{
++	if (!c || (wdx == 0 &amp;&amp; wdy == 0))
++		return;
++	redraw_region(&amp;server, c, wdx, wdy);
++	c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
++	c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
++}
++
++void bgce_mock_pan_screen(int sdx, int sdy)
++{
++	float z = server.zoom &gt; 0.0f ? server.zoom : 1.0f;
++	float old_px = server.pan_x;
++	float old_py = server.pan_y;
++	float s = config.pan_speed &gt; 0.0f ? config.pan_speed : 1.0f;
++
++	server.pan_x -= (float)sdx * s / z;
++	server.pan_y -= (float)sdy * s / z;
++	clamp_viewport(&amp;server);
++	redraw_pan(&amp;server, old_px, old_py);
++}
++
++void bgce_mock_zoom_at(float factor, int sx, int sy)
++{
++	float old_zoom = server.zoom;
++	float new_zoom = old_zoom * factor;
++	float wx, wy;
++
++	if (new_zoom &lt; BGCE_ZOOM_MIN)
++		new_zoom = BGCE_ZOOM_MIN;
++	if (new_zoom &gt; BGCE_ZOOM_MAX)
++		new_zoom = BGCE_ZOOM_MAX;
++	if (new_zoom == old_zoom)
++		return;
++
++	screen_to_world(&amp;server, (float)sx, (float)sy, &amp;wx, &amp;wy);
++	server.zoom = new_zoom;
++	server.pan_x = wx - (float)sx / new_zoom;
++	server.pan_y = wy - (float)sy / new_zoom;
++	clamp_viewport(&amp;server);
++	redraw_all(&amp;server);
++}
++
++int bgce_mock_screenshot(const char *path)
++{
++	return take_screenshot(path ? path : "mock_shot.png");
++}
++
++void bgce_mock_redraw_all(void)
++{
++	redraw_all(&amp;server);
++}
++
++/* Stubs so we don't need server.o (which provides main). */
++void bgce_announce(const char *fmt, ...)
++{
++	(void)fmt;
++}
++
++volatile sig_atomic_t bgce_sigint_pending;
++
++void bgce_request_shutdown(void)
++{
++}
+diff --git a/mock.h b/mock.h
+new file mode 100644
+index 0000000..e0492e8
+--- /dev/null
++++ b/mock.h
+@@ -0,0 +1,61 @@
++#ifndef BGCE_MOCK_H
++#define BGCE_MOCK_H
++
++/*
++ * Headless / mock compositor API (same idea as BGTK's bgtk_init_mock).
++ *
++ * Build:  make headless
++ * Run:    ./headless
++ *
++ * No /dev/fb0, DRM, VT, or real input.  In-memory framebuffer + PNG dumps
++ * for visual regression tests.
++ */
++
++#include "server.h"
++
++#include &lt;stdint.h&gt;
++
++/** Start mock server: malloc FB, virtual desktop, solid background. */
++int bgce_mock_init(uint32_t width, uint32_t height);
++
++/** Tear down mock (frees clients and FB). */
++void bgce_mock_fini(void);
++
++/**
++ * Add a client window with its own buffer (ARGB), filled with solid color.
++ * x,y,w,h are in world pixels.  Returns the client, or NULL.
++ */
++struct Client *bgce_mock_add_client(uint32_t x, uint32_t y,
++                                    uint32_t w, uint32_t h, uint32_t argb);
++
++/** Fill client buffer with solid color and redraw (respects stacking). */
++void bgce_mock_fill_client(struct Client *c, uint32_t argb);
++
++/** MSG_DRAW equivalent: recompose this client's screen rect. */
++void bgce_mock_draw(struct Client *c);
++
++/** Remove client and erase its footprint. */
++void bgce_mock_remove_client(struct Client *c);
++
++/** Raise + focus like a click (list reorder + draw). */
++void bgce_mock_focus(struct Client *c);
++
++/** Click at screen coords (pick top client, focus if any). */
++struct Client *bgce_mock_click(int screen_x, int screen_y);
++
++/** Move client by world delta (L-shaped damage). */
++void bgce_mock_move(struct Client *c, int wdx, int wdy);
++
++/** Pan viewport by screen-pixel mouse delta. */
++void bgce_mock_pan_screen(int sdx, int sdy);
++
++/** Zoom by factor toward screen point (sx, sy). */
++void bgce_mock_zoom_at(float factor, int sx, int sy);
++
++/** Dump framebuffer to PNG (cursor omitted). path NULL → mock_shot.png */
++int bgce_mock_screenshot(const char *path);
++
++/** Full redraw (background + all clients). */
++void bgce_mock_redraw_all(void);
++
++#endif /* BGCE_MOCK_H */
+diff --git a/test/headless.c b/test/headless.c
+new file mode 100644
+index 0000000..34dca98
+--- /dev/null
++++ b/test/headless.c
+@@ -0,0 +1,77 @@
++/*
++ * Headless mock test for BGCE (same workflow as BGTK's test/headless.c).
++ *
++ * Build:  make headless
++ * Run:    ./headless
++ *
++ * Writes headless_*.png for visual inspection.  No real display or input.
++ */
++
++#include "mock.h"
++
++#include &lt;stdio.h&gt;
++#include &lt;stdint.h&gt;
++
++int main(void)
++{
++	struct Client *a, *b, *c;
++
++	if (bgce_mock_init(640, 480) != 0) {
++		fprintf(stderr, "headless: mock init failed\n");
++		return 1;
++	}
++
++	/* Red desktop only */
++	bgce_mock_redraw_all();
++	if (bgce_mock_screenshot("headless_00_bg.png") != 0)
++		return 1;
++
++	/* Two overlapping solid windows */
++	a = bgce_mock_add_client(40, 40, 200, 150, 0xFFE74C3C); /* red */
++	b = bgce_mock_add_client(120, 100, 220, 160, 0xFF3498DB); /* blue on top */
++	if (!a || !b) {
++		fprintf(stderr, "headless: add_client failed\n");
++		bgce_mock_fini();
++		return 1;
++	}
++	bgce_mock_draw(a);
++	bgce_mock_draw(b);
++	if (bgce_mock_screenshot("headless_01_two_windows.png") != 0)
++		return 1;
++
++	/* Redraw of the bottom window must NOT raise it over blue */
++	bgce_mock_fill_client(a, 0xFFF39C12); /* orange */
++	if (bgce_mock_screenshot("headless_02_bottom_redraw.png") != 0)
++		return 1;
++
++	/* Click focuses red (under blue? pick top — blue still top at 120,100) */
++	c = bgce_mock_click(50, 50); /* should hit orange/red a */
++	if (c != a)
++		fprintf(stderr, "headless: expected click on A (got %p)\n", (void *)c);
++	bgce_mock_draw(a);
++	if (bgce_mock_screenshot("headless_03_focus_a.png") != 0)
++		return 1;
++
++	/* Move A; blue stays put */
++	bgce_mock_move(a, 80, 40);
++	if (bgce_mock_screenshot("headless_04_moved_a.png") != 0)
++		return 1;
++
++	/* Disconnect B — only its footprint erased */
++	bgce_mock_remove_client(b);
++	b = NULL;
++	if (bgce_mock_screenshot("headless_05_removed_b.png") != 0)
++		return 1;
++
++	/* Zoom out and pan */
++	bgce_mock_zoom_at(0.5f, 320, 240);
++	if (bgce_mock_screenshot("headless_06_zoomed_out.png") != 0)
++		return 1;
++	bgce_mock_pan_screen(40, 30);
++	if (bgce_mock_screenshot("headless_07_panned.png") != 0)
++		return 1;
++
++	printf("headless complete. PNG frames written.\n");
++	bgce_mock_fini();
++	return 0;
++}
+</pre>

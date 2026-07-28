@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce c6bfc91</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit c6bfc91
+parent <a href=commit-42f8f3a.html>42f8f3a</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-16T12:21:57-03:00
+
+    Fix client disconnect race that could freeze the compositor.
+
+    Flush in-flight DRAW/MOVE before munmap so terminal shell exit
+    cannot tear down a buffer the paint path still uses.
+
+<a href=tree-c6bfc91.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/loop.c b/loop.c
+index 9badff7..626d700 100644
+--- a/loop.c
++++ b/loop.c
+@@ -268,54 +268,86 @@ void* client_thread(void* arg) {
+ 		}
+ 	}
+ 
+-	/* Stop any in-progress drag that targets this client (UAF otherwise). */
++	/*
++	 * Teardown order matters (async compositor):
++	 *
++	 *   1. Cancel drag targeting this client.
++	 *   2. Snapshot geometry / buffer for later munmap + erase.
++	 *   3. Unlink from the client list and clear focus so *new* jobs
++	 *      cannot find this client.
++	 *   4. Close the socket (no more MSG_DRAW from the peer).
++	 *   5. bgce_comp_flush() — wait until any in-flight DRAW/MOVE that
++	 *      already holds Client* + buffer finishes.  Munmap *before*
++	 *      this flush races the paint path and can SEGV the orchestrator
++	 *      (looks like a hard freeze: last frame stuck, no input).
++	 *   6. munmap / unlink shm / erase footprint / free.
++	 *
++	 * Terminals that exit the shell (e.g. `exit 1`) often disconnect with
++	 * DRAW jobs still queued — this race was easy to hit there.
++	 */
+ 	client_disconnected(client);
+ 
+-	if (client-&gt;buffer) {
+-		munmap(client-&gt;buffer, client-&gt;width * client-&gt;height * 4);
+-		client-&gt;buffer = NULL;
+-		bgce_buf_unlink(client-&gt;shm_name);
+-		client-&gt;shm_name[0] = '\0';
+-	}
++	{
++		uint32_t ww = client-&gt;world_w ? client-&gt;world_w : client-&gt;width;
++		uint32_t wh = client-&gt;world_h ? client-&gt;world_h : client-&gt;height;
++		uint32_t erase_x = client-&gt;x;
++		uint32_t erase_y = client-&gt;y;
++		void *buf = client-&gt;buffer;
++		size_t buf_bytes = 0;
++		char shm_name[64];
++		struct Client *prev = NULL;
++		struct Client *curr = server.clients;
++
++		if (buf &amp;&amp; client-&gt;width &gt; 0 &amp;&amp; client-&gt;height &gt; 0)
++			buf_bytes = (size_t)client-&gt;width * client-&gt;height * 4;
++		shm_name[0] = '\0';
++		if (client-&gt;shm_name[0]) {
++			strncpy(shm_name, client-&gt;shm_name, sizeof(shm_name) - 1);
++			shm_name[sizeof(shm_name) - 1] = '\0';
++		}
+ 
+-	/* Remove client from the linked list. */
+-	struct Client* prev = NULL;
+-	struct Client* curr = server.clients;
+-	while (curr) {
+-		if (curr == client) {
+-			if (prev)
+-				prev-&gt;next = curr-&gt;next;
+-			else
+-				server.clients = curr-&gt;next;
+-			break;
++		/* Unlink so find_client / pick_client stop seeing this node. */
++		while (curr) {
++			if (curr == client) {
++				if (prev)
++					prev-&gt;next = curr-&gt;next;
++				else
++					server.clients = curr-&gt;next;
++				break;
++			}
++			prev = curr;
++			curr = curr-&gt;next;
+ 		}
+-		prev = curr;
+-		curr = curr-&gt;next;
+-	}
++		client-&gt;next = NULL;
+ 
+-	if (server.focused_client == client) {
+-		/* Socket is already dead — do not write a focus-lost message. */
+-		server.focused_client = NULL;
+-	}
++		if (server.focused_client == client) {
++			/* Socket is already dead — do not write focus-lost. */
++			server.focused_client = NULL;
++		}
+ 
+-	close(client_fd);
+-	client-&gt;fd = -1;
++		close(client_fd);
++		client-&gt;fd = -1;
+ 
+-	/*
+-	 * Only repaint the closed window's screen rect from whatever is still
+-	 * in the stack.  Snapshot geometry into the job so paint is safe after
+-	 * free; flush so no in-flight DRAW still references this client.
+-	 */
+-	location_cache_remember_client(client);
+-	{
+-		uint32_t ww = client-&gt;world_w ? client-&gt;world_w : client-&gt;width;
+-		uint32_t wh = client-&gt;world_h ? client-&gt;world_h : client-&gt;height;
++		/* Drain paint that still references this Client and its buffer. */
++		bgce_comp_flush();
++
++		if (buf) {
++			munmap(buf, buf_bytes);
++			client-&gt;buffer = NULL;
++		}
++		if (shm_name[0]) {
++			bgce_buf_unlink(shm_name);
++			client-&gt;shm_name[0] = '\0';
++		}
+ 
+-		bgce_comp_submit_erase(client-&gt;x, client-&gt;y, ww, wh);
++		location_cache_remember_client(client);
++		/* Only the closed window's screen rect from remaining stack. */
++		bgce_comp_submit_erase(erase_x, erase_y, ww, wh);
+ 		bgce_comp_flush();
+ 	}
+ 
+-	printf("[BGCE] Client thread finished (fd=%d); server still running\n", client_fd);
++	printf("[BGCE] Client thread finished (fd=%d); server still running\n",
++	       client_fd);
+ 	free(client);
+ 	return NULL;
+ }
+</pre>

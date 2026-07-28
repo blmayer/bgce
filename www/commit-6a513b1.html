@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 6a513b1</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 6a513b1
+parent <a href=commit-148bbb5.html>148bbb5</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-10T11:15:35-03:00
+
+    Restore MSG_DRAW to blit only the requesting client.
+
+    Walk top-to-bottom and subtract opaque windows above from the drawer
+    screen rect, then blit remaining pieces from that client only. Do not
+    full-stack recompose wallpaper/clients below (that caused blink/refill).
+    Document the model in draw(), server.h, and AGENTS.md.
+
+<a href=tree-6a513b1.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 39eac6b..51dfd99 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -16,6 +16,10 @@ Implement a minimal Linux graphical environment that runs without root, manages
+ - **IPC:** UNIX domain sockets for commands, FIFO for input events.
+ - **Buffers:** Each client has an off-screen buffer; server composites into real framebuffer.
+ - **Rendering:** CPU-based memory blitting only (no OpenGL/DRI accel for now).
++- **MSG_DRAW:** Blit only the client that asked, clipped by opaque windows
++  above (subtract their rects). Do **not** full-stack recompose wallpaper /
++  clients below on ordinary draw — that was a regression (blink/refill).
++  Full stack is for erase/move expose/pan/zoom only.
+ - **Focus Handling:** Server tracks which client receives keyboard/mouse events.
+ - **Event Model:** Blocking reads (no polling); async draw calls.
+ - **Security:** Clients are sandboxed via file descriptors; no root operations.
+diff --git a/display.c b/display.c
+index a6ebb1b..027d302 100644
+--- a/display.c
++++ b/display.c
+@@ -1080,6 +1080,111 @@ static int clip_to_display(const struct ServerState *srv,
+ 	return *x0 &lt; *x1 &amp;&amp; *y0 &lt; *y1;
+ }
+ 
++/* ------------------------------------------------------------------
++ * Visible-region helpers for MSG_DRAW (opaque windows).
++ *
++ * Subtract occluder [bx0,by0)×[bx1,by1) from subject [ax0,ay0)×[ax1,ay1).
++ * Writes 0–4 non-empty remnants into out[]; returns count.
++ * ------------------------------------------------------------------ */
++static int rect_subtract(int ax0, int ay0, int ax1, int ay1,
++                         int bx0, int by0, int bx1, int by1,
++                         int out[][4], int out_max)
++{
++	int n = 0;
++	int ix0, iy0, ix1, iy1;
++
++	if (out_max &lt; 1)
++		return 0;
++	/* No intersection → subject unchanged. */
++	if (bx1 &lt;= ax0 || bx0 &gt;= ax1 || by1 &lt;= ay0 || by0 &gt;= ay1) {
++		out[0][0] = ax0;
++		out[0][1] = ay0;
++		out[0][2] = ax1;
++		out[0][3] = ay1;
++		return 1;
++	}
++	/* Clip occluder to subject. */
++	ix0 = bx0 &gt; ax0 ? bx0 : ax0;
++	iy0 = by0 &gt; ay0 ? by0 : ay0;
++	ix1 = bx1 &lt; ax1 ? bx1 : ax1;
++	iy1 = by1 &lt; ay1 ? by1 : ay1;
++	if (ix0 &gt;= ix1 || iy0 &gt;= iy1) {
++		out[0][0] = ax0;
++		out[0][1] = ay0;
++		out[0][2] = ax1;
++		out[0][3] = ay1;
++		return 1;
++	}
++	/* Top strip */
++	if (ay0 &lt; iy0 &amp;&amp; n &lt; out_max) {
++		out[n][0] = ax0;
++		out[n][1] = ay0;
++		out[n][2] = ax1;
++		out[n][3] = iy0;
++		n++;
++	}
++	/* Bottom strip */
++	if (iy1 &lt; ay1 &amp;&amp; n &lt; out_max) {
++		out[n][0] = ax0;
++		out[n][1] = iy1;
++		out[n][2] = ax1;
++		out[n][3] = ay1;
++		n++;
++	}
++	/* Left strip (middle band only) */
++	if (ax0 &lt; ix0 &amp;&amp; n &lt; out_max) {
++		out[n][0] = ax0;
++		out[n][1] = iy0;
++		out[n][2] = ix0;
++		out[n][3] = iy1;
++		n++;
++	}
++	/* Right strip (middle band only) */
++	if (ix1 &lt; ax1 &amp;&amp; n &lt; out_max) {
++		out[n][0] = ix1;
++		out[n][1] = iy0;
++		out[n][2] = ax1;
++		out[n][3] = iy1;
++		n++;
++	}
++	return n;
++}
++
++#define DRAW_VIS_MAX 32
++
++/*
++ * Subtract one opaque occluder screen rect from a list of visible rects.
++ * in_n rects in vis[][4]; result written back into vis, returns new count.
++ */
++static int vis_subtract_occluder(int vis[][4], int in_n,
++                                 int ox0, int oy0, int ox1, int oy1)
++{
++	int tmp[DRAW_VIS_MAX][4];
++	int out_n = 0;
++	int i, j, k;
++	int pieces[4][4];
++	int np;
++
++	for (i = 0; i &lt; in_n; i++) {
++		np = rect_subtract(vis[i][0], vis[i][1], vis[i][2], vis[i][3],
++		                   ox0, oy0, ox1, oy1, pieces, 4);
++		for (j = 0; j &lt; np &amp;&amp; out_n &lt; DRAW_VIS_MAX; j++) {
++			tmp[out_n][0] = pieces[j][0];
++			tmp[out_n][1] = pieces[j][1];
++			tmp[out_n][2] = pieces[j][2];
++			tmp[out_n][3] = pieces[j][3];
++			out_n++;
++		}
++	}
++	for (k = 0; k &lt; out_n; k++) {
++		vis[k][0] = tmp[k][0];
++		vis[k][1] = tmp[k][1];
++		vis[k][2] = tmp[k][2];
++		vis[k][3] = tmp[k][3];
++	}
++	return out_n;
++}
++
+ /* Composite everything from `behind` into a rect, clipped to the display. */
+ static void composite_behind_rect(struct ServerState *srv, struct Client *behind,
+                                   int x0, int y0, int x1, int y1)
+@@ -1291,31 +1396,81 @@ void redraw_pan(struct ServerState *srv, int old_pan_x, int old_pan_y)
+ 	cursor_fb_end(1);
+ }
+ 
+-void draw(struct ServerState* srv, struct Client cli) {
++/*
++ * MSG_DRAW — design (do not “fix” by full-stack recomposite):
++ *
++ * Original BGCE model: the client that asked to draw only updates *its own*
++ * visible pixels.  We do NOT repaint wallpaper or windows below, and we do
++ * NOT walk the whole stack bottom→top into the client’s rect (that caused
++ * visible refill/blink and was a regression from this design).
++ *
++ * Algorithm (opaque windows; list is top → bottom):
++ *   1. Start with the drawer’s screen bounds as the visible region.
++ *   2. Walk clients from the head (topmost) until we reach `cli`.
++ *      Each window above subtracts its screen rect from the visible region.
++ *   3. When we arrive at `cli`, blit only the remaining rects from its buffer.
++ *   4. Windows above are never overwritten; windows below are never touched.
++ *
++ * Use composite_chain_to_rect / erase_client when underlay must change
++ * (unmap, move expose, pan edges, zoom) — not for ordinary MSG_DRAW.
++ *
++ * Cursor: lift only if damage hits the glyph; input thread re-presents.
++ */
++void draw(struct ServerState *srv, struct Client *cli)
++{
+ 	int sx0, sy0, sx1, sy1;
+-	int lifted;
+-
+-	if (!srv || !srv-&gt;framebuffer || !cli.buffer) {
+-		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
++	int vis[DRAW_VIS_MAX][4];
++	int nvis;
++	int lifted = 0;
++	int i;
++	struct Client *c;
++
++	if (!srv || !srv-&gt;framebuffer || !cli || !cli-&gt;buffer) {
++		fprintf(stderr,
++		        "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Recompose the stack into this client's screen footprint only.
+-	 * Blitting only `cli` would paint it on top of everyone (raise on
+-	 * every MSG_DRAW).  Windows above it stay above; others outside
+-	 * the rect are untouched.
+-	 *
+-	 * Cursor: lift if the damage hits the glyph; do not paint — the
+-	 * input thread re-presents via display_cursor_present / set_cursor_pos.
+-	 */
+-	client_screen_bounds(srv, &amp;cli, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1);
++	client_screen_bounds(srv, cli, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1);
+ 	if (!clip_to_display(srv, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1))
+ 		return;
+ 
++	/* Visible pieces of this client after subtracting occluders above. */
++	vis[0][0] = sx0;
++	vis[0][1] = sy0;
++	vis[0][2] = sx1;
++	vis[0][3] = sy1;
++	nvis = 1;
++
++	for (c = srv-&gt;clients; c; c = c-&gt;next) {
++		int cx0, cy0, cx1, cy1;
++
++		if (c == cli)
++			break;
++		/* Skip non-drawable entries (e.g. empty); still occlude if they have size. */
++		client_screen_bounds(srv, c, &amp;cx0, &amp;cy0, &amp;cx1, &amp;cy1);
++		if (!clip_to_display(srv, &amp;cx0, &amp;cy0, &amp;cx1, &amp;cy1))
++			continue;
++		nvis = vis_subtract_occluder(vis, nvis, cx0, cy0, cx1, cy1);
++		if (nvis &lt;= 0)
++			return; /* fully covered by windows above */
++	}
++
++	if (!c) {
++		/* Drawer not in the list — should not happen; refuse full-stack fallback. */
++		fprintf(stderr, "[BGCE] Draw: client not in stack, skip\n");
++		return;
++	}
++
+ 	cursor_fb_begin();
+-	lifted = cursor_lift_for_rect_ret(sx0, sy0, sx1, sy1);
+-	composite_chain_to_rect(srv, srv-&gt;clients, sx0, sy0, sx1, sy1);
++	for (i = 0; i &lt; nvis; i++) {
++		if (cursor_lift_for_rect_ret(vis[i][0], vis[i][1],
++		                             vis[i][2], vis[i][3]))
++			lifted = 1;
++	}
++	for (i = 0; i &lt; nvis; i++)
++		blit_client_overlap(srv, cli, vis[i][0], vis[i][1],
++		                    vis[i][2], vis[i][3]);
+ 	cursor_fb_end(lifted);
+ }
+ 
+diff --git a/input.c b/input.c
+index 73a8655..a13753a 100644
+--- a/input.c
++++ b/input.c
+@@ -620,7 +620,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 				if (drag.dx &lt; 0 || drag.dy &lt; 0) {
+ 					redraw_from_resize(&amp;server, *c, drag.dx, drag.dy);
+ 				}
+-				draw(&amp;server, *c);
++				draw(&amp;server, c);
+ 
+ 				struct BGCEMessage msg;
+ 				msg.type = MSG_BUFFER_CHANGE;
+@@ -716,7 +716,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			 * app to finish a heavy redraw — that runs on the client
+ 			 * thread when it posts MSG_DRAW.  Never do client work here.
+ 			 */
+-			draw(&amp;server, *c);
++			draw(&amp;server, c);
+ 			printf("[BGCE] Client focused (fd=%d).\n", c-&gt;fd);
+ 		}
+ 
+diff --git a/loop.c b/loop.c
+index d366c88..e0d3161 100644
+--- a/loop.c
++++ b/loop.c
+@@ -225,10 +225,10 @@ void* client_thread(void* arg) {
+ 
+ 		case MSG_DRAW: {
+ 			/*
+-			 * Blit on this client thread only — never on the input thread.
+-			 * A slow composite must not freeze the software cursor.
++			 * Blit this client only (clipped by windows above).
++			 * On this client thread only — never on the input thread.
+ 			 */
+-			draw(&amp;server, *client);
++			draw(&amp;server, client);
+ 			break;
+ 		}
+ 		case MSG_MOVE: {
+diff --git a/mock.c b/mock.c
+index 9cfa82c..3e98ba2 100644
+--- a/mock.c
++++ b/mock.c
+@@ -177,7 +177,7 @@ void bgce_mock_draw(struct Client *c)
+ {
+ 	if (!c)
+ 		return;
+-	draw(&amp;server, *c);
++	draw(&amp;server, c);
+ }
+ 
+ void bgce_mock_remove_client(struct Client *c)
+@@ -237,7 +237,7 @@ void bgce_mock_focus(struct Client *c)
+ 	if (server.focused_client)
+ 		c-&gt;z = server.focused_client-&gt;z + 1;
+ 	server.focused_client = c;
+-	draw(&amp;server, *c);
++	draw(&amp;server, c);
+ }
+ 
+ struct Client *bgce_mock_click(int screen_x, int screen_y)
+diff --git a/server.h b/server.h
+index 232d3fb..ee22306 100644
+--- a/server.h
++++ b/server.h
+@@ -226,10 +226,11 @@ void display_cursor_present(void);
+ void set_cursor_type(enum BGCECursorType type);
+ 
+ /**
+- * Client content changed (MSG_DRAW): recompose the stacking order into
+- * this client's screen rect only.  Does not raise the client.
++ * Client content changed (MSG_DRAW): blit only this client, clipped by
++ * windows stacked above it.  Does not repaint wallpaper or clients below,
++ * and does not raise the client.  See draw() in display.c for the model.
+  */
+-void draw(struct ServerState* srv, struct Client cli);
++void draw(struct ServerState *srv, struct Client *cli);
+ 
+ /**
+  * Move client on screen by world delta (dx, dy).  `c` is still at the old
+</pre>

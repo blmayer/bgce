@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce e808204</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit e808204
+parent <a href=commit-0388704.html>0388704</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-08T15:08:50-03:00
+
+    Shortcut logs and exec without shell; simple one-shot send.
+
+    Log when shortcuts fire; launch commands with fork+execvp (no /bin/sh).
+    bgce_send_msg is a single send of the full message. Docs updated.
+
+<a href=tree-e808204.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/README.md b/README.md
+index e4eca52..96c4723 100644
+--- a/README.md
++++ b/README.md
+@@ -176,7 +176,7 @@ color = #RRGGBBAA # Hex color with alpha (e.g., #FF000080 for semi-transparent r
+ #
+ # type is one of:
+ #   builtin  - value must be "exit" or "screenshot"
+-#   command  - value is a shell command to run in a new process
++#   command  - program + args, exec'd directly (no shell; quote args with ")
+ #
+ # Combo examples: ctrl+alt+q, sysrq, f12, ctrl+shift+s, super+r
+ 
+@@ -209,10 +209,10 @@ With custom shortcuts:
+ ctrl+alt+q = builtin:exit
+ sysrq = builtin:screenshot
+ 
+-# Launch programs (commands run via /bin/sh -c in a separate process)
++# Launch programs: fork + execvp (no /bin/sh)
+ ctrl+alt+t = command:alacritty
+ super+r = command:rofi -show drun
+-f12 = command:sh -c 'import -window root ~/screenshot.png'
++f12 = command:import -window root /tmp/screenshot.png
+ ```
+ 
+ 
+diff --git a/config.c b/config.c
+index b555422..0a4e7d6 100644
+--- a/config.c
++++ b/config.c
+@@ -186,7 +186,7 @@ static struct key_combo parse_key_combo(const char* str) {
+ 	return kc;
+ }
+ 
+-// Parse a shortcut rhs of the form "builtin:exit" or "command:alacritty -e foo"
++// Parse rhs: "builtin:exit" or "command:/bin/foo arg1 arg2" (execvp, no shell)
+ // Stores into out and returns SHORTCUT_PARSE_OK on success.
+ static enum shortcut_parse_result parse_shortcut_rhs(const char* rhs, struct shortcut* out) {
+ 	if (!rhs || !*rhs || !out)
+diff --git a/input.c b/input.c
+index 5a4a49c..ec95e42 100644
+--- a/input.c
++++ b/input.c
+@@ -486,25 +486,39 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		if (sc) {
+ 			if (sc-&gt;type == SHORTCUT_BUILTIN) {
+ 				if (strcmp(sc-&gt;value, "exit") == 0) {
+-					/* Do not printf here: a full log pipe can block
+-					 * forever so exit() never runs. */
++					/*
++					 * Do not printf to the log pipe here: a full
++					 * pipe can block forever so shutdown never
++					 * runs.  bgce_request_shutdown announces on
++					 * the real console.
++					 */
+ 					bgce_request_shutdown();
+ 					return 1; /* not reached */
+ 				} else if (strcmp(sc-&gt;value, "screenshot") == 0) {
+-					if (server.focused_client)
++					if (server.focused_client) {
++						printf("[BGCE] Shortcut: screenshot "
++						       "skipped (client focused — "
++						       "forward key to app)\n");
+ 						return 0;
++					}
++					printf("[BGCE] Shortcut: builtin screenshot\n");
+ 					take_screenshot("screenshot.png");
+ 					return 1;
+ 				}
++				printf("[BGCE] Shortcut: unknown builtin '%s'\n",
++				       sc-&gt;value);
+ 			} else if (sc-&gt;type == SHORTCUT_COMMAND) {
+ 				pid_t pid = fork();
+ 				if (pid == 0) {
++					char line[sizeof(sc-&gt;value)];
++					char *argv[64];
++					int argc = 0;
++					char *p;
+ 					int devnull;
++
+ 					/*
+ 					 * Detach from bgce's session/tty so the child is not
+-					 * a console job: no process-group SIGINT with the
+-					 * server, and no stdin/stdout bound to the VT (apps
+-					 * would otherwise treat the tty as their terminal).
++					 * a console job (SIGINT / controlling terminal).
+ 					 */
+ 					if (setsid() &lt; 0)
+ 						(void)setpgid(0, 0);
+@@ -518,10 +532,45 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 					}
+ 					signal(SIGINT, SIG_DFL);
+ 					signal(SIGTERM, SIG_DFL);
+-					execl("/bin/sh", "sh", "-c", sc-&gt;value, (char *)NULL);
++
++					/*
++					 * No shell: split on whitespace (optional "quoted"
++					 * args) and execvp the binary directly.
++					 */
++					strncpy(line, sc-&gt;value, sizeof(line) - 1);
++					line[sizeof(line) - 1] = '\0';
++					p = line;
++					while (*p &amp;&amp; argc &lt; (int)(sizeof(argv) / sizeof(argv[0])) - 1) {
++						while (*p == ' ' || *p == '\t')
++							p++;
++						if (!*p)
++							break;
++						if (*p == '"') {
++							p++;
++							argv[argc++] = p;
++							while (*p &amp;&amp; *p != '"')
++								p++;
++							if (*p)
++								*p++ = '\0';
++						} else {
++							argv[argc++] = p;
++							while (*p &amp;&amp; *p != ' ' &amp;&amp; *p != '\t')
++								p++;
++							if (*p)
++								*p++ = '\0';
++						}
++					}
++					argv[argc] = NULL;
++					if (argc &lt; 1)
++						_exit(127);
++					execvp(argv[0], argv);
++					/* Only reached if exec fails — nowhere to log. */
+ 					_exit(127);
+ 				} else if (pid &lt; 0) {
+ 					perror("[BGCE] fork for shortcut command");
++				} else {
++					printf("[BGCE] Shortcut: exec pid=%d: %s\n",
++					       (int)pid, sc-&gt;value);
+ 				}
+ 				return 1;
+ 			}
+@@ -632,7 +681,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 				struct BGCEMessage lost = {0};
+ 				lost.type = MSG_FOCUS_CHANGE;
+ 				lost.data.focus_event.state = 0;
+-				bgce_send_msg(old_focus-&gt;fd, &amp;lost);
++				/* Non-blocking send: never stall the input thread. */
++				(void)bgce_send_msg(old_focus-&gt;fd, &amp;lost);
+ 			}
+ 
+ 			/* keep z monotonic (if no previous focus, keep current z) */
+@@ -644,10 +694,15 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			struct BGCEMessage got = {0};
+ 			got.type = MSG_FOCUS_CHANGE;
+ 			got.data.focus_event.state = 1;
+-			bgce_send_msg(c-&gt;fd, &amp;got);
++			(void)bgce_send_msg(c-&gt;fd, &amp;got);
+ 
++			/*
++			 * Raise only: blit this client on top.  Do not wait for the
++			 * app to finish a heavy redraw — that runs on the client
++			 * thread when it posts MSG_DRAW.  Never do client work here.
++			 */
+ 			draw(&amp;server, *c);
+-			printf("[BGCE] Client focused.\n");
++			printf("[BGCE] Client focused (fd=%d).\n", c-&gt;fd);
+ 		}
+ 
+ 		if (!alt_down) {
+@@ -976,7 +1031,8 @@ void* input_loop(void* arg) {
+ 			struct BGCEMessage msg;
+ 			msg.type = MSG_INPUT_EVENT;
+ 			msg.data.input_event = e;
+-			bgce_send_msg(c.fd, &amp;msg);
++			/* Drop if the client is not reading (busy); keep the cursor live. */
++			(void)bgce_send_msg(c.fd, &amp;msg);
+ 		}
+ 	}
+ 	return NULL;
+diff --git a/libbgce.c b/libbgce.c
+index e6ed2c3..26e611e 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -188,18 +188,18 @@ void bgce_buf_unlink(const char *name)
+ 		unlink(path);
+ }
+ 
+-/* Write exactly 'size' bytes */
++/* Send one full BGCEMessage in a single send(). */
+ ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg) {
+ 	size_t size = sizeof(struct BGCEMessage);
++	ssize_t n = send(conn, msg, size, MSG_NOSIGNAL);
+ 
+-	ssize_t n = write(conn, msg, size);
+ 	if (n &lt; 0) {
+-		/* EPIPE/ECONNRESET: peer gone — caller should drop the client.
+-		 * With SIGPIPE ignored on the server, this is a normal path. */
+-		if (errno != EPIPE &amp;&amp; errno != ECONNRESET &amp;&amp; errno != EINTR)
+-			perror("[BGCE] write");
++		if (errno != EPIPE &amp;&amp; errno != ECONNRESET)
++			perror("[BGCE] send");
+ 		return -1;
+ 	}
++	if ((size_t)n != size)
++		return -1;
+ 	return n;
+ }
+ 
+diff --git a/loop.c b/loop.c
+index 1165c26..c853678 100644
+--- a/loop.c
++++ b/loop.c
+@@ -207,10 +207,9 @@ void* client_thread(void* arg) {
+ 		}
+ 
+ 		case MSG_DRAW: {
+-			printf("[BGCE] Received draw event from client %s\n", client-&gt;shm_name);
+ 			/*
+-			 * Drawing must be allowed even when the client is not focused.
+-			 * Focus only affects input routing.
++			 * Blit on this client thread only — never on the input thread.
++			 * A slow composite must not freeze the software cursor.
+ 			 */
+ 			draw(&amp;server, *client);
+ 			break;
+diff --git a/server.c b/server.c
+index 96fecef..15ac16a 100644
+--- a/server.c
++++ b/server.c
+@@ -127,7 +127,7 @@ void bgce_request_shutdown(void)
+ {
+ 	/* Prefer the real console — avoid printf/stderr (log pipe can block). */
+ 	if (console_fd &gt;= 0)
+-		dprintf(console_fd, "[BGCE] shutting down\n");
++		dprintf(console_fd, "[BGCE] Shortcut: exit — shutting down\n");
+ 	cleanup_and_exit(SIGTERM);
+ }
+ 
+diff --git a/server.h b/server.h
+index 67191fb..1a1cdd2 100644
+--- a/server.h
++++ b/server.h
+@@ -126,7 +126,8 @@ enum shortcut_parse_result {
+ struct shortcut {
+ 	struct key_combo combo;
+ 	enum shortcut_type type;
+-	char value[256]; // for builtin: "exit" or "screenshot"; for command: the command line to run
++	/* builtin: "exit"/"screenshot"; command: program + args (no shell) */
++	char value[256];
+ };
+ 
+ // Cursor theme: per-type image data (ARGB, pre-scaled to CURSOR_WIDTH x CURSOR_HEIGHT)
+diff --git a/www/index.html b/www/index.html
+index 78adeaa..84a1399 100644
+--- a/www/index.html
++++ b/www/index.html
+@@ -127,7 +127,7 @@ color = #RRGGBBAA # Hex color with alpha
+ #
+ # type is one of:
+ #   builtin  - value must be "exit" or "screenshot"
+-#   command  - value is a shell command to run in a new process
++#   command  - program + args (execvp, no shell; "quote" args)
+ #
+ # Combo examples: ctrl+alt+q, sysrq, f12, ctrl+shift+s, super+r
+ 
+@@ -155,10 +155,10 @@ With custom shortcuts:
+ ctrl+alt+q = builtin:exit
+ sysrq = builtin:screenshot
+ 
+-# Launch programs (commands run via /bin/sh -c in a separate process)
++# Launch programs: fork + execvp (no /bin/sh)
+ ctrl+alt+t = command:alacritty
+ super+r = command:rofi -show drun
+-f12 = command:sh -c 'import -window root ~/screenshot.png'
++f12 = command:import -window root /tmp/screenshot.png
+ 
+ 
+ &lt;i&gt;Notes&lt;/i&gt;
+</pre>

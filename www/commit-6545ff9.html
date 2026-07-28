@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 6545ff9</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 6545ff9
+parent <a href=commit-9cd84da.html>9cd84da</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-11-12T21:38:17-03:00
+
+    server now works with drm
+
+<a href=tree-6545ff9.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/Makefile b/Makefile
+index b62a8cb..644be2c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,8 +1,8 @@
+ CC = gcc
+-CFLAGS = -Wall -O2 -std=c99 -fPIC -g
+-LDFLAGS = -lrt
++CFLAGS = -Wall -O2 -std=c99 -fPIC -g -I/usr/include/libdrm
++LDFLAGS = -lrt -ldrm
+ 
+-SERVER_OBJS = server.o server_handler.o libbgce.so input.o
++SERVER_OBJS = server.o server_handler.o libbgce.so input.o display.o
+ LIB_OBJS = libbgce.o
+ 
+ all: bgce libbgce.so test-client
+diff --git a/display.c b/display.c
+index c78cf0a..4b6d1ff 100644
+--- a/display.c
++++ b/display.c
+@@ -14,8 +14,7 @@
+ #include &lt;xf86drm.h&gt;
+ #include &lt;xf86drmMode.h&gt;
+ 
+-#include "bgce_server.h" /* for ServerState */
+-#include "bgce_shared.h" /* for shared types if needed */
++#include "server.h" /* for ServerState */
+ 
+ /*
+  * Simple DRM/KMS display backend using a dumb buffer.
+@@ -37,51 +36,6 @@ static uint32_t drm_bpp = 32;
+ static uint8_t* drm_map = NULL;
+ static size_t drm_map_size = 0;
+ 
+-/* mode / connector / crtc state saved for shutdown */
+-static drmModeModeInfo chosen_mode;
+-static uint32_t chosen_crtc = 0;
+-static uint32_t chosen_conn = 0;
+-
+-/* Helper: create dumb buffer via ioctl */
+-static int create_dumb_buffer(int fd, uint32_t width, uint32_t height,
+-                              uint32_t* out_handle, uint32_t* out_pitch, size_t* out_size) {
+-	struct drm_mode_create_dumb creq;
+-	memset(&amp;creq, 0, sizeof(creq));
+-	creq.width = width;
+-	creq.height = height;
+-	creq.bpp = drm_bpp;
+-
+-	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &amp;creq) &lt; 0) {
+-		perror("DRM_IOCTL_MODE_CREATE_DUMB");
+-		return -1;
+-	}
+-
+-	*out_handle = creq.handle;
+-	*out_pitch = creq.pitch;
+-	*out_size = (size_t)creq.pitch * creq.height;
+-	return 0;
+-}
+-
+-/* Helper: map dumb buffer */
+-static int map_dumb_buffer(int fd, uint32_t handle, uint8_t** out_map, size_t size) {
+-	struct drm_mode_map_dumb mreq;
+-	memset(&amp;mreq, 0, sizeof(mreq));
+-	mreq.handle = handle;
+-	if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &amp;mreq) &lt; 0) {
+-		perror("DRM_IOCTL_MODE_MAP_DUMB");
+-		return -1;
+-	}
+-
+-	off_t offset = mreq.offset;
+-	*out_map = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+-	if (*out_map == MAP_FAILED) {
+-		perror("mmap(dumb)");
+-		*out_map = NULL;
+-		return -1;
+-	}
+-	return 0;
+-}
+-
+ /* Helper: destroy dumb buffer (unmap + ioctl destroy) */
+ static void destroy_dumb_buffer(int fd, uint32_t handle, uint8_t* map, size_t size) {
+ 	if (map) {
+@@ -95,192 +49,107 @@ static void destroy_dumb_buffer(int fd, uint32_t handle, uint8_t* map, size_t si
+ 	}
+ }
+ 
+-/* Find first connected connector and matching CRTC */
+-static int find_connector_and_crtc(int fd, drmModeConnector** out_conn, drmModeEncoder** out_enc, drmModeRes** out_res) {
+-	drmModeRes* res = drmModeGetResources(fd);
+-	if (!res) {
+-		fprintf(stderr, "[BGCE][DRM] drmModeGetResources failed\n");
++/* Initialize DRM: open card0, pick connector/mode, create &amp; map dumb buffer, add FB and set CRTC */
++int init_display(struct ServerState* srv) {
++	srv-&gt;drm_fd = open("/dev/dri/card1", O_RDWR);
++	if (srv-&gt;drm_fd &lt; 0) {
++		perror("open /dev/dri/card1");
+ 		return -1;
+ 	}
+ 
+-	drmModeConnector* conn = NULL;
+-	drmModeEncoder* enc = NULL;
+-	uint32_t conn_id = 0;
+-
+-	for (int i = 0; i &lt; res-&gt;count_connectors; i++) {
+-		drmModeConnector* c = drmModeGetConnector(fd, res-&gt;connectors[i]);
+-		if (!c)
+-			continue;
+-		if (c-&gt;connection == DRM_MODE_CONNECTED &amp;&amp; c-&gt;count_modes &gt; 0) {
+-			conn = c;
+-			conn_id = c-&gt;connector_id;
+-			break;
+-		}
+-		drmModeFreeConnector(c);
+-	}
+-
+-	if (!conn) {
+-		drmModeFreeResources(res);
+-		fprintf(stderr, "[BGCE][DRM] No connected connector found\n");
++	srv-&gt;resources = drmModeGetResources(srv-&gt;drm_fd);
++	if (!srv-&gt;resources) {
++		perror("drmModeGetResources");
++		close(srv-&gt;drm_fd);
+ 		return -1;
+ 	}
+ 
+-	/* choose encoder */
+-	drmModeEncoder* e = NULL;
+-	if (conn-&gt;encoder_id)
+-		e = drmModeGetEncoder(fd, conn-&gt;encoder_id);
++	drmModeConnector* conn = NULL;
++	drmModeEncoder* enc = NULL;
+ 
+-	if (!e) {
+-		/* try to find a compatible encoder via encoders list */
+-		for (int i = 0; i &lt; conn-&gt;count_encoders; i++) {
+-			e = drmModeGetEncoder(fd, conn-&gt;encoders[i]);
+-			if (e)
++	for (int i = 0; i &lt; srv-&gt;resources-&gt;count_connectors; i++) {
++		conn = drmModeGetConnector(srv-&gt;drm_fd, srv-&gt;resources-&gt;connectors[i]);
++		if (conn &amp;&amp; conn-&gt;connection == DRM_MODE_CONNECTED) {
++			enc = drmModeGetEncoder(srv-&gt;drm_fd, conn-&gt;encoder_id);
++			if (enc)
+ 				break;
++			drmModeFreeConnector(conn);
++			conn = NULL;
++		} else if (conn) {
++			drmModeFreeConnector(conn);
+ 		}
+ 	}
+ 
+-	if (!e) {
+-		drmModeFreeConnector(conn);
+-		drmModeFreeResources(res);
+-		fprintf(stderr, "[BGCE][DRM] No encoder for connector\n");
++	if (!conn || !enc) {
++		fprintf(stderr, "[BGCE] No connected display found\n");
+ 		return -1;
+ 	}
+ 
+-	*out_conn = conn;
+-	*out_enc = e;
+-	*out_res = res;
+-	chosen_conn = conn_id;
+-	return 0;
+-}
++	srv-&gt;connector = conn;
++	srv-&gt;encoder = enc;
++	srv-&gt;crtc_id = enc-&gt;crtc_id;
+ 
+-/* Initialize DRM: open card0, pick connector/mode, create &amp; map dumb buffer, add FB and set CRTC */
+-int bgce_display_init(struct ServerState* srv) {
+-	if (!srv)
+-		return -1;
+-	if (srv-&gt;width &lt;= 0 || srv-&gt;height &lt;= 0) {
+-		fprintf(stderr, "[BGCE][DRM] server resolution invalid, need width/height\n");
+-		return -1;
+-	}
+-
+-	drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+-	if (drm_fd &lt; 0) {
+-		perror("[BGCE][DRM] open /dev/dri/card0");
+-		return -1;
+-	}
+-
+-	drmModeConnector* conn = NULL;
+-	drmModeEncoder* enc = NULL;
+-	drmModeRes* res = NULL;
+-	if (find_connector_and_crtc(drm_fd, &amp;conn, &amp;enc, &amp;res) &lt; 0) {
+-		close(drm_fd);
+-		drm_fd = -1;
+-		return -1;
+-	}
+-
+-	/* pick a mode: prefer the connector preferred mode, else use first */
+ 	drmModeModeInfo mode = conn-&gt;modes[0];
+-	for (int i = 0; i &lt; conn-&gt;count_modes; i++) {
+-		if (conn-&gt;modes[i].type &amp; DRM_MODE_TYPE_PREFERRED) {
+-			mode = conn-&gt;modes[i];
+-			break;
+-		}
+-	}
+-
+-	chosen_mode = mode;
+-
+-	/* decide framebuffer size: use server size but ensure &lt;= mode */
+-	uint32_t fb_w = (uint32_t)srv-&gt;width;
+-	uint32_t fb_h = (uint32_t)srv-&gt;height;
+-	if (fb_w == 0 || fb_h == 0) {
+-		fb_w = mode.hdisplay;
+-		fb_h = mode.vdisplay;
+-	}
+-
+-	/* create dumb buffer of server size */
+-	if (create_dumb_buffer(drm_fd, fb_w, fb_h, &amp;drm_handle, &amp;drm_pitch, &amp;drm_map_size) &lt; 0) {
+-		drmModeFreeConnector(conn);
+-		drmModeFreeEncoder(enc);
+-		drmModeFreeResources(res);
+-		close(drm_fd);
+-		drm_fd = -1;
++	srv-&gt;display.mode.hdisplay = mode.hdisplay;
++	srv-&gt;display.mode.vdisplay = mode.vdisplay;
++	srv-&gt;color_depth = 32;
++
++	printf("[BGCE] Using display %dx%d (%s)\n",
++	       mode.hdisplay, mode.vdisplay, mode.name);
++
++	uint32_t handle;
++	uint32_t pitch = srv-&gt;display.mode.hdisplay * 4;
++	size_t fb_size = pitch * srv-&gt;display.mode.vdisplay;
++
++	struct drm_mode_create_dumb creq = {0};
++	creq.width = srv-&gt;display.mode.hdisplay;
++	creq.height = srv-&gt;display.mode.vdisplay;
++	creq.bpp = 32;
++	if (drmIoctl(srv-&gt;drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &amp;creq) &lt; 0) {
++		perror("DRM_IOCTL_MODE_CREATE_DUMB");
+ 		return -1;
+ 	}
+ 
+-	/* add fb object */
+-	int ret = drmModeAddFB(drm_fd, fb_w, fb_h, 24, drm_bpp, drm_pitch, drm_handle, &amp;drm_fb);
+-	if (ret) {
+-		fprintf(stderr, "[BGCE][DRM] drmModeAddFB failed: %s\n", strerror(errno));
+-		destroy_dumb_buffer(drm_fd, drm_handle, NULL, 0);
+-		drmModeFreeConnector(conn);
+-		drmModeFreeEncoder(enc);
+-		drmModeFreeResources(res);
+-		close(drm_fd);
+-		drm_fd = -1;
++	struct drm_mode_map_dumb mreq = {.handle = creq.handle};
++	if (drmIoctl(srv-&gt;drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &amp;mreq) &lt; 0) {
++		perror("DRM_IOCTL_MODE_MAP_DUMB");
+ 		return -1;
+ 	}
+ 
+-	/* map the buffer so userspace can write to it */
+-	if (map_dumb_buffer(drm_fd, drm_handle, &amp;drm_map, drm_map_size) &lt; 0) {
+-		drmModeRmFB(drm_fd, drm_fb);
+-		destroy_dumb_buffer(drm_fd, drm_handle, NULL, 0);
+-		drmModeFreeConnector(conn);
+-		drmModeFreeEncoder(enc);
+-		drmModeFreeResources(res);
+-		close(drm_fd);
+-		drm_fd = -1;
++	srv-&gt;display.framebuffer = mmap(0, creq.size, PROT_READ | PROT_WRITE, MAP_SHARED,
++	                        srv-&gt;drm_fd, mreq.offset);
++	if (srv-&gt;display.framebuffer == MAP_FAILED) {
++		perror("mmap");
+ 		return -1;
+ 	}
+ 
+-	/* find CRTC: get from encoder or find a suitable one */
+-	uint32_t crtc_id = 0;
+-	if (enc &amp;&amp; enc-&gt;crtc_id)
+-		crtc_id = enc-&gt;crtc_id;
+-	else {
+-		/* search for any crtc */
+-		for (int i = 0; i &lt; res-&gt;count_crtcs; i++) {
+-			crtc_id = res-&gt;crtcs[i];
+-			break;
+-		}
++	if (drmModeAddFB(srv-&gt;drm_fd, srv-&gt;display.mode.hdisplay, srv-&gt;display.mode.vdisplay, 24, 32, pitch,
++	                 creq.handle, &amp;srv-&gt;fb_id)) {
++		perror("drmModeAddFB");
++		return -1;
+ 	}
+-	chosen_crtc = crtc_id;
+ 
+-	/* set CRTC to use our FB */
+-	ret = drmModeSetCrtc(drm_fd, chosen_crtc, drm_fb, 0, 0, &amp;chosen_conn, 1, &amp;mode);
+-	if (ret) {
+-		fprintf(stderr, "[BGCE][DRM] drmModeSetCrtc failed: %s\n", strerror(errno));
+-		munmap(drm_map, drm_map_size);
+-		drmModeRmFB(drm_fd, drm_fb);
+-		destroy_dumb_buffer(drm_fd, drm_handle, NULL, 0);
+-		drmModeFreeConnector(conn);
+-		drmModeFreeEncoder(enc);
+-		drmModeFreeResources(res);
+-		close(drm_fd);
+-		drm_fd = -1;
++	if (drmModeSetCrtc(srv-&gt;drm_fd, srv-&gt;crtc_id, srv-&gt;fb_id, 0, 0,
++	                   &amp;srv-&gt;connector-&gt;connector_id, 1, &amp;mode)) {
++		perror("drmModeSetCrtc");
+ 		return -1;
+ 	}
+ 
+-	/* success: store chosen mode in globals, free resources */
+-	drmModeFreeConnector(conn);
+-	drmModeFreeEncoder(enc);
+-	drmModeFreeResources(res);
+-
+-	printf("[BGCE][DRM] initialized: %ux%u, pitch=%u, map=%p\n",
+-	       fb_w, fb_h, drm_pitch, (void*)drm_map);
+-
++	memset(srv-&gt;display.framebuffer, 0, fb_size);
+ 	return 0;
+ }
+ 
+ /* Convert server RGB24 buffer to XRGB8888 and copy into drm_map */
+-void bgce_display_present(struct ServerState* srv) {
++void draw(struct ServerState* srv) {
+ 	if (!drm_map || drm_fd &lt; 0 || !srv)
+ 		return;
+ 
+-	const uint8_t* src = srv-&gt;framebuffer; /* expecting RGB24 packed */
++	const uint8_t* src = srv-&gt;display.framebuffer; /* expecting RGB24 packed */
+ 	if (!src)
+ 		return;
+ 
+-	uint32_t width = srv-&gt;width;
+-	uint32_t height = srv-&gt;height;
++	uint32_t width = srv-&gt;display.mode.hdisplay;
++	uint32_t height = srv-&gt;display.mode.vdisplay;
+ 	uint32_t pitch = drm_pitch;
+ 
+ 	/* clamp to created buffer size */
+@@ -323,6 +192,7 @@ void bgce_display_shutdown(void) {
+ 		dreq.handle = drm_handle;
+ 		ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &amp;dreq);
+ 	}
++	drmDropMaster(drm_fd);
+ 
+ 	close(drm_fd);
+ 	drm_fd = -1;
+diff --git a/server.c b/server.c
+index ec812b4..ba405ed 100644
+--- a/server.c
++++ b/server.c
+@@ -1,11 +1,11 @@
+ #define _XOPEN_SOURCE 700
+ 
+-#include "bgce.h"
+ #include "server.h"
++#include "bgce.h"
+ 
++#include &lt;errno.h&gt;
+ #include &lt;pthread.h&gt;
+ #include &lt;signal.h&gt;
+-#include &lt;errno.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+@@ -57,10 +57,13 @@ int main(void) {
+ 	}
+ 
+ 	server.server_fd = fd;
+-	server.width = 800;
+-	server.height = 600;
+ 	server.color_depth = 32;
+ 
++	if (init_display(&amp;server) != 0) {
++		fprintf(stderr, "display init failed\n");
++		return 1;
++	}
++
+ 	if (bgce_input_init() != 0) {
+ 		perror("[BGCE] Failed to start input thread");
+ 		return 4;
+@@ -105,5 +108,8 @@ int main(void) {
+ 		pthread_detach(tid);
+ 	}
+ 
++	void bgce_display_shutdown();
++	free(server.display.framebuffer);
++
+ 	return 0;
+ }
+diff --git a/server.h b/server.h
+index 94480c6..d4a1459 100644
+--- a/server.h
++++ b/server.h
+@@ -2,6 +2,8 @@
+ #define BGCE_SERVER_H
+ 
+ #define _XOPEN_SOURCE 700
++#include &lt;drm/drm_mode.h&gt;
++#include &lt;xf86drmMode.h&gt;
+ #include &lt;pthread.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;sys/types.h&gt;
+@@ -11,30 +13,48 @@
+  * ---------------------------- */
+ 
+ struct Client {
+-    int fd;
+-    pid_t pid;
+-    char shm_name[64];
+-    void *buffer;
+-    uint32_t width;
+-    uint32_t height;
+-    struct Client *next;
++	int fd;
++	pid_t pid;
++	char shm_name[64];
++	void* buffer;
++	uint32_t width;
++	uint32_t height;
++	struct Client* next;
+ };
+ 
+-
+ /* ----------------------------
+  * Server State
+  * ---------------------------- */
+ 
++struct DisplayState {
++	int drm_fd;                    /* DRM device file descriptor */
++	uint32_t crtc_id;              /* CRTC ID in use */
++	uint32_t connector_id;         /* Connector ID in use */
++	uint32_t fb_id;                /* Framebuffer ID */
++	uint32_t handle;               /* GEM buffer handle */
++	uint32_t pitch;                /* Bytes per scanline */
++	uint64_t size;                 /* Total buffer size (bytes) */
++	uint8_t* framebuffer;          /* Mapped framebuffer pointer */
++	struct drm_mode_modeinfo mode; /* Active display mode */
++};
++
+ struct ServerState {
+-    int server_fd;
+-    int width;
+-    int height;
+-    int color_depth;
++	int server_fd;
++	int color_depth;
++
++	struct DisplayState display;
++
++	int drm_fd;
++	drmModeRes* resources;
++	drmModeConnector* connector;
++	drmModeEncoder* encoder;
++	uint32_t crtc_id;
++	uint32_t fb_id;
+ 
+-    struct Client *clients;
+-    int client_count;
++	struct Client* clients;
++	int client_count;
+ 
+-    struct Client *focused_client;
++	struct Client* focused_client;
+ };
+ 
+ /* ----------------------------
+@@ -45,22 +65,27 @@ struct ServerState {
+  * Initialize the BGCE server socket.
+  * Returns 0 on success, -1 on error.
+  */
+-int bgce_server_init(struct ServerState *srv, const char *socket_path);
++int bgce_server_init(struct ServerState* srv, const char* socket_path);
++
++int init_display(struct ServerState* srv);
++
++void draw(struct ServerState* srv);
++
++void bgce_display_shutdown(void);
+ 
+ /**
+  * Run the main accept loop — listens for incoming clients and spawns threads.
+  */
+-void bgce_server_run(struct ServerState *srv);
++void bgce_server_run(struct ServerState* srv);
+ 
+ /**
+  * Clean up sockets and client buffers.
+  */
+-void bgce_server_shutdown(struct ServerState *srv);
++void bgce_server_shutdown(struct ServerState* srv);
+ 
+ /**
+  * Handle a single connected client (thread function).
+  */
+-void *bgce_handle_client(void *arg);
++void* bgce_handle_client(void* arg);
+ 
+ #endif /* BGCE_SERVER_H */
+-
+diff --git a/server_handler.c b/server_handler.c
+index 926daef..5c244cf 100644
+--- a/server_handler.c
++++ b/server_handler.c
+@@ -14,31 +14,6 @@
+ /* Externs from bgce_server.c */
+ extern struct ServerState server;
+ 
+-/*
+- * Writes the active client’s buffer to /tmp/bgce_frame.ppm
+- * Each client overwrites sequentially.
+- */
+-void bgce_blit_to_framebuffer(struct ServerState* server, struct Client* client) {
+-	if (!client-&gt;buffer)
+-		return;
+-
+-	char* buf = client-&gt;buffer;
+-	size_t buf_size = (size_t)client-&gt;width * client-&gt;height * 3;
+-
+-	FILE* fp = fopen("/tmp/bgce_frame.ppm", "wb");
+-	if (!fp) {
+-		perror("fopen");
+-		return;
+-	}
+-
+-	fprintf(fp, "P6\n%d %d\n255\n", client-&gt;width, client-&gt;height);
+-	fwrite(buf, 1, buf_size, fp);
+-	fclose(fp);
+-
+-	printf("[BGCE] Frame written from client fd=%d (%ux%u)\n",
+-	       client-&gt;fd, client-&gt;width, client-&gt;height);
+-}
+-
+ void* client_thread_main(void* arg) {
+ 	int client_fd = *(int*)arg;
+ 	free(arg);
+@@ -60,8 +35,8 @@ void* client_thread_main(void* arg) {
+ 		switch (msg.type) {
+ 		case MSG_GET_SERVER_INFO: {
+ 			struct ServerInfo info = {
+-			        .width = server.width,
+-			        .height = server.height,
++			        .width = server.display.mode.hdisplay,
++			        .height = server.display.mode.vdisplay,
+ 			        .color_depth = server.color_depth};
+ 			memcpy(msg.data, &amp;info, sizeof(info));
+ 			bgce_send_msg(client_fd, &amp;msg);
+@@ -109,7 +84,7 @@ void* client_thread_main(void* arg) {
+ 					break;
+ 				}
+ 				printf("[BGCE] Drawing from focused client %d\n", client_fd);
+-				bgce_blit_to_framebuffer(&amp;server, &amp;client);
++				draw(&amp;server);
+ 			} else {
+ 				printf("[BGCE] Ignoring draw from unfocused client %d\n", client_fd);
+ 			}
+diff --git a/test_client.c b/test_client.c
+index f2be7c2..c77d8dd 100644
+--- a/test_client.c
++++ b/test_client.c
+@@ -35,10 +35,10 @@ int main(void) {
+ 	printf("[BGCE] Drawing gradient...\n");
+ 	for (int y = 0; y &lt; h; y++) {
+ 		for (int x = 0; x &lt; w; x++) {
+-			int idx = (y * w + x) * 3;
+-			buf[idx + 0] = (x * 255) / w; /* Red */
+-			buf[idx + 1] = (y * 255) / h; /* Green */
+-			buf[idx + 2] = 64;            /* Blue constant */
++			uint8_t* p = buf + (y * w + x) * 3;
++			p[0] = (x * 255) / w;  // R
++			p[1] = (y * 255) / h; // G
++			p[2] = 128;                       // B
+ 		}
+ 	}
+ 
+</pre>

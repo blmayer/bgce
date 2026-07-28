@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 5b6b309</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 5b6b309
+parent <a href=commit-73d45e3.html>73d45e3</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-11-15T09:02:25-03:00
+
+    renamed some files
+
+<a href=tree-5b6b309.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/Makefile b/Makefile
+index c499d24..4909a55 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@ CC = gcc
+ CFLAGS = -Wall -O2 -std=c99 -fPIC -g -I/usr/include/libdrm
+ LDFLAGS = -lrt -ldrm
+ 
+-SERVER_OBJS = server.o server_handler.o libbgce.so input.o display.o vt.o
++SERVER_OBJS = server.o loop.o libbgce.so input.o display.o vt.o
+ LIB_OBJS = libbgce.o
+ 
+ all: bgce libbgce.so client
+diff --git a/server_handler.c b/loop.c
+similarity index 100%
+rename from server_handler.c
+rename to loop.c
+diff --git a/test/server_client.sh b/test/server_client.sh
+new file mode 100755
+index 0000000..8df4da6
+--- /dev/null
++++ b/test/server_client.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++
++LD_LIBRARY_PATH=. ./bgce &gt; server.log 2&gt;&amp;1 &amp;
++sleep 0.3
++echo "[MAKE] Server running"
++
++echo "[MAKE] Running test client..."
++LD_LIBRARY_PATH=. ./client &gt; client.log 2&gt;&amp;1
++
++sleep 3
++echo "[MAKE] Stopping server..."
++killall bgce
++
++echo "[MAKE] Test finished."
++
+</pre>

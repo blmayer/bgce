@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce d296d9a</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit d296d9a
+parent <a href=commit-f8c8c8e.html>f8c8c8e</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2026-01-12T13:48:25-03:00
+
+    added type to event struct
+
+<a href=tree-d296d9a.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/bgce.h b/bgce.h
+index 2128c70..fbadb09 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -74,8 +74,9 @@ struct BufferReply {
+ };
+ 
+ struct InputEvent {
+-       uint32_t code; /* key code or button code */
++       int32_t type; /* press=1, release=0, or delta */
+        int32_t value; /* press=1, release=0, or delta */
++       uint32_t code; /* key code or button code */
+        int32_t x;     /* optional: for mouse move */
+        int32_t y;     /* optional: for mouse move */
+        struct InputDevice device;
+diff --git a/input.c b/input.c
+index 7f3f6d9..d53095f 100644
+--- a/input.c
++++ b/input.c
+@@ -398,6 +398,7 @@ void* input_loop(void* arg) {
+ 				struct Client c = *server.focused_client;
+ 
+ 				struct InputEvent e = {0};
++				e.type = ev.type;
+ 				e.device = server.input.devs[i];
+ 				e.code = ev.code;
+ 				e.value = ev.value;
+</pre>

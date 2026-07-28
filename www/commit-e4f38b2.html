@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce e4f38b2</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit e4f38b2
+parent <a href=commit-9935078.html>9935078</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-10-20T14:00:02-03:00
+
+    added client handling file
+
+<a href=tree-e4f38b2.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/README.md b/README.md
+index 7a41137..a3c727b 100644
+--- a/README.md
++++ b/README.md
+@@ -13,7 +13,7 @@ The server maintains:
+ - A **real display buffer** (the VGA framebuffer)
+ - A **per-client off-screen buffer**
+ - Basic **input handling** (keyboard + mouse)
+-- **IPC** using UNIX domain sockets (for commands) and FIFOs (for input events)
++- **IPC** using UNIX domain sockets for commands and input events
+ 
+ The client communicates with the server via a shared library exposing these APIs:
+ 
+diff --git a/bgce-client-handler.c b/bgce-client-handler.c
+new file mode 100644
+index 0000000..f556fbe
+--- /dev/null
++++ b/bgce-client-handler.c
+@@ -0,0 +1,99 @@
++#include "bgce.h"
++#include "bgce_shared.h"
++
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;unistd.h&gt;
++#include &lt;fcntl.h&gt;
++#include &lt;sys/mman.h&gt;
++#include &lt;sys/stat.h&gt;
++#include &lt;time.h&gt;
++
++/* Handle a single connected client */
++void handle_client(int client_fd, ServerState *server)
++{
++	Client client = {0};
++	client.fd = client_fd;
++
++	printf("[BGCE] Client connected (fd=%d)\n", client_fd);
++
++	while (1) {
++		BGCEMessage msg;
++		ssize_t rc = bgce_recv_msg(client_fd, &amp;msg);
++		if (rc &lt;= 0) {
++			printf("[BGCE] Client disconnected (fd=%d)\n", client_fd);
++			break;
++		}
++
++		switch (msg.type) {
++		case MSG_GET_SERVER_INFO: {
++			ServerInfo info = {
++				.width = server-&gt;width,
++				.height = server-&gt;height,
++				.color_depth = server-&gt;color_depth
++			};
++			bgce_send_data(client_fd, &amp;info, sizeof(info));
++			break;
++		}
++
++		case MSG_GET_BUFFER: {
++			if (msg.length &lt; sizeof(ClientBufferRequest)) {
++				fprintf(stderr, "[BGCE] Invalid buffer request size\n");
++				break;
++			}
++			ClientBufferRequest req;
++			memcpy(&amp;req, msg.data, sizeof(req));
++
++			snprintf(client.shm_name, sizeof(client.shm_name),
++				 "/bgce_buf_%d_%ld", getpid(), time(NULL));
++
++			int shm_fd = shm_open(client.shm_name, O_CREAT | O_RDWR, 0600);
++			if (shm_fd &lt; 0) {
++				perror("shm_open");
++				break;
++			}
++
++			size_t buf_size = req.width * req.height * 3;
++			if (ftruncate(shm_fd, buf_size) &lt; 0) {
++				perror("ftruncate");
++				close(shm_fd);
++				break;
++			}
++
++			client.buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++			client.width = req.width;
++			client.height = req.height;
++			close(shm_fd);
++
++			ClientBufferReply reply = {0};
++			strncpy(reply.shm_name, client.shm_name, sizeof(reply.shm_name));
++			reply.width = req.width;
++			reply.height = req.height;
++			bgce_send_data(client_fd, &amp;reply, sizeof(reply));
++			break;
++		}
++
++		case MSG_DRAW: {
++			if (!client.buffer) {
++				fprintf(stderr, "[BGCE] Client has no buffer!\n");
++				break;
++			}
++			printf("[BGCE] Drawing from client %d\n", client_fd);
++			bgce_blit_to_framebuffer(server, &amp;client);
++			break;
++		}
++
++		default:
++			fprintf(stderr, "[BGCE] Unknown message type %d\n", msg.type);
++			break;
++		}
++	}
++
++	if (client.buffer) {
++		munmap(client.buffer, client.width * client.height * 3);
++		shm_unlink(client.shm_name);
++	}
++	close(client_fd);
++}
++
+</pre>

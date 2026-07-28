@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 9426324</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 9426324
+parent <a href=commit-052d5e8.html>052d5e8</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-08T11:50:55-03:00
+
+    Restore bgce_get_buffer by-value ABI so existing apps work.
+
+    Changing the request to a pointer made every prebuilt client treat the
+    packed BufferRequest as an address and crash in get_buffer, so nothing
+    appeared on screen. Revert the pointer API and server-side zoom size
+    scaling; keep the faster compositor blit paths.
+
+<a href=tree-9426324.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/bgce.h b/bgce.h
+index 6ab92f1..adbf679 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -150,13 +150,10 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
+ 
+ /**
+  * Request a shared memory buffer from the server.
+- * req-&gt;width/height are logical (screen-normal) pixels: the server treats the
+- * current zoom as 100% and may return a different world-pixel size in *req
+- * (and in the internal reply) so the window appears at the requested on-screen
+- * size. On success, *req is updated to the actual buffer dimensions.
++ * width/height are in virtual-desktop (world) pixels.
+  * Returns a mapped buffer pointer on success, or NULL on failure.
+  */
+-void* bgce_get_buffer(int conn, struct BufferRequest *req);
++void* bgce_get_buffer(int conn, struct BufferRequest req);
+ 
+ /**
+  * Shared pixel buffers (server creates, client maps by token in BufferReply.shm_name).
+diff --git a/client.c b/client.c
+index 6196925..56d31c7 100644
+--- a/client.c
++++ b/client.c
+@@ -52,14 +52,11 @@ int main(void) {
+ 	}
+ 
+ 	struct BufferRequest req = {.width = (uint32_t)w, .height = (uint32_t)h};
+-	buf = bgce_get_buffer(conn, &amp;req);
++	buf = bgce_get_buffer(conn, req);
+ 	if (!buf) {
+ 		fprintf(stderr, "[BGCE] Failed to get buffer\n");
+ 		return 3;
+ 	}
+-	/* Server may scale logical size by current zoom → use actual dims. */
+-	w = (int)req.width;
+-	h = (int)req.height;
+ 	printf("Client got buffer at: %p (%dx%d)\n", buf, w, h);
+ 
+ 	printf("[BGCE] Drawing gradient...\n");
+diff --git a/libbgce.c b/libbgce.c
+index 184fb21..e6ed2c3 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -261,16 +261,14 @@ int bgce_get_server_info(int conn, struct ServerInfo* info) {
+ 	return 0;
+ }
+ 
+-/* Public API: Get shared buffer.
+- * req-&gt;width/height are logical sizes; on success they become the actual
+- * buffer (world) dimensions the client must use for drawing. */
+-void* bgce_get_buffer(int conn, struct BufferRequest *req) {
+-	if (conn &lt; 0 || !req)
++/* Public API: Get shared buffer (pass BufferRequest by value — stable ABI). */
++void* bgce_get_buffer(int conn, struct BufferRequest req) {
++	if (conn &lt; 0)
+ 		return NULL;
+ 
+ 	struct BGCEMessage msg = {0};
+ 	msg.type = MSG_GET_BUFFER;
+-	msg.data.buffer_request = *req;
++	msg.data.buffer_request = req;
+ 
+ 	int code = bgce_send_msg(conn, &amp;msg);
+ 	if (code &lt;= 0)
+@@ -301,8 +299,6 @@ void* bgce_get_buffer(int conn, struct BufferRequest *req) {
+ 		return NULL;
+ 	}
+ 
+-	req-&gt;width = reply.width;
+-	req-&gt;height = reply.height;
+ 	return buf;
+ }
+ 
+diff --git a/loop.c b/loop.c
+index 268fea6..df0513e 100644
+--- a/loop.c
++++ b/loop.c
+@@ -86,8 +86,6 @@ void* client_thread(void* arg) {
+ 			void *map;
+ 			char old_name[64];
+ 			int had_buffer;
+-			uint32_t world_w, world_h;
+-			float z;
+ 
+ 			reply.status = -1;
+ 			msg.type = MSG_GET_BUFFER;
+@@ -100,24 +98,10 @@ void* client_thread(void* arg) {
+ 				break;
+ 			}
+ 
+-			/*
+-			 * Client sizes are logical (screen-normal) pixels: the current
+-			 * zoom is treated as 100%, so a window that "should look like
+-			 * 800×600" occupies ~800×600 screen pixels at any zoom.
+-			 * Convert to world pixels: world = logical / zoom.
+-			 */
+-			z = server.zoom &gt; 0.0f ? server.zoom : 1.0f;
+-			world_w = (uint32_t)((float)req.width / z + 0.5f);
+-			world_h = (uint32_t)((float)req.height / z + 0.5f);
+-			if (world_w &lt; 1)
+-				world_w = 1;
+-			if (world_h &lt; 1)
+-				world_h = 1;
+-
+ 			printf(
+-			        "[BGCE] Client requested buffer %ux%u logical → "
+-			        "%ux%u world (zoom=%.2f)\n",
+-			        req.width, req.height, world_w, world_h, (double)z);
++			        "[BGCE] Client requested buffer of size %dx%d\n",
++			        req.width,
++			        req.height);
+ 
+ 			/* Unmap and remember old token before creating a new one. */
+ 			had_buffer = client-&gt;buffer != NULL;
+@@ -130,7 +114,7 @@ void* client_thread(void* arg) {
+ 				old_name[sizeof(old_name) - 1] = '\0';
+ 			}
+ 
+-			buf_size = (size_t)world_w * world_h * 4;
++			buf_size = (size_t)req.width * req.height * 4;
+ 			shm_fd = bgce_buf_create(client-&gt;shm_name,
+ 			                         sizeof(client-&gt;shm_name), buf_size);
+ 			if (shm_fd &lt; 0) {
+@@ -160,8 +144,8 @@ void* client_thread(void* arg) {
+ 				bgce_buf_unlink(old_name);
+ 
+ 			client-&gt;buffer = map;
+-			client-&gt;width = world_w;
+-			client-&gt;height = world_h;
++			client-&gt;width = req.width;
++			client-&gt;height = req.height;
+ 			/* First buffer only: place at the current viewport so the window
+ 			 * appears on-screen even when the user has panned/zoomed. */
+ 			if (!had_buffer) {
+@@ -187,9 +171,8 @@ void* client_thread(void* arg) {
+ 			reply.status = 0;
+ 			strncpy(reply.shm_name, client-&gt;shm_name, sizeof(reply.shm_name) - 1);
+ 			reply.shm_name[sizeof(reply.shm_name) - 1] = '\0';
+-			/* Reply carries the actual buffer (world) size for drawing/mmap. */
+-			reply.width = world_w;
+-			reply.height = world_h;
++			reply.width = req.width;
++			reply.height = req.height;
+ 			msg.data.buffer_reply = reply;
+ 			bgce_send_msg(client_fd, &amp;msg);
+ 			break;
+</pre>

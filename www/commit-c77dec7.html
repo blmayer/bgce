@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce c77dec7</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit c77dec7
+parent <a href=commit-a2b2538.html>a2b2538</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-14T20:27:21-03:00
+
+    Coalesce pending MOVE/CURSOR/PAN jobs to avoid queue floods.
+
+    A fast drag enqueues a MOVE+CURSOR per pointer step and fills the 256
+    slot queue. Fold into an already-queued peer: MOVE keeps earliest old_*
+    and latest new_*; CURSOR keeps latest pos; PAN sums deltas. Only drop
+    when full and the job cannot coalesce.
+
+<a href=tree-c77dec7.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/compositor.c b/compositor.c
+index fd7c194..940e4ac 100644
+--- a/compositor.c
++++ b/compositor.c
+@@ -466,22 +466,148 @@ static void assign_job_id(struct comp_job *job)
+ 		job-&gt;job_id = next_job_id++;
+ }
+ 
++/*
++ * Fold high-frequency jobs into an already-queued peer so a fast drag does
++ * not enqueue hundreds of 1px MOVE + CURSOR steps (fills CAP → drops).
++ *
++ *   MOVE   same client → keep earliest old_*, set new_* to latest
++ *   CURSOR any         → latest screen position only
++ *   PAN    any         → accumulate sdx/sdy
++ *
++ * Must hold q_mu.  Returns 1 if absorbed (do not push a new slot).
++ */
++static int try_coalesce_locked(const struct comp_job *job)
++{
++	int i, n, idx;
++	struct comp_job *pending = NULL;
++
++	if (job-&gt;op != COMP_MOVE &amp;&amp; job-&gt;op != COMP_CURSOR &amp;&amp;
++	    job-&gt;op != COMP_PAN)
++		return 0;
++
++	n = q_count;
++	for (i = 0; i &lt; n; i++) {
++		idx = (q_head + i) % COMP_QUEUE_CAP;
++		if (queue[idx].op != job-&gt;op)
++			continue;
++		if (job-&gt;op == COMP_MOVE &amp;&amp;
++		    queue[idx].client_id != job-&gt;client_id)
++			continue;
++		pending = &amp;queue[idx];
++		/* keep scanning so we fold into the newest match */
++	}
++	if (!pending)
++		return 0;
++
++	if (job-&gt;op == COMP_MOVE) {
++		/* pending: A→B, job: B→C (or further) → one paint A→C */
++		pending-&gt;new_x = job-&gt;new_x;
++		pending-&gt;new_y = job-&gt;new_y;
++		if (bgce_debug) {
++			printf("[BGCE] comp: coalesce MOVE job=%llu client=%u "
++			       "(%d,%d)-&gt;(%d,%d) q=%d\n",
++			       (unsigned long long)pending-&gt;job_id,
++			       (unsigned)pending-&gt;client_id,
++			       pending-&gt;old_x, pending-&gt;old_y,
++			       pending-&gt;new_x, pending-&gt;new_y, q_count);
++			debug_fflush();
++		}
++	} else if (job-&gt;op == COMP_CURSOR) {
++		pending-&gt;cursor_x = job-&gt;cursor_x;
++		pending-&gt;cursor_y = job-&gt;cursor_y;
++		if (bgce_debug) {
++			printf("[BGCE] comp: coalesce CURSOR job=%llu "
++			       "screen=(%d,%d) q=%d\n",
++			       (unsigned long long)pending-&gt;job_id,
++			       pending-&gt;cursor_x, pending-&gt;cursor_y, q_count);
++			debug_fflush();
++		}
++	} else { /* COMP_PAN */
++		pending-&gt;sdx += job-&gt;sdx;
++		pending-&gt;sdy += job-&gt;sdy;
++		if (bgce_debug) {
++			printf("[BGCE] comp: coalesce PAN job=%llu d=(%d,%d) "
++			       "q=%d\n",
++			       (unsigned long long)pending-&gt;job_id,
++			       pending-&gt;sdx, pending-&gt;sdy, q_count);
++			debug_fflush();
++		}
++	}
++	return 1;
++}
++
++static void log_enqueue(const struct comp_job *job)
++{
++	struct Client *c = NULL;
++	const char *app = "";
++	uint32_t cx = 0, cy = 0, ww = 0, wh = 0;
++
++	if (!bgce_debug)
++		return;
++
++	if (job-&gt;client_id)
++		c = bgce_comp_find_client(job-&gt;client_id);
++	if (c) {
++		if (c-&gt;app_id[0])
++			app = c-&gt;app_id;
++		cx = c-&gt;x;
++		cy = c-&gt;y;
++		ww = c-&gt;world_w ? c-&gt;world_w : c-&gt;width;
++		wh = c-&gt;world_h ? c-&gt;world_h : c-&gt;height;
++	}
++	if (job-&gt;op == COMP_DRAW)
++		printf("[BGCE] comp: enqueue job=%llu DRAW client=%u "
++		       "app='%s' world=(%u,%u) %ux%u q=%d\n",
++		       (unsigned long long)job-&gt;job_id,
++		       (unsigned)job-&gt;client_id, app, cx, cy, ww, wh,
++		       q_count);
++	else if (job-&gt;op == COMP_MOVE)
++		printf("[BGCE] comp: enqueue job=%llu MOVE client=%u "
++		       "app='%s' (%d,%d)-&gt;(%d,%d) q=%d\n",
++		       (unsigned long long)job-&gt;job_id,
++		       (unsigned)job-&gt;client_id, app,
++		       job-&gt;old_x, job-&gt;old_y, job-&gt;new_x, job-&gt;new_y,
++		       q_count);
++	else if (job-&gt;op == COMP_PAN)
++		printf("[BGCE] comp: enqueue job=%llu PAN d=(%d,%d) q=%d\n",
++		       (unsigned long long)job-&gt;job_id,
++		       job-&gt;sdx, job-&gt;sdy, q_count);
++	else if (job-&gt;op == COMP_CURSOR)
++		printf("[BGCE] comp: enqueue job=%llu CURSOR screen=(%d,%d) "
++		       "q=%d\n",
++		       (unsigned long long)job-&gt;job_id,
++		       job-&gt;cursor_x, job-&gt;cursor_y, q_count);
++	else
++		printf("[BGCE] comp: enqueue job=%llu %s client=%u "
++		       "app='%s' q=%d\n",
++		       (unsigned long long)job-&gt;job_id, op_name(job-&gt;op),
++		       (unsigned)job-&gt;client_id, app, q_count);
++	debug_fflush();
++}
++
+ /*
+  * Never block the producer (input) on a full queue — that freezes the mouse.
+- * Drop the new job if the queue is saturated (paint may lag; input stays live).
++ * Prefer coalescing MOVE/CURSOR/PAN; only drop if the queue is full and the
++ * job cannot fold into a peer.
+  */
+ static void enqueue(struct comp_job *job)
+ {
+ 	static int drop_log;
+ 
+-	assign_job_id(job);
+-
+ 	if (comp_sync) {
++		assign_job_id(job);
+ 		run_job(job);
+ 		return;
+ 	}
+ 
+ 	pthread_mutex_lock(&amp;q_mu);
++	if (try_coalesce_locked(job)) {
++		pthread_mutex_unlock(&amp;q_mu);
++		return;
++	}
++
++	assign_job_id(job);
++
+ 	if (q_count &gt;= COMP_QUEUE_CAP) {
+ 		pthread_mutex_unlock(&amp;q_mu);
+ 		if ((drop_log++ % 64) == 0) {
+@@ -495,50 +621,7 @@ static void enqueue(struct comp_job *job)
+ 	queue[q_tail] = *job;
+ 	q_tail = (q_tail + 1) % COMP_QUEUE_CAP;
+ 	q_count++;
+-	if (bgce_debug) {
+-		struct Client *c = NULL;
+-		const char *app = "";
+-		uint32_t cx = 0, cy = 0, ww = 0, wh = 0;
+-
+-		if (job-&gt;client_id)
+-			c = bgce_comp_find_client(job-&gt;client_id);
+-		if (c) {
+-			if (c-&gt;app_id[0])
+-				app = c-&gt;app_id;
+-			cx = c-&gt;x;
+-			cy = c-&gt;y;
+-			ww = c-&gt;world_w ? c-&gt;world_w : c-&gt;width;
+-			wh = c-&gt;world_h ? c-&gt;world_h : c-&gt;height;
+-		}
+-		if (job-&gt;op == COMP_DRAW)
+-			printf("[BGCE] comp: enqueue job=%llu DRAW client=%u "
+-			       "app='%s' world=(%u,%u) %ux%u q=%d\n",
+-			       (unsigned long long)job-&gt;job_id,
+-			       (unsigned)job-&gt;client_id, app, cx, cy, ww, wh,
+-			       q_count);
+-		else if (job-&gt;op == COMP_MOVE)
+-			printf("[BGCE] comp: enqueue job=%llu MOVE client=%u "
+-			       "app='%s' (%d,%d)-&gt;(%d,%d) q=%d\n",
+-			       (unsigned long long)job-&gt;job_id,
+-			       (unsigned)job-&gt;client_id, app,
+-			       job-&gt;old_x, job-&gt;old_y, job-&gt;new_x, job-&gt;new_y,
+-			       q_count);
+-		else if (job-&gt;op == COMP_PAN)
+-			printf("[BGCE] comp: enqueue job=%llu PAN d=(%d,%d) q=%d\n",
+-			       (unsigned long long)job-&gt;job_id,
+-			       job-&gt;sdx, job-&gt;sdy, q_count);
+-		else if (job-&gt;op == COMP_CURSOR)
+-			printf("[BGCE] comp: enqueue job=%llu CURSOR screen=(%d,%d) "
+-			       "q=%d\n",
+-			       (unsigned long long)job-&gt;job_id,
+-			       job-&gt;cursor_x, job-&gt;cursor_y, q_count);
+-		else
+-			printf("[BGCE] comp: enqueue job=%llu %s client=%u "
+-			       "app='%s' q=%d\n",
+-			       (unsigned long long)job-&gt;job_id, op_name(job-&gt;op),
+-			       (unsigned)job-&gt;client_id, app, q_count);
+-		debug_fflush();
+-	}
++	log_enqueue(job);
+ 	pthread_cond_signal(&amp;q_not_empty);
+ 	pthread_mutex_unlock(&amp;q_mu);
+ }
+diff --git a/compositor.h b/compositor.h
+index 8980922..906d4f1 100644
+--- a/compositor.h
++++ b/compositor.h
+@@ -11,6 +11,8 @@ struct Client;
+  * - Async mode: orchestrator pops jobs (DRAW/MOVE/PAN/CURSOR/…).
+  *   A pool of 3 blit workers runs fine-grained MOVE tasks FCFS.
+  *   Input never paints — it only enqueues (including mouse motion).
++ * - Pending MOVE (same client), CURSOR, and PAN jobs coalesce so a fast
++ *   drag paints one big step instead of flooding the queue.
+  * - Sync mode (headless): submit runs on the caller; parallel tasks serial.
+  *
+  * Debug: BGCE_DEBUG=1 — op names, enqueue/run/done, which worker took each
+</pre>

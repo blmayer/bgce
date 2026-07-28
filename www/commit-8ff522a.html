@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 8ff522a</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 8ff522a
+parent <a href=commit-467897d.html>467897d</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-12-05T17:09:45-03:00
+
+    moved toolkit to separate repo
+
+<a href=tree-8ff522a.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 397f75c..c7008c9 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -28,31 +28,18 @@ Implement a minimal Linux graphical environment that runs without root, manages
+ 
+ ## Current Milestone
+ 
+-### BGTK (Brian's Graphical Toolkit)
+-
+-[x] **Step 1: Analyze Client API**
+-    *   Check `bgce.h` to see what functions are available for client connection, buffer retrieval, and especially **event handling**.
+-    *   Check `client.c` to see how an application currently interacts with `libbgce.so`.
+-
+-[ ] **Step 2: Define BGTK Interface (`bgtk.h`)**
+-    * Define the core structure for a widget (`struct BGTK_Widget`).
+-    * Define the event structure (`struct BGTK_Event`).
+-    [ ] Improve widget structure: add options (like alignment), child widgets.
+-    * Define API functions:
+-        * `BGTK_Context *bgtk_init(void)`: Connects to BGCE server, gets buffer/dimensions.
+-        * `void bgtk_main_loop(BGTK_Context *ctx)`: Blocking loop to handle events and redraws.
+-        * `BGTK_Widget *bgtk_label_new(const char *text)`: Creates a label.
+-        * `BGTK_Widget *bgtk_button_new(const char *text, void (*callback)(void))`
+-        * `void bgtk_add_widget(BGTK_Context *ctx, BGTK_Widget *widget, int x, int y, int w, int h)`: Simple absolute positioning for now.
+-
+-[ ] **Step 3: Implement BGTK Core (`bgtk.c`)**
+-    [X] Implement initialization, event queueing, and simple drawing (e.g., drawing rectangles for buttons, text rendering).
+-    [ ] Only call draw when changes are made, like input.
+-    [ ] Implement proper hit detection: using widget trees and coordinates, e.g. click on x,y -&gt; search the tree until last widget is found, then send the input to that widget.
+-
+-[x] **Step 4: Integrate and Test**
+-    [X] Create a new client file (or update `client.c`) to demonstrate a basic BGTK application. -&gt; app.c
+-    [ ] Ensure events (like mouse clicks) are routed to the appropriate widget callbacks. This needs server-side changes.
++### High-evel features
++[ ] Implement config file
++[ ] Implement a cache file to memorize the last location of clients, in order to reopen them on the same place
++
++### Protocol features
++[ ] Add suport for requesting a buffer at a specific location
++[ ] Add suport for resizing a buffer
++
++### Internal stuff
++[ ] Create more tests
++  - [ ] test if events go to the correct client and only the one
++
+ 
+ ---
+ 
+diff --git a/Makefile b/Makefile
+index c7024e2..a207eb2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,11 +1,11 @@
+ CC = gcc
+-CFLAGS = -Wall -O0 -std=c99 -fPIC -g -I/usr/include/libdrm -I/usr/include/freetype2 -I/usr/include/harfbuzz
+-LDFLAGS = -lrt -ldrm -lfreetype
++CFLAGS = -Wall -O1 -std=c99 -fPIC -g -I/usr/include/libdrm
++LDFLAGS = -lrt -ldrm
+ 
+ SERVER_OBJS = server.o loop.o libbgce.so input.o display.o
+ LIB_OBJS = libbgce.o
+ 
+-all: bgce libbgce.so client app
++all: bgce libbgce.so
+ 
+ bgce: $(SERVER_OBJS)
+ 	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) -L. -lbgce $(LDFLAGS)
+@@ -16,15 +16,26 @@ libbgce.so: $(LIB_OBJS)
+ client: client.c bgce.h
+ 	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce $(LDFLAGS)
+ 
+-app: app.c bgtk.h bgtk.o
+-	$(CC) $(CFLAGS) -o $@ app.c bgtk.o -L. -lbgce $(LDFLAGS)
+-
+ %.o: %.c
+ 	$(CC) $(CFLAGS) -c $&lt; -o $@
+ 
+ clean:
+ 	rm -f *.o bgce libbgce.so client app
+ 
++INSTALL_BIN = /usr/bin
++INSTALL_LIB = /usr/lib
++INSTALL_INCLUDE = /usr/include
++
++.PHONY: install
++install: bgce libbgce.so bgce.h
++	install -d $(INSTALL_BIN)
++	install -m 755 bgce $(INSTALL_BIN)
++	install -d $(INSTALL_LIB)
++	install -m 755 libbgce.so $(INSTALL_LIB)
++	install -d $(INSTALL_INCLUDE)
++	install -m 644 bgce.h $(INSTALL_INCLUDE)
++	ldconfig
++
+ .PHONY: test
+ test-server: bgce
+ 	@echo "[MAKE] Starting BGCE server..."
+</pre>

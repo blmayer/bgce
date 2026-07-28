@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 949fa81</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 949fa81
+parent <a href=commit-5e5cd58.html>5e5cd58</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2025-12-30T16:46:52-03:00
+
+    passing screenshot key to client
+
+<a href=tree-949fa81.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/display.c b/display.c
+index cdd11a5..eaf39a7 100644
+--- a/display.c
++++ b/display.c
+@@ -583,30 +583,30 @@ void release_display(void) {
+ }
+ 
+ int take_screenshot(const char* filename) {
+-    if (!server.framebuffer) {
+-        fprintf(stderr, "No framebuffer available for screenshot.\n");
+-        return -1;
+-    }
+-
+-    uint32_t width = server.display_w;
+-    uint32_t height = server.display_h;
+-    uint32_t stride = width * BGCE_BYTES_PER_PIXEL;
+-
+-    // Write the framebuffer to a PNG file
+-    int result = stbi_write_png(
+-        filename,
+-        width,
+-        height,
+-        BGCE_BYTES_PER_PIXEL,
+-        server.framebuffer,
+-        stride
+-    );
+-
+-    if (!result) {
+-        fprintf(stderr, "Failed to save screenshot to %s.\n", filename);
+-        return -1;
+-    }
+-
+-    printf("Screenshot saved to %s.\n", filename);
+-    return 0;
++	if (!server.framebuffer) {
++		fprintf(stderr, "No framebuffer available for screenshot.\n");
++		return -1;
++	}
++
++	uint32_t width = server.display_w;
++	uint32_t height = server.display_h;
++	uint32_t stride = width * BGCE_BYTES_PER_PIXEL;
++
++	// Write the framebuffer to a PNG file
++	int result = stbi_write_png(
++		filename,
++		width,
++		height,
++		BGCE_BYTES_PER_PIXEL,
++		server.framebuffer,
++		stride
++	);
++
++	if (!result) {
++		fprintf(stderr, "Failed to save screenshot to %s.\n", filename);
++		return -1;
++	}
++
++	printf("Screenshot saved to %s.\n", filename);
++	return 0;
+ }
+diff --git a/input.c b/input.c
+index a389e2d..7f3f6d9 100644
+--- a/input.c
++++ b/input.c
+@@ -190,6 +190,9 @@ static int handle_input_event(struct input_event ev) {
+ 		}
+ 		if (ev.code == KEY_SYSRQ) {
+ 			printf("[BGCE] Print Screen key pressed, taking screenshot.\n");
++			if (server.focused_client) {
++				return 0;
++			}
+ 			take_screenshot("screenshot.png");
+ 			return 1;
+ 		}
+@@ -248,6 +251,7 @@ static int handle_input_event(struct input_event ev) {
+ 		// switch focuse
+ 		struct Client* c = pick_client(mouse_x, mouse_y);
+ 		if (!c) {
++			server.focused_client = NULL;
+ 			return 0;
+ 		}
+ 		printf("[BGCE] Click detected at client %s z=%d.\n", c-&gt;shm_name, c-&gt;z);
+</pre>

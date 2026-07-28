@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce e572be4</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit e572be4
+parent <a href=commit-cc7597c.html>cc7597c</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-11-19T18:58:54-03:00
+
+    added index page
+
+<a href=tree-e572be4.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/www/index.html b/www/index.html
+new file mode 100644
+index 0000000..81e995e
+--- /dev/null
++++ b/www/index.html
+@@ -0,0 +1,54 @@
++&lt;!DOCTYPE html&gt;
++&lt;meta name="viewport" content="width=device-width, initial-scale=1" /&gt;
++&lt;title&gt;BGCE&lt;/title&gt;
++&lt;meta name="color-scheme" content="light dark"&gt;
++&lt;link rel=icon href=data:,&gt;
++&lt;link rel=alternate type="application/rss+xml" title=log href=feed.xml /&gt;
++&lt;style&gt;pre{width:52ch;margin:2ch auto}a{color:#ff00ff}&lt;/style&gt;
++&lt;pre&gt;
++	┌────────────────────────┐
++	│                        │
++	│ BGCE.                  │
++	│     |\                 │
++	│                        │
++	└────────────────────────┘
++
++&lt;i&gt;&lt;b&gt;BGCE: Brian's Graphical Computer Environment&lt;/b&gt;&lt;/i&gt;
++
++BGCE is a minimal graphical environment for Linux
++written in C. It acts as a bare-bones window system
++similar to Xorg or Wayland, but much simpler and
++designed to run &lt;b&gt;without root privileges&lt;/b&gt;.
++
++
++&lt;b&gt;Overview&lt;/b&gt;
++
++The system is split into two components:
++
++- &lt;b&gt;Server:&lt;/b&gt; Manages video buffer, input events, and
++  window stacking.
++- &lt;b&gt;Client:&lt;/b&gt; Applications that render to their own
++  buffers and request drawing through the server.
++
++
++&lt;b&gt;Build Instructions&lt;/b&gt;
++
++	git clone https://terminal.pink/bgce
++	cd bgce
++	make
++	./bgce   # Start server
++	./client  # Start test client
++
++
++&lt;b&gt;Goals&lt;/b&gt;
++
++- Minimal, understandable graphics stack in C
++- No external dependencies like OpenGL, X11 etc
++- Educational reference for framebuffer-based
++  compositing and IPC
++
++
++&lt;b&gt;License&lt;/b&gt;
++
++MIT License
++&lt;/pre&gt;
+</pre>

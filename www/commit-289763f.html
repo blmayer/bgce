@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 289763f</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 289763f
+parent <a href=commit-cd04e4e.html>cd04e4e</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-06-20T23:46:04-03:00
+
+    Add cursor theme support with multiple cursor types
+
+    - Add BGCECursorType enum (default, text, hand, resize_ns/ew/nwse, move)
+    - Add MSG_SET_CURSOR protocol message so clients can request cursor changes
+    - Add bgce_set_cursor() to client library
+    - Add built-in procedural cursor shapes as fallback renderers
+    - Add Xcursor file loader to load standard X11/Wayland cursor themes
+    - Add [cursors] config section with theme directory path
+    - Server automatically sets resize/move cursors during Alt+drag
+    - Only the focused client may change the cursor type
+
+<a href=tree-289763f.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/.DS_Store b/.DS_Store
+new file mode 100644
+index 0000000..bd201e1
+Binary files /dev/null and b/.DS_Store differ
+diff --git a/.tai b/.tai
+new file mode 100644
+index 0000000..365ca15
+--- /dev/null
++++ b/.tai
+@@ -0,0 +1,7 @@
++{
++	"provider": "openrouter",
++	"tai": {
++		"model": "xiaomi/mimo-v2-flash:free",
++		"tools": ["read_file", "shell", "patch"]
++	}
++}
+diff --git a/bgce.h b/bgce.h
+index aa89780..6fd714b 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -30,7 +30,22 @@ enum {
+ 	MSG_BUFFER_CHANGE,
+ 	MSG_FOCUS_CHANGE,
+ 	MSG_SUBSCRIBE_INPUT,
+-	MSG_MOVE
++	MSG_MOVE,
++	MSG_SET_CURSOR
++};
++
++/* ----------------------------
++ * Cursor Types
++ * ---------------------------- */
++enum BGCECursorType {
++	BGCE_CURSOR_DEFAULT = 0,
++	BGCE_CURSOR_TEXT,
++	BGCE_CURSOR_HAND,
++	BGCE_CURSOR_RESIZE_NS,
++	BGCE_CURSOR_RESIZE_EW,
++	BGCE_CURSOR_RESIZE_NWSE,
++	BGCE_CURSOR_MOVE,
++	BGCE_CURSOR_COUNT /* sentinel – must be last */
+ };
+ 
+ /* ----------------------------
+@@ -66,6 +81,10 @@ struct ResizeRequest {
+ 	uint32_t height;
+ };
+ 
++struct CursorRequest {
++	int32_t cursor_type; /* enum BGCECursorType */
++};
++
+ struct BufferReply {
+ 	int status; // 0 for success, -1 for failure
+ 	char shm_name[64];
+@@ -97,6 +116,7 @@ struct BGCEMessage {
+ 		struct InputEvent input_event;
+ 		struct FocusEvent focus_event;
+ 		struct MoveRequest move_request;
++		struct CursorRequest cursor_request;
+ 	} data;
+ };
+ 
+@@ -129,6 +149,12 @@ void* bgce_get_buffer(int conn, const struct BufferRequest req);
+ 
+ int bgce_move(int fd, int x, int y);
+ 
++/**
++ * Set the cursor type displayed by the server.
++ * Returns 0 on success, -1 on failure.
++ */
++int bgce_set_cursor(int fd, enum BGCECursorType type);
++
+ /**
+  * Send a draw command to the server, telling it to blit the
+  * shared memory contents to the framebuffer.
+diff --git a/config.c b/config.c
+index f0b704f..a2bd951 100644
+--- a/config.c
++++ b/config.c
+@@ -1,5 +1,6 @@
+ #include "server.h"
+ #include &lt;ctype.h&gt;
++#include &lt;limits.h&gt;
+ #include &lt;linux/input.h&gt;
+ #include &lt;stdbool.h&gt;
+ #include &lt;stdio.h&gt;
+@@ -261,6 +262,174 @@ static void set_default_shortcuts(struct config* config) {
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------
++ * Xcursor file loader
++ *
++ * The Xcursor format (used by X11/Wayland themes) stores ARGB pixel
++ * data with hotspot information.  Files live under a theme directory,
++ * e.g. /usr/share/icons/Adwaita/cursors/left_ptr
++ *
++ * File layout (all little-endian):
++ *   Header:  magic(4) header_size(4) version(4) ntoc(4)
++ *   TOC[ntoc]: type(4) subtype(4) position(4)
++ *   Image chunk (type 0xfffd0002):
++ *     chunk_header(4) type(4) subtype(4) version(4)
++ *     width(4) height(4) xhot(4) yhot(4) delay(4)
++ *     pixels[width*height] (ARGB, 4 bytes each)
++ * --------------------------------------------------------------- */
++
++#define XCURSOR_MAGIC     0x72756358u  /* "Xcur" */
++#define XCURSOR_IMAGE_TYPE 0xfffd0002u
++
++static uint32_t read_le32(const uint8_t* p) {
++	return (uint32_t)p[0] | ((uint32_t)p[1] &lt;&lt; 8) |
++	       ((uint32_t)p[2] &lt;&lt; 16) | ((uint32_t)p[3] &lt;&lt; 24);
++}
++
++/*
++ * Load the best-fit image from an Xcursor file.
++ * Prefers an image whose nominal size (subtype) is closest to CURSOR_WIDTH.
++ * The image is nearest-neighbor scaled to exactly CURSOR_WIDTH x CURSOR_HEIGHT.
++ * Fills hotspot_x/hotspot_y (scaled) and returns a malloc'd ARGB buffer,
++ * or NULL on failure.
++ */
++static uint32_t* load_xcursor_file(const char* path, int* hotspot_x, int* hotspot_y) {
++	FILE* f = fopen(path, "rb");
++	if (!f) return NULL;
++
++	/* Read entire file */
++	fseek(f, 0, SEEK_END);
++	long file_size = ftell(f);
++	fseek(f, 0, SEEK_SET);
++	if (file_size &lt; 16) { fclose(f); return NULL; }
++
++	uint8_t* data = malloc((size_t)file_size);
++	if (!data) { fclose(f); return NULL; }
++	if (fread(data, 1, (size_t)file_size, f) != (size_t)file_size) {
++		free(data); fclose(f); return NULL;
++	}
++	fclose(f);
++
++	/* Validate header */
++	uint32_t magic = read_le32(data);
++	if (magic != XCURSOR_MAGIC) {
++		fprintf(stderr, "[BGCE] Not an Xcursor file: %s\n", path);
++		free(data); return NULL;
++	}
++	uint32_t ntoc = read_le32(data + 12);
++	if (16 + ntoc * 12 &gt; (uint32_t)file_size) {
++		free(data); return NULL;
++	}
++
++	/* Scan TOC for image entries, pick best size match */
++	uint32_t best_pos = 0;
++	int best_diff = INT_MAX;
++	for (uint32_t i = 0; i &lt; ntoc; i++) {
++		uint8_t* toc = data + 16 + i * 12;
++		uint32_t type    = read_le32(toc);
++		uint32_t subtype = read_le32(toc + 4);  /* nominal size */
++		uint32_t pos     = read_le32(toc + 8);
++		if (type != XCURSOR_IMAGE_TYPE) continue;
++
++		int diff = abs((int)subtype - (int)CURSOR_WIDTH);
++		if (diff &lt; best_diff) {
++			best_diff = diff;
++			best_pos = pos;
++		}
++	}
++	if (best_diff == INT_MAX) {
++		fprintf(stderr, "[BGCE] No image chunks in Xcursor file: %s\n", path);
++		free(data); return NULL;
++	}
++
++	/* Parse image chunk at best_pos */
++	if (best_pos + 36 &gt; (uint32_t)file_size) { free(data); return NULL; }
++	uint8_t* chunk = data + best_pos;
++	/* chunk layout: header_size(4) type(4) subtype(4) version(4)
++	 *               width(4) height(4) xhot(4) yhot(4) delay(4) pixels... */
++	uint32_t chunk_header_size = read_le32(chunk);
++	if (chunk_header_size &lt; 36) chunk_header_size = 36;
++	uint32_t img_w = read_le32(chunk + 16);
++	uint32_t img_h = read_le32(chunk + 20);
++	uint32_t xhot  = read_le32(chunk + 24);
++	uint32_t yhot  = read_le32(chunk + 28);
++	/* pixels start after chunk header */
++	uint32_t pixel_offset = best_pos + chunk_header_size;
++	if (pixel_offset + img_w * img_h * 4 &gt; (uint32_t)file_size) {
++		fprintf(stderr, "[BGCE] Truncated Xcursor image in: %s\n", path);
++		free(data); return NULL;
++	}
++
++	uint32_t* pixels = (uint32_t*)(data + pixel_offset);
++
++	/* Allocate output buffer at CURSOR_WIDTH x CURSOR_HEIGHT */
++	uint32_t* buf = malloc(CURSOR_WIDTH * CURSOR_HEIGHT * sizeof(uint32_t));
++	if (!buf) { free(data); return NULL; }
++
++	/* Nearest-neighbor scale; Xcursor pixels are already ARGB */
++	float x_ratio = (float)img_w / CURSOR_WIDTH;
++	float y_ratio = (float)img_h / CURSOR_HEIGHT;
++
++	for (int y = 0; y &lt; CURSOR_HEIGHT; y++) {
++		for (int x = 0; x &lt; CURSOR_WIDTH; x++) {
++			int sx = (int)(x * x_ratio);
++			int sy = (int)(y * y_ratio);
++			if (sx &gt;= (int)img_w) sx = (int)img_w - 1;
++			if (sy &gt;= (int)img_h) sy = (int)img_h - 1;
++			buf[y * CURSOR_WIDTH + x] = pixels[sy * (int)img_w + sx];
++		}
++	}
++
++	/* Scale hotspot */
++	if (hotspot_x) *hotspot_x = (img_w &gt; 0) ? (int)(xhot * CURSOR_WIDTH / img_w) : 0;
++	if (hotspot_y) *hotspot_y = (img_h &gt; 0) ? (int)(yhot * CURSOR_HEIGHT / img_h) : 0;
++
++	free(data);
++	printf("[BGCE] Loaded Xcursor: %s (%ux%u -&gt; %dx%d, hotspot %u,%u)\n",
++	       path, img_w, img_h, CURSOR_WIDTH, CURSOR_HEIGHT, xhot, yhot);
++	return buf;
++}
++
++/*
++ * Standard Xcursor file names for each BGCECursorType.
++ * Themes use these names under their cursors/ directory.
++ */
++static const char* xcursor_names[][3] = {
++	[BGCE_CURSOR_DEFAULT]     = { "left_ptr",             "default",    "arrow" },
++	[BGCE_CURSOR_TEXT]        = { "xterm",                 "text",       "ibeam" },
++	[BGCE_CURSOR_HAND]        = { "hand2",                 "pointer",    "hand" },
++	[BGCE_CURSOR_RESIZE_NS]   = { "sb_v_double_arrow",     "ns-resize",  "size_ver" },
++	[BGCE_CURSOR_RESIZE_EW]   = { "sb_h_double_arrow",     "ew-resize",  "size_hor" },
++	[BGCE_CURSOR_RESIZE_NWSE] = { "top_left_corner",       "nwse-resize","size_fdiag" },
++	[BGCE_CURSOR_MOVE]        = { "fleur",                 "move",       "all-scroll" },
++};
++
++/*
++ * Load all cursor types from an Xcursor theme directory.
++ * Tries each standard name for a given type until one succeeds.
++ */
++static void load_cursor_theme(const char* theme_dir, struct cursor_theme* theme) {
++	for (int t = 0; t &lt; BGCE_CURSOR_COUNT; t++) {
++		for (int n = 0; n &lt; 3; n++) {
++			if (!xcursor_names[t][n]) continue;
++
++			char path[MAX_PATH_LEN];
++			snprintf(path, sizeof(path), "%s/%s", theme_dir, xcursor_names[t][n]);
++
++			int hx = 0, hy = 0;
++			uint32_t* img = load_xcursor_file(path, &amp;hx, &amp;hy);
++			if (img) {
++				theme-&gt;images[t] = img;
++				theme-&gt;hotspot_x[t] = hx;
++				theme-&gt;hotspot_y[t] = hy;
++				break; /* found one, skip alternatives */
++			}
++		}
++		if (!theme-&gt;images[t])
++			printf("[BGCE] No Xcursor file found for cursor type %d, using built-in\n", t);
++	}
++}
++
+ // Parse config file
+ int parse_config(struct config* config) {
+ 	const char* home = getenv("HOME");
+@@ -279,6 +448,7 @@ int parse_config(struct config* config) {
+ 	config-&gt;type = BG_COLOR;
+ 	config-&gt;color = 0xAAAAAAAA; // Default gray
+ 	config-&gt;shortcut_count = 0;
++	memset(&amp;config-&gt;cursors, 0, sizeof(config-&gt;cursors));
+ 
+ 	char line[1024];
+ 	char current_section[256] = "";
+@@ -304,8 +474,8 @@ int parse_config(struct config* config) {
+ 			continue;
+ 
+ 		char key[32];
+-		char value[128];
+-		sscanf(trimmed, "%s = %[^\n]", key, value);
++		char value[MAX_PATH_LEN];
++		sscanf(trimmed, "%31s = %511[^\n]", key, value);
+ 
+ 		if (strcmp(current_section, "background") == 0) {
+ 			if (strcmp(key, "type") == 0) {
+@@ -327,6 +497,13 @@ int parse_config(struct config* config) {
+ 					config-&gt;mode = IMAGE_SCALED;
+ 				}
+ 			}
++		} else if (strcmp(current_section, "cursors") == 0) {
++			if (strcmp(key, "theme") == 0) {
++				load_cursor_theme(value, &amp;config-&gt;cursors);
++			} else {
++				fprintf(stderr, "[BGCE] Unknown cursor config key: %s "
++				        "(expected 'theme')\n", key);
++			}
+ 		} else if (strcmp(current_section, "shortcuts") == 0) {
+ 			if (config-&gt;shortcut_count &lt; MAX_SHORTCUTS) {
+ 				struct key_combo kc = parse_key_combo(key);
+diff --git a/display.c b/display.c
+index 7829572..0e279b3 100644
+--- a/display.c
++++ b/display.c
+@@ -58,6 +58,7 @@
+ #include &lt;stb_image_write.h&gt;
+ 
+ extern struct ServerState server;
++extern struct config config;
+ 
+ static int vt_fd = -1;
+ 
+@@ -112,23 +113,280 @@ static int drm_destroy_dumb(int fd, uint32_t handle) {
+ 	return 0;
+ }
+ 
+-static void draw_cursor(uint8_t* buf, uint32_t stride, uint32_t w, uint32_t h) {
+-	/* Cursor is ARGB8888 */
+-	for (uint32_t y = 0; y &lt; h; y++) {
+-		uint32_t* line = (uint32_t*)(buf + y * stride);
+-		for (uint32_t x = 0; x &lt; w; x++) {
+-			/* simple triangle with alpha */
+-			if (x &lt; y &amp;&amp; x &gt; y / 5 &amp;&amp; x + y &lt; 64) {
+-				uint8_t alpha = 200;
+-				uint8_t red = 255;
+-				uint8_t green = (x * 255) / (w - 1);
+-				uint8_t blue = (y * 255) / (h - 1);
+-				line[x] = (alpha &lt;&lt; 24) | (red &lt;&lt; 16) | (green &lt;&lt; 8) | blue;
+-			} else {
+-				line[x] = 0; /* transparent */
+-			}
+-		}
++static enum BGCECursorType current_cursor = BGCE_CURSOR_DEFAULT;
++
++/* Helper: set a single pixel (ARGB8888) with bounds check */
++static inline void cur_px(uint32_t* buf, uint32_t stride_px, uint32_t w, uint32_t h,
++                          int x, int y, uint32_t argb) {
++	if (x &gt;= 0 &amp;&amp; x &lt; (int)w &amp;&amp; y &gt;= 0 &amp;&amp; y &lt; (int)h)
++		buf[y * stride_px + x] = argb;
++}
++
++/* Draw a filled line (horizontal) */
++static void cur_hline(uint32_t* buf, uint32_t stride_px, uint32_t w, uint32_t h,
++                      int x0, int x1, int y, uint32_t argb) {
++	for (int x = x0; x &lt;= x1; x++)
++		cur_px(buf, stride_px, w, h, x, y, argb);
++}
++
++/* Draw a filled line (vertical) */
++static void cur_vline(uint32_t* buf, uint32_t stride_px, uint32_t w, uint32_t h,
++                      int x, int y0, int y1, uint32_t argb) {
++	for (int y = y0; y &lt;= y1; y++)
++		cur_px(buf, stride_px, w, h, x, y, argb);
++}
++
++/* Outline color and fill color for all cursors */
++#define CUR_BLACK 0xFF000000u
++#define CUR_WHITE 0xFFFFFFFFu
++
++/* ---------- Individual cursor renderers ---------- */
++
++static void draw_cursor_default(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
++	/* Classic arrow pointer, ~20px tall */
++	/* Outline */
++	static const int arrow[][2] = {
++		{0,0},{0,1},{0,2},{0,3},{0,4},{0,5},{0,6},{0,7},{0,8},{0,9},{0,10},{0,11},{0,12},{0,13},{0,14},{0,15},{0,16},
++		{1,1},{1,2},{1,3},{1,4},{1,5},{1,6},{1,7},{1,8},{1,9},{1,10},{1,11},{1,12},{1,13},{1,14},{1,15},
++		{2,2},{2,3},{2,4},{2,5},{2,6},{2,7},{2,8},{2,9},{2,10},{2,11},{2,12},{2,13},{2,14},
++		{3,3},{3,4},{3,5},{3,6},{3,7},{3,8},{3,9},{3,10},{3,11},{3,12},{3,13},
++		{4,4},{4,5},{4,6},{4,7},{4,8},{4,9},{4,10},{4,11},{4,12},
++		{5,5},{5,6},{5,7},{5,8},{5,9},{5,10},{5,11},
++		{6,6},{6,7},{6,8},{6,9},{6,10},
++		{7,7},{7,8},{7,9},
++		{8,8},
++	};
++	/* White fill (interior) */
++	for (size_t i = 0; i &lt; sizeof(arrow)/sizeof(arrow[0]); i++)
++		cur_px(buf, sp, w, h, arrow[i][0], arrow[i][1], CUR_WHITE);
++
++	/* Black outline around the arrow */
++	/* Left edge */
++	for (int y = 0; y &lt;= 16; y++)
++		cur_px(buf, sp, w, h, 0, y, CUR_BLACK);
++	/* Diagonal right edge */
++	for (int i = 0; i &lt;= 16; i++)
++		cur_px(buf, sp, w, h, (i+1)/2, i, CUR_BLACK);
++	/* Bottom horizontal at y=11 */
++	for (int x = 0; x &lt;= 6; x++)
++		cur_px(buf, sp, w, h, x, 11, CUR_BLACK);
++	/* Bottom tip */
++	cur_px(buf, sp, w, h, 0, 16, CUR_BLACK);
++	cur_px(buf, sp, w, h, 0, 17, CUR_BLACK);
++	/* Diagonal from (6,11) -&gt; (3,17) for the notch */
++	cur_px(buf, sp, w, h, 6, 11, CUR_BLACK);
++	cur_px(buf, sp, w, h, 5, 12, CUR_BLACK);
++	cur_px(buf, sp, w, h, 5, 13, CUR_BLACK);
++	cur_px(buf, sp, w, h, 4, 14, CUR_BLACK);
++	cur_px(buf, sp, w, h, 4, 15, CUR_BLACK);
++	cur_px(buf, sp, w, h, 3, 16, CUR_BLACK);
++	cur_px(buf, sp, w, h, 3, 17, CUR_BLACK);
++	/* Tail shaft from notch */
++	cur_px(buf, sp, w, h, 3, 12, CUR_BLACK);
++	cur_px(buf, sp, w, h, 3, 13, CUR_BLACK);
++	cur_px(buf, sp, w, h, 2, 14, CUR_BLACK);
++	cur_px(buf, sp, w, h, 2, 15, CUR_BLACK);
++	cur_px(buf, sp, w, h, 1, 16, CUR_BLACK);
++	cur_px(buf, sp, w, h, 1, 17, CUR_BLACK);
++	/* White fill for shaft */
++	cur_px(buf, sp, w, h, 4, 12, CUR_WHITE);
++	cur_px(buf, sp, w, h, 4, 13, CUR_WHITE);
++	cur_px(buf, sp, w, h, 3, 14, CUR_WHITE);
++	cur_px(buf, sp, w, h, 3, 15, CUR_WHITE);
++	cur_px(buf, sp, w, h, 2, 16, CUR_WHITE);
++	cur_px(buf, sp, w, h, 2, 17, CUR_WHITE);
++}
++
++static void draw_cursor_text(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
++	/* I-beam cursor, centered at x=7 */
++	int cx = 7;
++	/* Top serif */
++	cur_hline(buf, sp, w, h, cx - 4, cx + 4, 0, CUR_BLACK);
++	cur_hline(buf, sp, w, h, cx - 3, cx + 3, 1, CUR_BLACK);
++	/* Vertical bar */
++	cur_vline(buf, sp, w, h, cx, 2, 17, CUR_BLACK);
++	cur_vline(buf, sp, w, h, cx - 1, 2, 17, CUR_WHITE);
++	cur_vline(buf, sp, w, h, cx + 1, 2, 17, CUR_WHITE);
++	/* Bottom serif */
++	cur_hline(buf, sp, w, h, cx - 3, cx + 3, 18, CUR_BLACK);
++	cur_hline(buf, sp, w, h, cx - 4, cx + 4, 19, CUR_BLACK);
++}
++
++static void draw_cursor_hand(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
++	/* Pointing hand — finger up, simplified */
++	/* Index finger */
++	cur_vline(buf, sp, w, h, 6, 0, 7, CUR_BLACK);
++	cur_vline(buf, sp, w, h, 7, 0, 7, CUR_WHITE);
++	cur_vline(buf, sp, w, h, 8, 0, 7, CUR_WHITE);
++	cur_vline(buf, sp, w, h, 9, 0, 7, CUR_BLACK);
++	/* Other fingers opening at y=8 */
++	for (int f = 0; f &lt; 4; f++) {
++		int bx = 3 + f * 3;
++		cur_vline(buf, sp, w, h, bx, 8, 12, CUR_BLACK);
++		cur_vline(buf, sp, w, h, bx + 1, 8, 12, CUR_WHITE);
++		cur_vline(buf, sp, w, h, bx + 2, 8, 12, CUR_BLACK);
++	}
++	/* Palm */
++	for (int y = 13; y &lt;= 18; y++) {
++		cur_px(buf, sp, w, h, 3, y, CUR_BLACK);
++		cur_hline(buf, sp, w, h, 4, 13, y, CUR_WHITE);
++		cur_px(buf, sp, w, h, 14, y, CUR_BLACK);
++	}
++	/* Bottom */
++	cur_hline(buf, sp, w, h, 3, 14, 19, CUR_BLACK);
++}
++
++static void draw_cursor_resize_ns(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
++	/* Vertical double-headed arrow, centered at (7, 10) */
++	int cx = 7;
++	/* Up arrow head */
++	for (int i = 0; i &lt; 5; i++) {
++		cur_hline(buf, sp, w, h, cx - i, cx + i, 4 + i, CUR_BLACK);
++		if (i &gt; 0)
++			cur_hline(buf, sp, w, h, cx - i + 1, cx + i - 1, 4 + i, CUR_WHITE);
++	}
++	cur_hline(buf, sp, w, h, cx - 4, cx + 4, 8, CUR_BLACK);
++	/* Shaft */
++	cur_vline(buf, sp, w, h, cx - 1, 9, 12, CUR_BLACK);
++	cur_vline(buf, sp, w, h, cx, 9, 12, CUR_WHITE);
++	cur_vline(buf, sp, w, h, cx + 1, 9, 12, CUR_BLACK);
++	/* Down arrow head */
++	cur_hline(buf, sp, w, h, cx - 4, cx + 4, 13, CUR_BLACK);
++	for (int i = 0; i &lt; 5; i++) {
++		cur_hline(buf, sp, w, h, cx - 4 + i, cx + 4 - i, 13 + i, CUR_BLACK);
++		if (i &gt; 0 &amp;&amp; 4 - i &gt; 0)
++			cur_hline(buf, sp, w, h, cx - 4 + i + 1, cx + 4 - i - 1, 13 + i, CUR_WHITE);
++	}
++}
++
++static void draw_cursor_resize_ew(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
++	/* Horizontal double-headed arrow, centered at (9, 7) */
++	int cy = 7;
++	/* Left arrow head */
++	for (int i = 0; i &lt; 5; i++) {
++		cur_vline(buf, sp, w, h, 2 + i, cy - i, cy + i, CUR_BLACK);
++		if (i &gt; 0)
++			cur_vline(buf, sp, w, h, 2 + i, cy - i + 1, cy + i - 1, CUR_WHITE);
++	}
++	cur_vline(buf, sp, w, h, 6, cy - 4, cy + 4, CUR_BLACK);
++	/* Shaft */
++	cur_hline(buf, sp, w, h, 7, 11, cy - 1, CUR_BLACK);
++	cur_hline(buf, sp, w, h, 7, 11, cy, CUR_WHITE);
++	cur_hline(buf, sp, w, h, 7, 11, cy + 1, CUR_BLACK);
++	/* Right arrow head */
++	cur_vline(buf, sp, w, h, 12, cy - 4, cy + 4, CUR_BLACK);
++	for (int i = 0; i &lt; 5; i++) {
++		cur_vline(buf, sp, w, h, 12 + i, cy - 4 + i, cy + 4 - i, CUR_BLACK);
++		if (i &gt; 0 &amp;&amp; 4 - i &gt; 0)
++			cur_vline(buf, sp, w, h, 12 + i, cy - 4 + i + 1, cy + 4 - i - 1, CUR_WHITE);
++	}
++}
++
++static void draw_cursor_resize_nwse(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
++	/* Diagonal (NW-SE) double arrow */
++	/* NW arrow head */
++	for (int i = 0; i &lt; 6; i++) {
++		cur_px(buf, sp, w, h, i, 0, CUR_BLACK);
++		cur_px(buf, sp, w, h, 0, i, CUR_BLACK);
+ 	}
++	for (int i = 1; i &lt; 5; i++) {
++		cur_px(buf, sp, w, h, i, 1, CUR_WHITE);
++		cur_px(buf, sp, w, h, 1, i, CUR_WHITE);
++	}
++	/* Diagonal shaft */
++	for (int i = 3; i &lt;= 14; i++) {
++		cur_px(buf, sp, w, h, i - 1, i, CUR_BLACK);
++		cur_px(buf, sp, w, h, i, i, CUR_WHITE);
++		cur_px(buf, sp, w, h, i + 1, i, CUR_BLACK);
++	}
++	/* SE arrow head */
++	for (int i = 0; i &lt; 6; i++) {
++		cur_px(buf, sp, w, h, 17 - i, 17, CUR_BLACK);
++		cur_px(buf, sp, w, h, 17, 17 - i, CUR_BLACK);
++	}
++	for (int i = 1; i &lt; 5; i++) {
++		cur_px(buf, sp, w, h, 17 - i, 16, CUR_WHITE);
++		cur_px(buf, sp, w, h, 16, 17 - i, CUR_WHITE);
++	}
++}
++
++static void draw_cursor_move(uint32_t* buf, uint32_t sp, uint32_t w, uint32_t h) {
++	/* Four-way arrow, centered at (9, 9) */
++	int cx = 9, cy = 9;
++	/* Horizontal bar */
++	cur_hline(buf, sp, w, h, 2, 16, cy - 1, CUR_BLACK);
++	cur_hline(buf, sp, w, h, 2, 16, cy, CUR_WHITE);
++	cur_hline(buf, sp, w, h, 2, 16, cy + 1, CUR_BLACK);
++	/* Vertical bar */
++	cur_vline(buf, sp, w, h, cx - 1, 2, 16, CUR_BLACK);
++	cur_vline(buf, sp, w, h, cx, 2, 16, CUR_WHITE);
++	cur_vline(buf, sp, w, h, cx + 1, 2, 16, CUR_BLACK);
++	/* Up arrow */
++	for (int i = 0; i &lt; 4; i++) {
++		cur_px(buf, sp, w, h, cx - i, 2 + i, CUR_BLACK);
++		cur_px(buf, sp, w, h, cx + i, 2 + i, CUR_BLACK);
++	}
++	/* Down arrow */
++	for (int i = 0; i &lt; 4; i++) {
++		cur_px(buf, sp, w, h, cx - i, 16 - i, CUR_BLACK);
++		cur_px(buf, sp, w, h, cx + i, 16 - i, CUR_BLACK);
++	}
++	/* Left arrow */
++	for (int i = 0; i &lt; 4; i++) {
++		cur_px(buf, sp, w, h, 2 + i, cy - i, CUR_BLACK);
++		cur_px(buf, sp, w, h, 2 + i, cy + i, CUR_BLACK);
++	}
++	/* Right arrow */
++	for (int i = 0; i &lt; 4; i++) {
++		cur_px(buf, sp, w, h, 16 - i, cy - i, CUR_BLACK);
++		cur_px(buf, sp, w, h, 16 - i, cy + i, CUR_BLACK);
++	}
++}
++
++/* Render the currently selected cursor into the cursor buffer.
++ * If a cursor image was loaded from the config, blit it directly;
++ * otherwise fall back to the built-in procedural shape. */
++static void render_cursor(uint32_t* buf, uint32_t stride_px, uint32_t w, uint32_t h) {
++	memset(buf, 0, h * stride_px * 4); /* clear to fully transparent */
++
++	/* Try loaded image first */
++	if (current_cursor &gt;= 0 &amp;&amp; current_cursor &lt; BGCE_CURSOR_COUNT &amp;&amp;
++	    config.cursors.images[current_cursor]) {
++		uint32_t* src = config.cursors.images[current_cursor];
++		for (uint32_t y = 0; y &lt; h; y++)
++			memcpy(buf + y * stride_px, src + y * w, w * sizeof(uint32_t));
++		return;
++	}
++
++	/* Built-in fallback */
++	switch (current_cursor) {
++	case BGCE_CURSOR_TEXT:        draw_cursor_text(buf, stride_px, w, h); break;
++	case BGCE_CURSOR_HAND:        draw_cursor_hand(buf, stride_px, w, h); break;
++	case BGCE_CURSOR_RESIZE_NS:   draw_cursor_resize_ns(buf, stride_px, w, h); break;
++	case BGCE_CURSOR_RESIZE_EW:   draw_cursor_resize_ew(buf, stride_px, w, h); break;
++	case BGCE_CURSOR_RESIZE_NWSE: draw_cursor_resize_nwse(buf, stride_px, w, h); break;
++	case BGCE_CURSOR_MOVE:        draw_cursor_move(buf, stride_px, w, h); break;
++	default:                      draw_cursor_default(buf, stride_px, w, h); break;
++	}
++}
++
++void set_cursor_type(enum BGCECursorType type) {
++	if (type &lt; 0 || type &gt;= BGCE_CURSOR_COUNT)
++		type = BGCE_CURSOR_DEFAULT;
++	if (type == current_cursor)
++		return;
++
++	current_cursor = type;
++
++	/* cur_map is the mmap'd DRM dumb buffer for the cursor */
++	if (!cur_map || cur_map == MAP_FAILED)
++		return;
++
++	uint32_t stride_px = cur_w; /* pitch in pixels (32bpp, tightly packed) */
++	render_cursor((uint32_t*)cur_map, stride_px, cur_w, cur_h);
++
++	/* Re-upload cursor to hardware */
++	drmModeSetCursor(server.drm_fd, server.crtc_id, cur_handle, cur_w, cur_h);
+ }
+ 
+ int setup_vt_handling(void) {
+@@ -350,7 +608,7 @@ int init_display() {
+ 	}
+ 	memset(cur_map, 0, cur_size);
+ 
+-	draw_cursor((uint8_t*)cur_map, cur_pitch, CURSOR_WIDTH, CURSOR_HEIGHT);
++	render_cursor((uint32_t*)cur_map, cur_w, CURSOR_WIDTH, CURSOR_HEIGHT);
+ 
+ #ifdef DRM_FORMAT_ARGB8888
+ 	{
+diff --git a/input.c b/input.c
+index 5bb225e..9e5a713 100644
+--- a/input.c
++++ b/input.c
+@@ -401,6 +401,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		// Stop drag/move on button release
+ 		if ((ev.code == BTN_LEFT || ev.code == BTN_RIGHT) &amp;&amp; drag.active) { // Only stop if it was an active drag of that type
+ 			printf("[BGCE] End of drag event.\n");
++			set_cursor_type(BGCE_CURSOR_DEFAULT);
+ 			if (drag.type == DRAG_MOVE) {
+ 				drag.active = 0;
+ 				drag.target = NULL;
+@@ -501,9 +502,11 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 
+ 		if (ev.code == BTN_RIGHT) {
+ 			drag.type = DRAG_RESIZE;
++			set_cursor_type(BGCE_CURSOR_RESIZE_NWSE);
+ 			printf("[BGCE] Resize event.\n");
+ 		} else {
+ 			drag.type = DRAG_MOVE;
++			set_cursor_type(BGCE_CURSOR_MOVE);
+ 			printf("[BGCE] Move event.\n");
+ 		}
+ 
+diff --git a/libbgce.c b/libbgce.c
+index 4718ecb..bc633d4 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -139,6 +139,21 @@ int bgce_move(int conn, int x, int y) {
+ 	return 0;
+ }
+ 
++/* Public API: Set cursor type */
++int bgce_set_cursor(int conn, enum BGCECursorType type) {
++	if (conn &lt; 0)
++		return -1;
++
++	struct BGCEMessage msg = {0};
++	msg.type = MSG_SET_CURSOR;
++	msg.data.cursor_request.cursor_type = (int32_t)type;
++
++	if (bgce_send_msg(conn, &amp;msg) &lt;= 0)
++		return -1;
++
++	return 0;
++}
++
+ /* Public API: Disconnect */
+ void bgce_disconnect(int conn) {
+ 	if (conn &gt;= 0) {
+diff --git a/loop.c b/loop.c
+index 0804d1a..46f6250 100644
+--- a/loop.c
++++ b/loop.c
+@@ -142,6 +142,14 @@ void* client_thread(void* arg) {
+ 
+ 			break;
+ 		}
++		case MSG_SET_CURSOR: {
++			int ctype = msg.data.cursor_request.cursor_type;
++			printf("[BGCE] Client requested cursor type %d\n", ctype);
++			/* Only the focused client may change the cursor */
++			if (server.focused_client == client)
++				set_cursor_type((enum BGCECursorType)ctype);
++			break;
++		}
+ 		default:
+ 			fprintf(stderr, "[BGCE] Unknown message type %d\n", msg.type);
+ 		}
+diff --git a/server.h b/server.h
+index ba883fa..17a39d6 100644
+--- a/server.h
++++ b/server.h
+@@ -110,6 +110,13 @@ struct shortcut {
+ 	char value[256]; // for builtin: "exit" or "screenshot"; for command: the command line to run
+ };
+ 
++// Cursor theme: per-type image data (ARGB, pre-scaled to CURSOR_WIDTH x CURSOR_HEIGHT)
++struct cursor_theme {
++	uint32_t* images[BGCE_CURSOR_COUNT]; // NULL = use built-in fallback
++	int hotspot_x[BGCE_CURSOR_COUNT];
++	int hotspot_y[BGCE_CURSOR_COUNT];
++};
++
+ // Background configuration for now
+ struct config {
+ 	BackgroundType type;
+@@ -119,6 +126,8 @@ struct config {
+ 
+ 	struct shortcut shortcuts[MAX_SHORTCUTS];
+ 	int shortcut_count;
++
++	struct cursor_theme cursors;
+ };
+ 
+ // Parse config file
+@@ -147,6 +156,8 @@ void release_display(void);
+ 
+ void set_drm_cursor(struct ServerState* srv, int x, int y);
+ 
++void set_cursor_type(enum BGCECursorType type);
++
+ void draw(struct ServerState* srv, struct Client cli);
+ 
+ void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
+diff --git a/test/test_background.sh b/test/test_background.sh
+new file mode 100755
+index 0000000..6512114
+--- /dev/null
++++ b/test/test_background.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++
++# Create a test directory for configuration
++mkdir -p /tmp/bgce
++
++# Create a test configuration file
++cat &gt; /tmp/bgce/config &lt;&lt; 'CONFIG_EOF'
++# BGCE Background Configuration
++background_type=image
++image_path=/usr/share/backgrounds/default.jpg
++scale_mode=tiled
++CONFIG_EOF
++
++# Create a simple test image if it doesn't exist
++if [ ! -f /usr/share/backgrounds/default.jpg ]; then
++    mkdir -p /usr/share/backgrounds
++    echo "Creating test image...
++" | convert -size 800x600 -pointsize 20 -fill white -draw "text 100,300 'BGCE Test Image'" gradient:blue-red /usr/share/backgrounds/default.jpg 2&gt;/dev/null || \
++    echo "Please install ImageMagick to create test image or provide your own image file"
++fi
++
++# Run the server with our test configuration
++echo "Running BGCE server with test configuration..."
++echo "Config path: /tmp/bgce/config"
++echo "Image path: /usr/share/backgrounds/default.jpg"
++
++# Build the project
++make clean &amp;&amp; make
++
++# Run the server with our test configuration
++LD_LIBRARY_PATH=. ./bgce --config /tmp/bgce/config
+</pre>

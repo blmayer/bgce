@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce dea4830</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit dea4830
+parent <a href=commit-c5a6c3b.html>c5a6c3b</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-12-08T23:22:22-03:00
+
+    fixed sending scroll events to clients
+
+<a href=tree-dea4830.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/input.c b/input.c
+index dbc64d6..0aebf25 100644
+--- a/input.c
++++ b/input.c
+@@ -267,7 +267,7 @@ static int handle_input_event(struct input_event ev) {
+ 		}
+ 
+ 		if (!alt_down) {
+-			return 0; // Alt + Left click down
++			return 0; // Left click
+ 		}
+ 
+ 		printf("[BGCE] Alt is pressed, starting move/resize.\n");
+@@ -341,8 +341,8 @@ static int handle_input_event(struct input_event ev) {
+ 				drag.dx += dx;
+ 				drag.dy += dy;
+ 			}
++			return 1;
+ 		}
+-		return 1;
+ 	}
+ 
+ 	// This means nothing was handled
+@@ -391,10 +391,10 @@ void* input_loop(void* arg) {
+ 				struct InputEvent e = {0};
+ 				e.device = server.input.devs[i];
+ 				e.code = ev.code;
++				e.value = ev.value;
+ 
+ 				switch (ev.type) {
+ 				case EV_KEY:
+-					e.value = ev.value;
+ 					if (ev.code != BTN_LEFT &amp;&amp; ev.code != BTN_RIGHT) {
+ 						break;
+ 					}
+</pre>

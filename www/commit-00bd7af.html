@@ -1,0 +1,1081 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 00bd7af</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 00bd7af
+parent <a href=commit-fb43a29.html>fb43a29</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-03T15:10:23-03:00
+
+    WIP: add zoomable/pannable virtual desktop
+
+    Virtual canvas is 2x display in each axis (4x area) with zoom 0.5–4.0.
+    Alt+scroll zooms toward the cursor; Alt+left-drag on empty space pans.
+
+<a href=tree-00bd7af.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 0e69486..dfc007a 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -31,6 +31,7 @@ Implement a minimal Linux graphical environment that runs without root, manages
+ ### High-evel features
+ [X] Implement config file
+ [X] Implement taking screenshots
++[X] Implement zoomable/pannable virtual desktop (4× area, zoom 50%–400%)
+ [ ] Implement a cache file to memorize the last location of clients, in order to reopen them on the same place
+ 
+ ### Protocol features
+@@ -41,6 +42,15 @@ Implement a minimal Linux graphical environment that runs without root, manages
+ [ ] Create more tests
+   - [ ] test if events go to the correct client and only the one
+ 
++### Zoom / pan controls
++- **Alt + scroll**: zoom in/out toward the cursor (range 0.5×–4.0×)
++- **Alt + left-drag on empty space**: pan the viewport over the virtual desktop
++- **Alt + left-drag on a client**: move window (existing)
++- **Alt + right-drag on a client**: resize window (existing)
++- Virtual desktop is 2× the physical resolution in each axis (4× area). Client
++  positions and buffer sizes are in world pixels; the compositor scales to the
++  screen using the current zoom and pan.
++
+ 
+ ---
+ 
+diff --git a/README.md b/README.md
+index 8b0a365..99e5632 100644
+--- a/README.md
++++ b/README.md
+@@ -59,11 +59,15 @@ I also posted a video on my blog:
+ ### Input
+ - The server listens to keyboard and mouse events.
+ - Focus determines which client receives input.
++- **Zoom / pan (virtual desktop):**
++  - `Alt` + scroll wheel — zoom in/out (50%–400%), centered on the cursor
++  - `Alt` + left-drag on empty desktop — pan the viewport
++  - The virtual desktop is **2×** the physical resolution in each axis (**4×** the screen area), so you can place work areas far apart and zoom into focus when needed
+ 
+ 
+ ### Drawing
+-- Each client owns its own off-screen buffer.
+-- The server composites buffers into the display based on Z-order.
++- Each client owns its own off-screen buffer (sizes and positions are in virtual-desktop / world pixels).
++- The server composites buffers into the display based on Z-order, scaled by the current zoom and pan.
+ 
+ 
+ ### Privileges
+diff --git a/display.c b/display.c
+index 0e279b3..83e1aca 100644
+--- a/display.c
++++ b/display.c
+@@ -23,6 +23,7 @@
+ #include &lt;fcntl.h&gt;
+ #include &lt;linux/kd.h&gt;
+ #include &lt;linux/vt.h&gt;
++#include &lt;math.h&gt;
+ #include &lt;stdbool.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;stdio.h&gt;
+@@ -651,74 +652,101 @@ int init_display() {
+ 	return 0;
+ }
+ 
+-void draw(struct ServerState* srv, struct Client cli) {
+-	if (!srv || !srv-&gt;framebuffer || !cli.buffer) {
+-		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
+-		return;
+-	}
+-
+-	uint32_t screen_w = srv-&gt;display_w;
+-	uint32_t screen_h = srv-&gt;display_h;
+-
+-	uint32_t client_w = cli.width;
+-	uint32_t client_h = cli.height;
+-
+-	int cx = cli.x;
+-	int cy = cli.y;
+-
+-	uint32_t* dst = (uint32_t*)srv-&gt;framebuffer;
+-	uint32_t* src = (uint32_t*)cli.buffer;
+-
+-	/* ---------------- Clip Region ---------------- */
+-
+-	int start_x = cx &lt; 0 ? 0 : cx;
+-	int start_y = cy &lt; 0 ? 0 : cy;
+-
+-	int end_x = cx + client_w;
+-	int end_y = cy + client_h;
++/* ------------------------------------------------------------------
++ * Viewport / coordinate transforms
++ * ------------------------------------------------------------------ */
++
++void screen_to_world(const struct ServerState* srv, float sx, float sy,
++                     float* wx, float* wy) {
++	float z = srv-&gt;zoom &gt; 0.0f ? srv-&gt;zoom : 1.0f;
++	if (wx)
++		*wx = sx / z + srv-&gt;pan_x;
++	if (wy)
++		*wy = sy / z + srv-&gt;pan_y;
++}
+ 
+-	if (end_x &gt; (int)screen_w)
+-		end_x = screen_w;
+-	if (end_y &gt; (int)screen_h)
+-		end_y = screen_h;
++void world_to_screen(const struct ServerState* srv, float wx, float wy,
++                     float* sx, float* sy) {
++	if (sx)
++		*sx = (wx - srv-&gt;pan_x) * srv-&gt;zoom;
++	if (sy)
++		*sy = (wy - srv-&gt;pan_y) * srv-&gt;zoom;
++}
+ 
+-	/* Entire window is outside screen */
+-	if (start_x &gt;= end_x || start_y &gt;= end_y) {
+-		fprintf(stderr, "[BGCE] Draw: Client entirely outside screen\n");
++void clamp_viewport(struct ServerState* srv) {
++	if (!srv)
+ 		return;
++	if (srv-&gt;zoom &lt; BGCE_ZOOM_MIN)
++		srv-&gt;zoom = BGCE_ZOOM_MIN;
++	if (srv-&gt;zoom &gt; BGCE_ZOOM_MAX)
++		srv-&gt;zoom = BGCE_ZOOM_MAX;
++
++	float vis_w = (float)srv-&gt;display_w / srv-&gt;zoom;
++	float vis_h = (float)srv-&gt;display_h / srv-&gt;zoom;
++	float max_x = (float)srv-&gt;virtual_w - vis_w;
++	float max_y = (float)srv-&gt;virtual_h - vis_h;
++
++	if (max_x &lt; 0.0f) {
++		/* View larger than world — center the desktop */
++		srv-&gt;pan_x = max_x * 0.5f;
++	} else {
++		if (srv-&gt;pan_x &lt; 0.0f)
++			srv-&gt;pan_x = 0.0f;
++		if (srv-&gt;pan_x &gt; max_x)
++			srv-&gt;pan_x = max_x;
+ 	}
+ 
+-	int src_start_x = start_x - cx;
+-	int src_start_y = start_y - cy;
+-
+-	int copy_w = end_x - start_x;
+-	int copy_h = end_y - start_y;
+-
+-	uint32_t screen_stride_pixels = screen_w; /* No stride stored → compute */
+-
+-	/* ------------- Copy to DRM FB --------------- */
+-
+-	for (int y = 0; y &lt; copy_h; y++) {
+-		uint32_t* drow = dst + (start_y + y) * screen_stride_pixels + start_x;
+-		uint32_t* srow = src + (src_start_y + y) * client_w + src_start_x;
+-		memcpy(drow, srow, copy_w * 4);
++	if (max_y &lt; 0.0f) {
++		srv-&gt;pan_y = max_y * 0.5f;
++	} else {
++		if (srv-&gt;pan_y &lt; 0.0f)
++			srv-&gt;pan_y = 0.0f;
++		if (srv-&gt;pan_y &gt; max_y)
++			srv-&gt;pan_y = max_y;
+ 	}
+ }
+ 
++/* Screen-space axis-aligned bounds of a client (exclusive end). */
++static void client_screen_bounds(const struct ServerState* srv, const struct Client* cli,
++                                 int* sx0, int* sy0, int* sx1, int* sy1) {
++	float fsx0, fsy0, fsx1, fsy1;
++	world_to_screen(srv, (float)cli-&gt;x, (float)cli-&gt;y, &amp;fsx0, &amp;fsy0);
++	world_to_screen(srv, (float)(cli-&gt;x + cli-&gt;width), (float)(cli-&gt;y + cli-&gt;height),
++	                &amp;fsx1, &amp;fsy1);
++	*sx0 = (int)floorf(fsx0);
++	*sy0 = (int)floorf(fsy0);
++	*sx1 = (int)ceilf(fsx1);
++	*sy1 = (int)ceilf(fsy1);
++}
++
++/*
++ * Nearest-neighbour blit of a client into a screen-space damage rect.
++ * Client geometry is in world coordinates; the viewport (pan/zoom) maps
++ * world → screen.
++ */
+ static void blit_client_overlap(struct ServerState* srv, const struct Client* cli,
+                                 int rx0, int ry0, int rx1, int ry1) {
+ 	if (!srv || !srv-&gt;framebuffer || !cli || !cli-&gt;buffer)
+ 		return;
++	if (cli-&gt;width == 0 || cli-&gt;height == 0)
++		return;
++
++	int csx0, csy0, csx1, csy1;
++	client_screen_bounds(srv, cli, &amp;csx0, &amp;csy0, &amp;csx1, &amp;csy1);
+ 
+-	int cx0 = (int)cli-&gt;x;
+-	int cy0 = (int)cli-&gt;y;
+-	int cx1 = (int)cli-&gt;x + (int)cli-&gt;width;
+-	int cy1 = (int)cli-&gt;y + (int)cli-&gt;height;
++	int ox0 = rx0 &gt; csx0 ? rx0 : csx0;
++	int oy0 = ry0 &gt; csy0 ? ry0 : csy0;
++	int ox1 = rx1 &lt; csx1 ? rx1 : csx1;
++	int oy1 = ry1 &lt; csy1 ? ry1 : csy1;
+ 
+-	int ox0 = rx0 &gt; cx0 ? rx0 : cx0;
+-	int oy0 = ry0 &gt; cy0 ? ry0 : cy0;
+-	int ox1 = rx1 &lt; cx1 ? rx1 : cx1;
+-	int oy1 = ry1 &lt; cy1 ? ry1 : cy1;
++	if (ox0 &lt; 0)
++		ox0 = 0;
++	if (oy0 &lt; 0)
++		oy0 = 0;
++	if (ox1 &gt; (int)srv-&gt;display_w)
++		ox1 = (int)srv-&gt;display_w;
++	if (oy1 &gt; (int)srv-&gt;display_h)
++		oy1 = (int)srv-&gt;display_h;
+ 
+ 	if (ox0 &gt;= ox1 || oy0 &gt;= oy1)
+ 		return;
+@@ -726,11 +754,59 @@ static void blit_client_overlap(struct ServerState* srv, const struct Client* cl
+ 	uint32_t screen_w = srv-&gt;display_w;
+ 	uint32_t* dst = (uint32_t*)srv-&gt;framebuffer;
+ 	uint32_t* src = (uint32_t*)cli-&gt;buffer;
++	const int cw = (int)cli-&gt;width;
++	const int ch = (int)cli-&gt;height;
++	const float inv_z = 1.0f / srv-&gt;zoom;
++	const float pan_x = srv-&gt;pan_x;
++	const float pan_y = srv-&gt;pan_y;
++	const float cli_x = (float)cli-&gt;x;
++	const float cli_y = (float)cli-&gt;y;
++
++	/* Fast path: identity transform (zoom≈1, pan integer, aligned). */
++	if (fabsf(srv-&gt;zoom - 1.0f) &lt; 1e-6f &amp;&amp;
++	    fabsf(pan_x - roundf(pan_x)) &lt; 1e-6f &amp;&amp;
++	    fabsf(pan_y - roundf(pan_y)) &lt; 1e-6f) {
++		int ipx = (int)roundf(pan_x);
++		int ipy = (int)roundf(pan_y);
++		int wox0 = ox0 + ipx;
++		int woy0 = oy0 + ipy;
++		int wox1 = ox1 + ipx;
++		int woy1 = oy1 + ipy;
++
++		int cx0 = (int)cli-&gt;x;
++		int cy0 = (int)cli-&gt;y;
++		int cx1 = cx0 + cw;
++		int cy1 = cy0 + ch;
++
++		int ix0 = wox0 &gt; cx0 ? wox0 : cx0;
++		int iy0 = woy0 &gt; cy0 ? woy0 : cy0;
++		int ix1 = wox1 &lt; cx1 ? wox1 : cx1;
++		int iy1 = woy1 &lt; cy1 ? woy1 : cy1;
++		if (ix0 &gt;= ix1 || iy0 &gt;= iy1)
++			return;
++
++		for (int wy = iy0; wy &lt; iy1; wy++) {
++			int sy = wy - ipy;
++			uint32_t* drow = dst + sy * (int)screen_w + (ix0 - ipx);
++			uint32_t* srow = src + (wy - cy0) * cw + (ix0 - cx0);
++			memcpy(drow, srow, (size_t)(ix1 - ix0) * 4);
++		}
++		return;
++	}
+ 
+-	for (int y = oy0; y &lt; oy1; y++) {
+-		uint32_t* drow = dst + y * (int)screen_w + ox0;
+-		uint32_t* srow = src + (y - cy0) * (int)cli-&gt;width + (ox0 - cx0);
+-		memcpy(drow, srow, (size_t)(ox1 - ox0) * 4);
++	for (int sy = oy0; sy &lt; oy1; sy++) {
++		float wy = (float)sy * inv_z + pan_y;
++		int icy = (int)floorf(wy - cli_y);
++		if (icy &lt; 0 || icy &gt;= ch)
++			continue;
++		uint32_t* drow = dst + sy * (int)screen_w;
++		uint32_t* srow = src + icy * cw;
++		for (int sx = ox0; sx &lt; ox1; sx++) {
++			float wx = (float)sx * inv_z + pan_x;
++			int icx = (int)floorf(wx - cli_x);
++			if (icx &gt;= 0 &amp;&amp; icx &lt; cw)
++				drow[sx] = srow[icx];
++		}
+ 	}
+ }
+ 
+@@ -766,110 +842,78 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
+ 	free(stack);
+ }
+ 
+-/*
+- * The situation:
+- *
+- * dx&lt;0:                             dx&gt;0:  . (x,y)
+- * dy&lt;0:  +----------------+         dy&gt;0:  +----------------+
+- *        |     (x,y)      | dx             |     rect A     | dy
+- *        |    .           +----+           +----+-----------+----+
+- *        |                |    |           |    |                |
+- *        |                |    |           |    |                |
+- *        |                |    |           |    |                |
+- *        |                | B  |           |  B |                |
+- *        +----+-----------+----+           +----+                |
+- *          dy |     rect A     |             dx |                |
+- *             +----------------+                +----------------+
+- *
+- * So we redraw the rectangles:
+- * A: (x, y) (x+width, y+dy) and
+- * B: (x, y+dy) (x+dx, y+height)
+- */
+-void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy) {
+-	if (!srv || !srv-&gt;framebuffer) {
+-		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
++void redraw_all(struct ServerState* srv) {
++	if (!srv || !srv-&gt;framebuffer)
+ 		return;
+-	}
++	composite_chain_to_rect(srv, srv-&gt;clients, 0, 0,
++	                        (int)srv-&gt;display_w, (int)srv-&gt;display_h);
++}
+ 
+-	uint32_t width = c.width;
+-	uint32_t height = c.height;
+-	uint32_t screen_w = srv-&gt;display_w;
+-	uint32_t screen_h = srv-&gt;display_h;
+-
+-	/* Rectangle A: exposed area in y-direction (top or bottom strip of the old location) */
+-	int rect_a_start_x = (int)c.x;
+-	int rect_a_end_x = (int)c.x + (int)width;
+-	int rect_a_start_y;
+-	int rect_a_end_y;
+-	if (dy &gt; 0) {
+-		rect_a_start_y = (int)c.y;
+-		rect_a_end_y = (int)c.y + dy;
+-	} else {
+-		rect_a_start_y = (int)c.y + (int)height + dy;
+-		rect_a_end_y = (int)c.y + (int)height;
++void draw(struct ServerState* srv, struct Client cli) {
++	if (!srv || !srv-&gt;framebuffer || !cli.buffer) {
++		fprintf(stderr, "[BGCE] Draw: Invalid server, framebuffer, or client buffer\n");
++		return;
+ 	}
+ 
+-	/* Rectangle B: exposed area in x-direction (left or right strip of the old location) */
+-	int rect_b_start_x;
+-	int rect_b_end_x;
+-	if (dx &gt; 0) {
+-		rect_b_start_x = (int)c.x;
+-		rect_b_end_x = (int)c.x + dx;
+-	} else {
+-		rect_b_start_x = (int)c.x + (int)width + dx;
+-		rect_b_end_x = (int)c.x + (int)width;
+-	}
+-
+-	int rect_b_start_y = (int)c.y;
+-	int rect_b_end_y = (int)c.y + (int)height;
+-	/* Avoid overdrawing the corner already covered by rect A (optional) */
+-	if (dy &gt; 0)
+-		rect_b_start_y += dy;
+-	if (dy &lt; 0)
+-		rect_b_end_y += dy;
+-
+-	/* Clip to screen boundaries */
+-	if (rect_a_start_x &lt; 0)
+-		rect_a_start_x = 0;
+-	if (rect_a_start_y &lt; 0)
+-		rect_a_start_y = 0;
+-	if (rect_a_end_x &gt; (int)screen_w)
+-		rect_a_end_x = (int)screen_w;
+-	if (rect_a_end_y &gt; (int)screen_h)
+-		rect_a_end_y = (int)screen_h;
+-
+-	if (rect_b_start_x &lt; 0)
+-		rect_b_start_x = 0;
+-	if (rect_b_start_y &lt; 0)
+-		rect_b_start_y = 0;
+-	if (rect_b_end_x &gt; (int)screen_w)
+-		rect_b_end_x = (int)screen_w;
+-	if (rect_b_end_y &gt; (int)screen_h)
+-		rect_b_end_y = (int)screen_h;
+-
+-	/* Composite underlying clients (background -&gt; ... -&gt; topmost behind 'c') */
+-	if (dy &amp;&amp; rect_a_start_x &lt; rect_a_end_x &amp;&amp; rect_a_start_y &lt; rect_a_end_y) {
+-		composite_chain_to_rect(srv, c.next, rect_a_start_x, rect_a_start_y, rect_a_end_x, rect_a_end_y);
+-	}
+-	if (dx &amp;&amp; rect_b_start_x &lt; rect_b_end_x &amp;&amp; rect_b_start_y &lt; rect_b_end_y) {
+-		composite_chain_to_rect(srv, c.next, rect_b_start_x, rect_b_start_y, rect_b_end_x, rect_b_end_y);
+-	}
++	int sx0, sy0, sx1, sy1;
++	client_screen_bounds(srv, &amp;cli, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1);
++
++	if (sx0 &lt; 0)
++		sx0 = 0;
++	if (sy0 &lt; 0)
++		sy0 = 0;
++	if (sx1 &gt; (int)srv-&gt;display_w)
++		sx1 = (int)srv-&gt;display_w;
++	if (sy1 &gt; (int)srv-&gt;display_h)
++		sy1 = (int)srv-&gt;display_h;
++
++	if (sx0 &gt;= sx1 || sy0 &gt;= sy1)
++		return;
++
++	blit_client_overlap(srv, &amp;cli, sx0, sy0, sx1, sy1);
+ }
+-static void redraw_exposed_rect(struct ServerState* srv, const struct Client* resized_client,
+-                                 int exposed_x, int exposed_y, int exposed_width, int exposed_height) {
+-	if (exposed_width &lt;= 0 || exposed_height &lt;= 0) {
+-		return; // Nothing to draw
++
++/*
++ * Redraw screen regions exposed when a client moves by (wdx, wdy) in
++ * world space.  `c` is still at the old position when this is called.
++ * dx/dy here are world-space deltas (not screen pixels).
++ */
++void redraw_region(struct ServerState* srv, struct Client c, int wdx, int wdy) {
++	if (!srv || !srv-&gt;framebuffer) {
++		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
++		return;
+ 	}
+ 
+-	/* Composite everything behind the resized client into the exposed rectangle.
+-	 * Must be composed bottom-&gt;top to preserve correct stacking.
+-	 */
+-	composite_chain_to_rect(srv,
+-	                        resized_client ? resized_client-&gt;next : NULL,
+-	                        exposed_x,
+-	                        exposed_y,
+-	                        exposed_x + exposed_width,
+-	                        exposed_y + exposed_height);
++	/* Screen bounds of the old position */
++	int ox0, oy0, ox1, oy1;
++	client_screen_bounds(srv, &amp;c, &amp;ox0, &amp;oy0, &amp;ox1, &amp;oy1);
++
++	/* Screen bounds of the new position */
++	struct Client moved = c;
++	moved.x = (uint32_t)((int)c.x + wdx);
++	moved.y = (uint32_t)((int)c.y + wdy);
++	int nx0, ny0, nx1, ny1;
++	client_screen_bounds(srv, &amp;moved, &amp;nx0, &amp;ny0, &amp;nx1, &amp;ny1);
++
++	/* Union of old and new (the moved window will be redrawn by draw()) */
++	int ux0 = ox0 &lt; nx0 ? ox0 : nx0;
++	int uy0 = oy0 &lt; ny0 ? oy0 : ny0;
++	int ux1 = ox1 &gt; nx1 ? ox1 : nx1;
++	int uy1 = oy1 &gt; ny1 ? oy1 : ny1;
++
++	if (ux0 &lt; 0)
++		ux0 = 0;
++	if (uy0 &lt; 0)
++		uy0 = 0;
++	if (ux1 &gt; (int)srv-&gt;display_w)
++		ux1 = (int)srv-&gt;display_w;
++	if (uy1 &gt; (int)srv-&gt;display_h)
++		uy1 = (int)srv-&gt;display_h;
++
++	/* Fill the union with everything behind the moving client; caller
++	 * then draw()s the client on top at its new position. */
++	if (ux0 &lt; ux1 &amp;&amp; uy0 &lt; uy1)
++		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
+ }
+ 
+ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
+@@ -878,29 +922,37 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
+ 		return;
+ 	}
+ 
+-	// Calculate the client's old dimensions
+-	int old_width = c.width - dx;
+-	int old_height = c.height - dy;
+-
+-	// Handle horizontal shrinkage (area on the right)
+-	if (dx &lt; 0) {
+-		int exposed_x = c.x + c.width; // Start of the exposed area
+-		int exposed_y = c.y;
+-		int exposed_width = -dx;       // The amount it shrunk
+-		int exposed_height = old_height; // This should be the old height
+-
+-		redraw_exposed_rect(srv, &amp;c, exposed_x, exposed_y, exposed_width, exposed_height);
+-	}
+-
+-	// Handle vertical shrinkage (area at the bottom)
+-	if (dy &lt; 0) {
+-		int exposed_x = c.x;
+-		int exposed_y = c.y + c.height; // Start of the exposed area
+-		int exposed_width = old_width;   // This should be the old width
+-		int exposed_height = -dy;       // The amount it shrunk
+-
+-		redraw_exposed_rect(srv, &amp;c, exposed_x, exposed_y, exposed_width, exposed_height);
+-	}
++	/*
++	 * With an arbitrary zoom/pan transform it is simplest and correct to
++	 * recompose the screen bounds of the old (larger) and new sizes.
++	 * `c` already has the new size; old size = new - (dx,dy).
++	 */
++	struct Client old = c;
++	old.width = (uint32_t)((int)c.width - dx);
++	old.height = (uint32_t)((int)c.height - dy);
++
++	int ox0, oy0, ox1, oy1;
++	int nx0, ny0, nx1, ny1;
++	client_screen_bounds(srv, &amp;old, &amp;ox0, &amp;oy0, &amp;ox1, &amp;oy1);
++	client_screen_bounds(srv, &amp;c, &amp;nx0, &amp;ny0, &amp;nx1, &amp;ny1);
++
++	int ux0 = ox0 &lt; nx0 ? ox0 : nx0;
++	int uy0 = oy0 &lt; ny0 ? oy0 : ny0;
++	int ux1 = ox1 &gt; nx1 ? ox1 : nx1;
++	int uy1 = oy1 &gt; ny1 ? oy1 : ny1;
++
++	if (ux0 &lt; 0)
++		ux0 = 0;
++	if (uy0 &lt; 0)
++		uy0 = 0;
++	if (ux1 &gt; (int)srv-&gt;display_w)
++		ux1 = (int)srv-&gt;display_w;
++	if (uy1 &gt; (int)srv-&gt;display_h)
++		uy1 = (int)srv-&gt;display_h;
++
++	/* Everything behind the resized client into the union; draw() later. */
++	if (ux0 &lt; ux1 &amp;&amp; uy0 &lt; uy1)
++		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
+ }
+ 
+ void release_display(void) {
+diff --git a/input.c b/input.c
+index 9e5a713..cca0330 100644
+--- a/input.c
++++ b/input.c
+@@ -6,6 +6,7 @@
+ #include &lt;fcntl.h&gt;
+ #include &lt;linux/input.h&gt;
+ #include &lt;linux/kd.h&gt;
++#include &lt;math.h&gt;
+ #include &lt;poll.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+@@ -31,9 +32,13 @@ struct {
+ 	struct Client* target;
+ 	int dx;
+ 	int dy;
++	/* Sub-pixel accumulators so fine zoom still moves windows smoothly */
++	float acc_x;
++	float acc_y;
+ 	enum {
+ 		DRAG_MOVE,
+-		DRAG_RESIZE
++		DRAG_RESIZE,
++		DRAG_PAN
+ 	} type;
+ } drag;
+ 
+@@ -89,19 +94,57 @@ int resize_buffer(struct Client* c, int dx, int dy) {
+ 	return 1;
+ }
+ 
++/* Pick topmost non-background client under screen-space (x, y). */
+ struct Client* pick_client(int x, int y) {
+-	// Iterate through clients to find the topmost client under the cursor
++	float wx, wy;
++	screen_to_world(&amp;server, (float)x, (float)y, &amp;wx, &amp;wy);
++
+ 	struct Client* c = server.clients;
+ 	struct Client* picked = NULL;
+ 	while (c) {
+-		if (x &gt;= c-&gt;x &amp;&amp; x &lt;= (c-&gt;x + c-&gt;width) &amp;&amp;
+-		    y &gt;= c-&gt;y &amp;&amp; y &lt;= (c-&gt;y + c-&gt;height)) {
++		if (wx &gt;= (float)c-&gt;x &amp;&amp; wx &lt; (float)(c-&gt;x + c-&gt;width) &amp;&amp;
++		    wy &gt;= (float)c-&gt;y &amp;&amp; wy &lt; (float)(c-&gt;y + c-&gt;height)) {
+ 			picked = c;
+ 			break;
+ 		}
+ 		c = c-&gt;next;
+ 	}
+-	return (picked &amp;&amp; picked-&gt;z &gt; 0) ? picked : NULL; // avoid getting the background
++	return (picked &amp;&amp; picked-&gt;z &gt; 0) ? picked : NULL; /* skip background */
++}
++
++/* Convert a screen-pixel delta to an integer world-pixel delta, with
++ * fractional accumulation so slow drags still move at high zoom. */
++static void screen_delta_to_world(float sdx, float sdy, float* acc_x, float* acc_y,
++                                  int* wdx, int* wdy) {
++	float z = server.zoom &gt; 0.0f ? server.zoom : 1.0f;
++	*acc_x += sdx / z;
++	*acc_y += sdy / z;
++	*wdx = (int)truncf(*acc_x);
++	*wdy = (int)truncf(*acc_y);
++	*acc_x -= (float)*wdx;
++	*acc_y -= (float)*wdy;
++}
++
++static void apply_zoom_at_cursor(float factor) {
++	float old_zoom = server.zoom;
++	float new_zoom = old_zoom * factor;
++	if (new_zoom &lt; BGCE_ZOOM_MIN)
++		new_zoom = BGCE_ZOOM_MIN;
++	if (new_zoom &gt; BGCE_ZOOM_MAX)
++		new_zoom = BGCE_ZOOM_MAX;
++	if (fabsf(new_zoom - old_zoom) &lt; 1e-6f)
++		return;
++
++	/* Keep the world point under the cursor fixed on screen. */
++	float wx, wy;
++	screen_to_world(&amp;server, (float)mouse_x, (float)mouse_y, &amp;wx, &amp;wy);
++	server.zoom = new_zoom;
++	server.pan_x = wx - (float)mouse_x / new_zoom;
++	server.pan_y = wy - (float)mouse_y / new_zoom;
++	clamp_viewport(&amp;server);
++	redraw_all(&amp;server);
++	printf("[BGCE] Zoom: %.2f  pan=(%.1f, %.1f)\n",
++	       server.zoom, server.pan_x, server.pan_y);
+ }
+ 
+ int init_input(void) {
+@@ -342,8 +385,10 @@ static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t ke
+ /*
+  * Keyboard shortcuts are configured via the config file ([shortcuts] section).
+  * Built-in behavior for mouse modifiers:
+- *  ALT + LEFT_CLICK + DRAG: move
+- *  ALT + RIGHT_CLICK + DRAG: resize
++ *  ALT + LEFT_CLICK + DRAG on a client: move window
++ *  ALT + RIGHT_CLICK + DRAG on a client: resize window
++ *  ALT + LEFT_CLICK + DRAG on empty space: pan the desktop
++ *  ALT + SCROLL: zoom in/out (centered on cursor)
+  *
+  *  Returns if shortcut was handled
+  */
+@@ -398,25 +443,25 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			alt_down = 0;
+ 		}
+ 
+-		// Stop drag/move on button release
+-		if ((ev.code == BTN_LEFT || ev.code == BTN_RIGHT) &amp;&amp; drag.active) { // Only stop if it was an active drag of that type
++		// Stop drag/move/pan on button release
++		if ((ev.code == BTN_LEFT || ev.code == BTN_RIGHT) &amp;&amp; drag.active) {
+ 			printf("[BGCE] End of drag event.\n");
+ 			set_cursor_type(BGCE_CURSOR_DEFAULT);
+-			if (drag.type == DRAG_MOVE) {
++
++			if (drag.type == DRAG_MOVE || drag.type == DRAG_PAN) {
+ 				drag.active = 0;
+ 				drag.target = NULL;
++				drag.acc_x = 0;
++				drag.acc_y = 0;
+ 				return 1;
+ 			}
+ 
++			/* DRAG_RESIZE */
+ 			struct Client* c = drag.target;
+-			if (resize_buffer(c, drag.dx, drag.dy)) {
++			if (c &amp;&amp; resize_buffer(c, drag.dx, drag.dy)) {
+ 				printf("[BGCE] Redrawing dx=%d dy=%d.\n", drag.dx, drag.dy);
+ 				if (drag.dx &lt; 0 || drag.dy &lt; 0) {
+-					redraw_from_resize(
+-					        &amp;server,
+-					        *c,
+-					        drag.dx,
+-					        drag.dy);
++					redraw_from_resize(&amp;server, *c, drag.dx, drag.dy);
+ 				}
+ 				draw(&amp;server, *c);
+ 
+@@ -431,7 +476,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			}
+ 			drag.active = 0;
+ 			drag.target = NULL;
+-
++			drag.acc_x = 0;
++			drag.acc_y = 0;
+ 			return 1;
+ 		}
+ 	}
+@@ -439,9 +485,30 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 	if (ev.type == EV_KEY &amp;&amp; (ev.code == BTN_LEFT || ev.code == BTN_RIGHT) &amp;&amp; ev.value == 1) {
+ 		printf("[BGCE] Click detected at (%d, %d).\n", mouse_x, mouse_y);
+ 
+-		/* switch focus */
+ 		struct Client* c = pick_client(mouse_x, mouse_y);
+ 		struct Client* old_focus = server.focused_client;
++
++		/* Alt + left click on empty space → pan the desktop */
++		if (!c &amp;&amp; alt_down &amp;&amp; ev.code == BTN_LEFT) {
++			if (old_focus) {
++				struct BGCEMessage lost = {0};
++				lost.type = MSG_FOCUS_CHANGE;
++				lost.data.focus_event.state = 0;
++				bgce_send_msg(old_focus-&gt;fd, &amp;lost);
++			}
++			server.focused_client = NULL;
++			drag.active = 1;
++			drag.target = NULL;
++			drag.type = DRAG_PAN;
++			drag.dx = 0;
++			drag.dy = 0;
++			drag.acc_x = 0;
++			drag.acc_y = 0;
++			set_cursor_type(BGCE_CURSOR_MOVE);
++			printf("[BGCE] Pan desktop started.\n");
++			return 1;
++		}
++
+ 		if (!c) {
+ 			if (old_focus) {
+ 				struct BGCEMessage lost = {0};
+@@ -499,6 +566,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		drag.target = c;
+ 		drag.dx = 0;
+ 		drag.dy = 0;
++		drag.acc_x = 0;
++		drag.acc_y = 0;
+ 
+ 		if (ev.code == BTN_RIGHT) {
+ 			drag.type = DRAG_RESIZE;
+@@ -513,6 +582,18 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		return 1;
+ 	}
+ 
++	/* Alt + scroll wheel → zoom toward cursor */
++	if (ev.type == EV_REL &amp;&amp; ev.code == REL_WHEEL &amp;&amp; alt_down) {
++		/* Positive value = scroll up = zoom in */
++		float factor = (ev.value &gt; 0) ? BGCE_ZOOM_STEP : (1.0f / BGCE_ZOOM_STEP);
++		int steps = ev.value &gt;= 0 ? ev.value : -ev.value;
++		if (steps &lt; 1)
++			steps = 1;
++		for (int i = 0; i &lt; steps; i++)
++			apply_zoom_at_cursor(factor);
++		return 1;
++	}
++
+ 	if (ev.type == EV_REL) {
+ 		int dx = 0;
+ 		int dy = 0;
+@@ -522,6 +603,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			break;
+ 		case REL_Y:
+ 			dy += ev.value;
++			break;
++		default:
++			/* Wheel without alt, etc. — not a pointer move */
++			return 0;
+ 		}
+ 		mouse_x += dx;
+ 		mouse_y += dy;
+@@ -531,10 +616,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			mouse_x = 0;
+ 		if (mouse_y &lt; 0)
+ 			mouse_y = 0;
+-		if (mouse_x &gt; server.display_w)
+-			mouse_x = server.display_w;
+-		if (mouse_y &gt; server.display_h)
+-			mouse_y = server.display_h;
++		if (mouse_x &gt; (int)server.display_w)
++			mouse_x = (int)server.display_w;
++		if (mouse_y &gt; (int)server.display_h)
++			mouse_y = (int)server.display_h;
+ 
+ 		drmModeMoveCursor(
+ 		        server.drm_fd,
+@@ -543,29 +628,39 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		        mouse_y);
+ 
+ 		if (drag.active) {
+-			struct Client* c = drag.target;
+-			if (!c) {
+-				printf("[BGCE] No client to drag\n");
+-				return 1; // Should not happen
+-			}
+-
+ 			switch (drag.type) {
+-			case DRAG_MOVE:
+-				// if moving, redraw old region.
+-				if (drag.type == DRAG_MOVE) {
+-					redraw_region(&amp;server, *c, dx, dy);
++			case DRAG_PAN: {
++				/* Dragging the desktop: pan opposite to pointer motion */
++				float z = server.zoom &gt; 0.0f ? server.zoom : 1.0f;
++				server.pan_x -= (float)dx / z;
++				server.pan_y -= (float)dy / z;
++				clamp_viewport(&amp;server);
++				redraw_all(&amp;server);
++				break;
++			}
++			case DRAG_MOVE: {
++				struct Client* c = drag.target;
++				if (!c)
++					return 1;
++				int wdx, wdy;
++				screen_delta_to_world((float)dx, (float)dy,
++				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
++				if (wdx || wdy) {
++					redraw_region(&amp;server, *c, wdx, wdy);
++					c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
++					c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
++					draw(&amp;server, *c);
+ 				}
+-
+-				// Update client's position
+-				c-&gt;x = c-&gt;x + dx;
+-				c-&gt;y = c-&gt;y + dy;
+-				draw(&amp;server, *c);
+ 				break;
+-
+-			case DRAG_RESIZE:
+-				// Accumulate new width and height
+-				drag.dx += dx;
+-				drag.dy += dy;
++			}
++			case DRAG_RESIZE: {
++				int wdx, wdy;
++				screen_delta_to_world((float)dx, (float)dy,
++				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
++				drag.dx += wdx;
++				drag.dy += wdy;
++				break;
++			}
+ 			}
+ 			return 1;
+ 		}
+@@ -599,8 +694,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		/* Clamp */
+ 		if (mouse_x &lt; 0) mouse_x = 0;
+ 		if (mouse_y &lt; 0) mouse_y = 0;
+-		if (mouse_x &gt; (int)server.display_w) mouse_x = server.display_w;
+-		if (mouse_y &gt; (int)server.display_h) mouse_y = server.display_h;
++		if (mouse_x &gt; (int)server.display_w) mouse_x = (int)server.display_w;
++		if (mouse_y &gt; (int)server.display_h) mouse_y = (int)server.display_h;
+ 
+ 		drmModeMoveCursor(
+ 		        server.drm_fd,
+@@ -609,22 +704,41 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		        mouse_y);
+ 
+ 		if (drag.active) {
+-			struct Client* c = drag.target;
+-			if (!c) return 1;
+-
+ 			int dx = mouse_x - old_x;
+ 			int dy = mouse_y - old_y;
+ 
+ 			switch (drag.type) {
+-			case DRAG_MOVE:
+-				redraw_region(&amp;server, *c, dx, dy);
+-				c-&gt;x = c-&gt;x + dx;
+-				c-&gt;y = c-&gt;y + dy;
+-				draw(&amp;server, *c);
++			case DRAG_PAN: {
++				float z = server.zoom &gt; 0.0f ? server.zoom : 1.0f;
++				server.pan_x -= (float)dx / z;
++				server.pan_y -= (float)dy / z;
++				clamp_viewport(&amp;server);
++				redraw_all(&amp;server);
+ 				break;
+-			case DRAG_RESIZE:
+-				drag.dx += dx;
+-				drag.dy += dy;
++			}
++			case DRAG_MOVE: {
++				struct Client* c = drag.target;
++				if (!c)
++					return 1;
++				int wdx, wdy;
++				screen_delta_to_world((float)dx, (float)dy,
++				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
++				if (wdx || wdy) {
++					redraw_region(&amp;server, *c, wdx, wdy);
++					c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
++					c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
++					draw(&amp;server, *c);
++				}
++				break;
++			}
++			case DRAG_RESIZE: {
++				int wdx, wdy;
++				screen_delta_to_world((float)dx, (float)dy,
++				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
++				drag.dx += wdx;
++				drag.dy += wdy;
++				break;
++			}
+ 			}
+ 			return 1;
+ 		}
+@@ -700,15 +814,19 @@ void* input_loop(void* arg) {
+ 				/* fall through — mouse buttons carry position */
+ 			case EV_REL:
+ 			case EV_ABS: {
+-				int in = mouse_x &gt;= (int)c.x &amp;&amp;
+-				         mouse_x &lt;= (int)(c.x + c.width) &amp;&amp;
+-				         mouse_y &gt;= (int)c.y &amp;&amp;
+-				         mouse_y &lt;= (int)(c.y + c.height);
++				float wx, wy;
++				screen_to_world(&amp;server, (float)mouse_x, (float)mouse_y,
++				                &amp;wx, &amp;wy);
++				int in = wx &gt;= (float)c.x &amp;&amp;
++				         wx &lt; (float)(c.x + c.width) &amp;&amp;
++				         wy &gt;= (float)c.y &amp;&amp;
++				         wy &lt; (float)(c.y + c.height);
+ 				if (!in)
+ 					continue;
+ 
+-				e.x = mouse_x - c.x;
+-				e.y = mouse_y - c.y;
++				/* Client-local coordinates in buffer/world pixels */
++				e.x = (int32_t)(wx - (float)c.x);
++				e.y = (int32_t)(wy - (float)c.y);
+ 				break;
+ 			}
+ 			default:
+diff --git a/loop.c b/loop.c
+index 46f6250..c520c6f 100644
+--- a/loop.c
++++ b/loop.c
+@@ -80,8 +80,9 @@ void* client_thread(void* arg) {
+ 			snprintf(client-&gt;shm_name, sizeof(client-&gt;shm_name),
+ 			         "bgce_buf_%d_%ld", getpid(), time(NULL));
+ 
+-			// Unmap and unlink the existing buffer: for resize
+-			if (client-&gt;buffer) {
++			/* Unmap and unlink the existing buffer (resize path). */
++			int had_buffer = client-&gt;buffer != NULL;
++			if (had_buffer) {
+ 				printf("[BGCE] Client already has a buffer, unmapping.\n");
+ 				munmap(client-&gt;buffer, client-&gt;width * client-&gt;height * 4);
+ 				shm_unlink(client-&gt;shm_name);
+@@ -103,8 +104,22 @@ void* client_thread(void* arg) {
+ 			client-&gt;buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+ 			client-&gt;width = req.width;
+ 			client-&gt;height = req.height;
+-			client-&gt;x = 0;
+-			client-&gt;y = 0;
++			/* First buffer only: place at the current viewport so the window
++			 * appears on-screen even when the user has panned/zoomed. */
++			if (!had_buffer) {
++				float wx, wy;
++				screen_to_world(&amp;server, 0.0f, 0.0f, &amp;wx, &amp;wy);
++				if (wx &lt; 0.0f)
++					wx = 0.0f;
++				if (wy &lt; 0.0f)
++					wy = 0.0f;
++				if (wx &gt; (float)server.virtual_w)
++					wx = (float)server.virtual_w;
++				if (wy &gt; (float)server.virtual_h)
++					wy = (float)server.virtual_h;
++				client-&gt;x = (uint32_t)wx;
++				client-&gt;y = (uint32_t)wy;
++			}
+ 			close(shm_fd);
+ 			printf("[BGCE] Client buffer: %p size=%zu (%dx%d) name=%s\n",
+ 			       client-&gt;buffer,
+diff --git a/server.c b/server.c
+index 6e7a40d..4fed9ef 100644
+--- a/server.c
++++ b/server.c
+@@ -126,19 +126,37 @@ int main(void) {
+ 	}
+ 	printf("[BGCE] Display initialised\n");
+ 
+-	/* Add a background client */
++	/* Virtual desktop: WORLD_SCALE × physical display in each axis (4× area).
++	 * Zoom 1.0 = 100%; range [0.5, 4.0] so the full canvas fits when zoomed out. */
++	server.virtual_w = server.display_w * BGCE_WORLD_SCALE;
++	server.virtual_h = server.display_h * BGCE_WORLD_SCALE;
++	server.zoom = 1.0f;
++	server.pan_x = 0.0f;
++	server.pan_y = 0.0f;
++	printf("[BGCE] Virtual desktop %ux%u (%.0fx physical area), zoom=%.2f\n",
++	       server.virtual_w, server.virtual_h,
++	       (double)(BGCE_WORLD_SCALE * BGCE_WORLD_SCALE), server.zoom);
++
++	/* Background covers the entire virtual desktop */
+ 	struct Client background_client;
++	memset(&amp;background_client, 0, sizeof(background_client));
+ 	background_client.x = 0;
+ 	background_client.y = 0;
+-	background_client.z = 0; // Special case
+-	background_client.width = server.display_w;
+-	background_client.height = server.display_h;
+-	background_client.buffer = malloc(server.display_w * server.display_h * 4);
++	background_client.z = 0; /* special: never focusable */
++	background_client.width = server.virtual_w;
++	background_client.height = server.virtual_h;
++	background_client.buffer = malloc((size_t)server.virtual_w * server.virtual_h * 4);
++	if (!background_client.buffer) {
++		perror("[BGCE] malloc background");
++		release_display();
++		return 1;
++	}
+ 	background_client.next = NULL;
++	background_client.fd = -1;
+ 	server.clients = &amp;background_client;
+ 
+-	// Apply background based on config
+-	apply_background(&amp;config, background_client.buffer, server.display_w, server.display_h);
++	apply_background(&amp;config, background_client.buffer,
++	                 server.virtual_w, server.virtual_h);
+ 
+ 	puts("[BGCE] Drawing background");
+ 	draw(&amp;server, background_client);
+diff --git a/server.h b/server.h
+index 17a39d6..e8abc08 100644
+--- a/server.h
++++ b/server.h
+@@ -22,6 +22,15 @@
+ 
+ #define MAX_PATH_LEN 512
+ 
++/* Virtual desktop is WORLD_SCALE × display in each axis (4× area).
++ * Zoom 1.0 = 100% (1 world pixel = 1 screen pixel).
++ * Zoom range [ZOOM_MIN, ZOOM_MAX]: fully zoomed-out fits the whole
++ * virtual desktop; fully zoomed-in is 4× magnification. */
++#define BGCE_WORLD_SCALE 2
++#define BGCE_ZOOM_MIN 0.5f
++#define BGCE_ZOOM_MAX 4.0f
++#define BGCE_ZOOM_STEP 1.15f
++
+ /* ----------------------------
+  * Client Representation
+  * ---------------------------- */
+@@ -33,6 +42,7 @@ struct Client {
+ 	void* buffer;
+ 	uint32_t width;
+ 	uint32_t height;
++	/* Position and size are in virtual-desktop (world) pixels */
+ 	uint32_t x;
+ 	uint32_t y;
+ 	uint32_t z;
+@@ -59,6 +69,13 @@ struct ServerState {
+ 	uint32_t display_bpp;
+ 	void* framebuffer;
+ 
++	/* Virtual desktop / viewport (see BGCE_WORLD_SCALE) */
++	uint32_t virtual_w;
++	uint32_t virtual_h;
++	float zoom;   /* screen_pixels = world_pixels * zoom */
++	float pan_x;  /* world coords of top-left of the screen */
++	float pan_y;
++
+ 	struct InputState input;
+ 
+ 	struct Client* clients;
+@@ -164,6 +181,20 @@ void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
+ 
+ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy);
+ 
++/** Full-scene recomposite (used after pan/zoom changes). */
++void redraw_all(struct ServerState* srv);
++
++/** Clamp pan so the viewport stays over the virtual desktop. */
++void clamp_viewport(struct ServerState* srv);
++
++/** Map a screen pixel to virtual-desktop (world) coordinates. */
++void screen_to_world(const struct ServerState* srv, float sx, float sy,
++                     float* wx, float* wy);
++
++/** Map a world point to screen coordinates. */
++void world_to_screen(const struct ServerState* srv, float wx, float wy,
++                     float* sx, float* sy);
++
+ /**
+  * Capture the current framebuffer and save it as a screenshot.
+  * Returns 0 on success, -1 on failure.
+</pre>

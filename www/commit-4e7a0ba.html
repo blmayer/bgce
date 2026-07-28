@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 4e7a0ba</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 4e7a0ba
+parent <a href=commit-a6eb140.html>a6eb140</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-14T13:17:03-03:00
+
+    Route cursor through compositor; drop SIGINT flag plumbing.
+
+    Input only enqueues COMP_CURSOR (and other jobs); the orchestrator paints
+    the software cursor. Restore default FCFS blit workers and a single
+    BGCE_DEBUG switch. Ignore tty SIGINT instead of a pending-flag poll path.
+
+<a href=tree-4e7a0ba.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 0c2affd..b002270 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -16,10 +16,10 @@ Implement a minimal Linux graphical environment that runs without root, manages
+ - **IPC:** UNIX domain sockets for commands, FIFO for input events.
+ - **Buffers:** Each client has an off-screen buffer; server composites into real framebuffer.
+ - **Rendering:** CPU-based memory blitting only (no OpenGL/DRI accel for now).
+-- **Compositor:** `compositor.c` owns a job queue + orchestrator thread; paint
+-  algorithms stay in `display.c`. MOVE enqueues underlay/mover as free tasks;
+-  3 blit workers grab FCFS (not pinned to L0/L1/mover). No coalescing yet.
+-  Headless uses sync (inline) mode. Debug damage: `BGCE_DEBUG_DAMAGE=1`.
++- **Compositor:** `compositor.c` owns the job queue + orchestrator; paint code
++  stays in `display.c`. Input never blits: it enqueues DRAW/MOVE/PAN/**CURSOR**.
++  MOVE uses 3 FCFS blit workers for underlay/mover tasks. Headless = sync mode.
++  Debug: `BGCE_DEBUG=1` (jobs, damage rects, cursor enqueues).
+ - **MSG_DRAW:** Blit only the client that asked, clipped by opaque windows
+   above (subtract their rects). Do **not** full-stack recompose wallpaper /
+   clients below on ordinary draw — that was a regression (blink/refill).
+diff --git a/compositor.c b/compositor.c
+index 2789ac8..8e9e249 100644
+--- a/compositor.c
++++ b/compositor.c
+@@ -30,6 +30,7 @@ enum comp_op {
+ 	COMP_PAN,
+ 	COMP_ERASE,
+ 	COMP_FULL,
++	COMP_CURSOR,
+ 	COMP_QUIT
+ };
+ 
+@@ -38,6 +39,7 @@ struct comp_job {
+ 	uint32_t client_id;
+ 	int old_x, old_y, new_x, new_y;
+ 	int sdx, sdy;
++	int cursor_x, cursor_y;
+ 	uint32_t erase_x, erase_y, erase_ww, erase_wh;
+ };
+ 
+@@ -61,7 +63,7 @@ static int comp_inited;
+ static int comp_sync;
+ static int orch_running;
+ static int job_in_flight;
+-static int damage_debug;
++static int bgce_debug;
+ 
+ /* ---- Free FCFS task queue for blit workers ---- */
+ static pthread_mutex_t work_mu = PTHREAD_MUTEX_INITIALIZER;
+@@ -75,13 +77,18 @@ static int work_shutdown;
+ 
+ static __thread int tls_worker_id = -1;
+ 
+-static void damage_init(void)
++static void debug_init(void)
+ {
+-	const char *e = getenv("BGCE_DEBUG_DAMAGE");
++	const char *e = getenv("BGCE_DEBUG");
+ 
+-	damage_debug = (e &amp;&amp; e[0] &amp;&amp; e[0] != '0');
+-	if (damage_debug)
+-		printf("[BGCE] compositor: BGCE_DEBUG_DAMAGE on\n");
++	bgce_debug = (e &amp;&amp; e[0] &amp;&amp; e[0] != '0');
++	if (bgce_debug)
++		printf("[BGCE] debug: BGCE_DEBUG on\n");
++}
++
++int bgce_comp_debug(void)
++{
++	return bgce_debug;
+ }
+ 
+ int bgce_comp_worker_id(void)
+@@ -92,7 +99,7 @@ int bgce_comp_worker_id(void)
+ void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
+                           int worker)
+ {
+-	if (!damage_debug)
++	if (!bgce_debug)
+ 		return;
+ 	if (worker &lt; 0)
+ 		worker = tls_worker_id;
+@@ -124,6 +131,11 @@ static void run_job(const struct comp_job *job)
+ 	int wdx, wdy;
+ 	uint32_t save_x, save_y;
+ 
++	if (bgce_debug)
++		printf("[BGCE] comp: run op=%d id=%u cursor=(%d,%d)\n",
++		       (int)job-&gt;op, (unsigned)job-&gt;client_id,
++		       job-&gt;cursor_x, job-&gt;cursor_y);
++
+ 	switch (job-&gt;op) {
+ 	case COMP_DRAW:
+ 		c = bgce_comp_find_client(job-&gt;client_id);
+@@ -172,17 +184,17 @@ static void run_job(const struct comp_job *job)
+ 		redraw_all(&amp;server);
+ 		break;
+ 
++	case COMP_CURSOR:
++		set_cursor_pos(&amp;server, job-&gt;cursor_x, job-&gt;cursor_y);
++		break;
++
+ 	case COMP_QUIT:
+ 	default:
+ 		break;
+ 	}
+ 
+-	/*
+-	 * Paint the software cursor here so it is not stuck waiting for the
+-	 * input thread to win a race with fb_writing (input only dirties the
+-	 * hotspot while a job is in flight).
+-	 */
+-	display_cursor_present();
++	if (bgce_debug)
++		printf("[BGCE] comp: done op=%d\n", (int)job-&gt;op);
+ }
+ 
+ static void *worker_main(void *arg)
+@@ -357,7 +369,7 @@ int bgce_comp_init(int sync_mode)
+ 	if (comp_inited)
+ 		bgce_comp_shutdown();
+ 
+-	damage_init();
++	debug_init();
+ 	comp_sync = sync_mode ? 1 : 0;
+ 	q_head = q_tail = q_count = 0;
+ 	job_in_flight = 0;
+@@ -382,18 +394,18 @@ int bgce_comp_init(int sync_mode)
+ 		return -1;
+ 	}
+ 
++	/* Default: 3 FCFS blit workers for MOVE underlay/mover tasks. */
+ 	for (i = 0; i &lt; COMP_NWORKERS; i++) {
+ 		if (pthread_create(&amp;workers[i], NULL, worker_main,
+ 		                   (void *)(intptr_t)i) != 0) {
+ 			perror("[BGCE] compositor worker");
+-			/* Fall back: parallel3 will run serial. */
+ 			break;
+ 		}
+ 		workers_running++;
+ 	}
+ 
+ 	comp_inited = 1;
+-	printf("[BGCE] compositor: async job queue, %d FCFS blit worker(s)\n",
++	printf("[BGCE] compositor: async queue, %d FCFS blit worker(s)\n",
+ 	       workers_running);
+ 	return 0;
+ }
+@@ -545,3 +557,23 @@ void bgce_comp_submit_full(void)
+ 	j.op = COMP_FULL;
+ 	enqueue(&amp;j);
+ }
++
++void bgce_comp_submit_cursor(int x, int y)
++{
++	struct comp_job j;
++
++	if (!comp_inited) {
++		set_cursor_pos(&amp;server, x, y);
++		return;
++	}
++	memset(&amp;j, 0, sizeof(j));
++	j.op = COMP_CURSOR;
++	j.cursor_x = x;
++	j.cursor_y = y;
++	if (bgce_debug) {
++		static int n;
++		if ((n++ % 32) == 0)
++			printf("[BGCE] comp: enqueue cursor (%d,%d)\n", x, y);
++	}
++	enqueue(&amp;j);
++}
+diff --git a/compositor.h b/compositor.h
+index 83ab9f6..ae079b0 100644
+--- a/compositor.h
++++ b/compositor.h
+@@ -6,16 +6,14 @@
+ struct Client;
+ 
+ /**
+- * Compositor: owns framebuffer writes via a job queue.
++ * Compositor: owns all framebuffer writes via a job queue.
+  *
+- * - Async mode: orchestrator pops high-level jobs (DRAW/MOVE/PAN/…).
+- *   A pool of 3 blit workers runs fine-grained tasks from a free FCFS
+- *   task queue (any worker can take any task — underlay or mover, etc.).
+- *   No coalescing — every submitted event is painted.
+- * - Sync mode (headless/mock): submit runs paint on the caller; parallel
+- *   tasks run serially.
++ * - Async mode: orchestrator pops jobs (DRAW/MOVE/PAN/CURSOR/…).
++ *   A pool of 3 blit workers runs fine-grained MOVE tasks FCFS.
++ *   Input never paints — it only enqueues (including mouse motion).
++ * - Sync mode (headless): submit runs on the caller; parallel tasks serial.
+  *
+- * Debug rect logs: set env BGCE_DEBUG_DAMAGE=1.
++ * Debug: BGCE_DEBUG=1  (damage rects, jobs, cursor submits — one switch)
+  */
+ 
+ /** Start compositor. sync_mode != 0 → no background threads (inline paint). */
+@@ -37,8 +35,7 @@ void bgce_comp_submit_draw(uint32_t client_id);
+ void bgce_comp_submit_move(uint32_t client_id, int old_x, int old_y,
+                            int new_x, int new_y);
+ 
+-/** Desktop pan by screen-pixel delta (caller already updated pan, or not —
+- *  pan job applies redraw_pan which updates pan inside display). */
++/** Desktop pan by screen-pixel delta. */
+ void bgce_comp_submit_pan(int sdx, int sdy);
+ 
+ /**
+@@ -51,25 +48,30 @@ void bgce_comp_submit_erase(uint32_t x, uint32_t y, uint32_t world_w,
+ /** Full-scene recomposite (zoom, Alt+Tab viewport, hard invalidate). */
+ void bgce_comp_submit_full(void);
+ 
++/**
++ * Software cursor move — input enqueues this; compositor paints the glyph.
++ * Screen pixel coordinates (top-left of 32×32 tile).
++ */
++void bgce_comp_submit_cursor(int x, int y);
++
+ /**
+  * Enqueue up to three independent paint tasks and wait until all complete.
+- * Workers grab tasks first-come-first-serve (not pinned to L0/L1/mover).
+- * NULL function slots are skipped.  In sync mode, runs serially.
++ * Workers grab FCFS.  NULL slots skipped.  Sync mode runs serially.
+  */
+ void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
+                          void *a1, void (*f2)(void *), void *a2);
+ 
+-/**
+- * Id of the blit worker running this thread (0..2), or -1 if not a worker
+- * (serial/sync path).  Useful for damage debug logs.
+- */
++/** Blit worker id 0..2, or -1 if not a worker. */
+ int bgce_comp_worker_id(void);
+ 
+-/** Debug: log a damage rect if BGCE_DEBUG_DAMAGE is set. worker=-1 → auto/serial. */
++/** Log a damage rect when BGCE_DEBUG is set. worker=-1 → auto from TLS. */
+ void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
+                           int worker);
+ 
+ /** Look up a live client by id (for paint paths). */
+ struct Client *bgce_comp_find_client(uint32_t client_id);
+ 
++/** Non-zero when BGCE_DEBUG is enabled. */
++int bgce_comp_debug(void);
++
+ #endif /* BGCE_COMPOSITOR_H */
+diff --git a/display.c b/display.c
+index fbd7fde..de2f447 100644
+--- a/display.c
++++ b/display.c
+@@ -56,17 +56,10 @@ static int cur_saved_x;
+ static int cur_saved_y;
+ static int cur_underlay_valid; /* 1 = FB has glyph; underlay is live */
+ /*
+- * Input thread owns cursor paint.  Compositor threads only lift the glyph
+- * (restore underlay) when they damage that tile, then set cursor_dirty so
+- * the input thread re-presents.  Avoids restore/paint races that left a
+- * 32×32 square of stale underlay (wallpaper under a redrawing window).
+- *
+- * fb_writing: compositor is mid-blit.  Input must not paint/restore then
+- * (would sample or replay a half-updated tile and freeze the look of the
+- * window under the pointer).  Only update cursor_x/y + dirty.
++ * Software cursor is painted only on the compositor (orchestrator) thread.
++ * Input enqueues COMP_CURSOR jobs; it never blits the glyph itself.
+  */
+-static volatile int cursor_dirty;
+-static volatile int fb_writing;
++static int cursor_dirty;
+ 
+ static enum BGCECursorType current_cursor = BGCE_CURSOR_DEFAULT;
+ 
+@@ -451,7 +444,7 @@ static void cursor_restore(void)
+ /*
+  * Draw the glyph at cursor_x/y.  Always lifts any previous glyph first so
+  * calling paint twice never bakes a pointer into the underlay.
+- * Input thread only (via set_cursor_pos / display_cursor_present).
++ * Compositor thread only.
+  */
+ static void cursor_paint(void)
+ {
+@@ -504,17 +497,22 @@ static int cursor_lift_all_ret(void)
+ 	return 1;
+ }
+ 
+-/* Begin/end compositor FB writes (paired). */
++/*
++ * Begin/end scene paint on the compositor thread.  Glyph is lifted for the
++ * duration; restored at end if need_present (or left dirty for a later
++ * COMP_CURSOR).
++ */
+ static void cursor_fb_begin(void)
+ {
+-	fb_writing = 1;
++	(void)cursor_lift_all_ret();
+ }
+ 
+ static void cursor_fb_end(int need_present)
+ {
+-	fb_writing = 0;
+ 	if (need_present)
+ 		cursor_dirty = 1;
++	if (server.framebuffer &amp;&amp; (cursor_dirty || !cur_underlay_valid))
++		cursor_paint();
+ }
+ 
+ int display_cursor_pending(void)
+@@ -524,39 +522,27 @@ int display_cursor_pending(void)
+ 
+ void display_cursor_present(void)
+ {
+-	if (!server.framebuffer || fb_writing)
+-		return;
+-	if (!cursor_dirty &amp;&amp; cur_underlay_valid)
++	if (!server.framebuffer)
+ 		return;
+-	cursor_paint();
++	if (cursor_dirty || !cur_underlay_valid)
++		cursor_paint();
+ }
+ 
+ void display_cursor_refresh(void)
+ {
+-	if (fb_writing) {
+-		cursor_dirty = 1;
+-		return;
+-	}
+ 	cursor_restore();
+ 	cursor_paint();
+ }
+ 
++/*
++ * Move the software cursor and paint it.  Must run on the compositor
++ * thread (via COMP_CURSOR or after a scene job).  Input only enqueues.
++ */
+ void set_cursor_pos(struct ServerState *srv, int x, int y)
+ {
+ 	(void)srv;
+ 	clamp_cursor_pos(&amp;x, &amp;y);
+ 
+-	/*
+-	 * Compositor owns the FB right now: only remember the hotspot.
+-	 * Painting would sample a half-drawn frame and leave a frozen tile.
+-	 */
+-	if (fb_writing) {
+-		cursor_x = x;
+-		cursor_y = y;
+-		cursor_dirty = 1;
+-		return;
+-	}
+-
+ 	if (x == cursor_x &amp;&amp; y == cursor_y) {
+ 		if (cursor_dirty || !cur_underlay_valid)
+ 			cursor_paint();
+@@ -572,18 +558,15 @@ void set_cursor_type(enum BGCECursorType type)
+ {
+ 	if (type &lt; 0 || type &gt;= BGCE_CURSOR_COUNT)
+ 		type = BGCE_CURSOR_DEFAULT;
+-	if (fb_writing) {
+-		current_cursor = type;
+-		render_cursor(cur_img, 32, 32, 32);
+-		cursor_dirty = 1;
+-		return;
+-	}
+ 	if (type == current_cursor &amp;&amp; cur_underlay_valid &amp;&amp; !cursor_dirty)
+ 		return;
+ 	current_cursor = type;
+-	cursor_restore();
++	/*
++	 * Rebuild glyph only.  Caller should enqueue COMP_CURSOR so the
++	 * compositor paints (safe for client threads).
++	 */
+ 	render_cursor(cur_img, 32, 32, 32);
+-	cursor_paint();
++	cursor_dirty = 1;
+ }
+ 
+ 
+diff --git a/input.c b/input.c
+index 055456e..b2ad3ef 100644
+--- a/input.c
++++ b/input.c
+@@ -193,7 +193,7 @@ static void apply_zoom_at_cursor(int dir)
+ 	server.pan_y = wy * z / 100 - mouse_y;
+ 	clamp_viewport(&amp;server);
+ 	bgce_comp_submit_full();
+-	display_cursor_present();
++	bgce_comp_submit_cursor(mouse_x, mouse_y);
+ 	printf("[BGCE] Zoom: %d%%  pan=(%d, %d)  was %d%%\n",
+ 	       server.zoom_pct, server.pan_x, server.pan_y, old_pct);
+ }
+@@ -482,7 +482,6 @@ static void run_alttab(int reverse)
+ 			(void)bgce_send_msg(now-&gt;fd, &amp;got);
+ 		}
+ 	}
+-	display_cursor_present();
+ }
+ 
+ /*
+@@ -825,9 +824,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 
+ 				if (sp &lt; 1)
+ 					sp = 256;
+-				/* Cursor first so a busy compositor never freezes the pointer. */
+-				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+-				/* Integer screen pixels; pan paint is queued. */
++				/* Cursor + pan paint both go through the compositor. */
++				bgce_comp_submit_cursor(mouse_x, mouse_y);
+ 				sdx = dx * sp / 256;
+ 				sdy = dy * sp / 256;
+ 				if (sdx || sdy)
+@@ -841,7 +839,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 
+ 				if (!c)
+ 					return 1;
+-				set_cursor_pos(&amp;server, mouse_x, mouse_y);
++				bgce_comp_submit_cursor(mouse_x, mouse_y);
+ 				screen_delta_to_world(dx, dy, config.move_speed,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				if (wdx || wdy) {
+@@ -860,15 +858,15 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				drag.dx += wdx;
+ 				drag.dy += wdy;
+-				set_cursor_pos(&amp;server, mouse_x, mouse_y);
++				bgce_comp_submit_cursor(mouse_x, mouse_y);
+ 				break;
+ 			}
+ 			}
+ 			return 1;
+ 		}
+ 
+-		/* Normal move: update software cursor on every axis event. */
+-		set_cursor_pos(&amp;server, mouse_x, mouse_y);
++		/* Normal move: enqueue cursor for the compositor to paint. */
++		bgce_comp_submit_cursor(mouse_x, mouse_y);
+ 		return 0;
+ 	}
+ 
+@@ -923,7 +921,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 
+ 				if (sp &lt; 1)
+ 					sp = 256;
+-				set_cursor_pos(&amp;server, mouse_x, mouse_y);
++				bgce_comp_submit_cursor(mouse_x, mouse_y);
+ 				sdx = dx * sp / 256;
+ 				sdy = dy * sp / 256;
+ 				if (sdx || sdy)
+@@ -937,7 +935,7 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 
+ 				if (!c)
+ 					return 1;
+-				set_cursor_pos(&amp;server, mouse_x, mouse_y);
++				bgce_comp_submit_cursor(mouse_x, mouse_y);
+ 				screen_delta_to_world(dx, dy, config.move_speed,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				if (wdx || wdy) {
+@@ -956,14 +954,14 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				drag.dx += wdx;
+ 				drag.dy += wdy;
+-				set_cursor_pos(&amp;server, mouse_x, mouse_y);
++				bgce_comp_submit_cursor(mouse_x, mouse_y);
+ 				break;
+ 			}
+ 			}
+ 			return 1;
+ 		}
+ 
+-		set_cursor_pos(&amp;server, mouse_x, mouse_y);
++		bgce_comp_submit_cursor(mouse_x, mouse_y);
+ 		return 0;
+ 	}
+ 
+@@ -971,47 +969,20 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 	return 0;
+ }
+ 
+-/*
+- * Tty Ctrl+C → SIGINT on the process group.  We only swallow it so the
+- * compositor does not exit.  Clients get Ctrl+C solely from /dev/input
+- * (keys to the focused client).  Synthesizing a chord here double-fired.
+- */
+-void deliver_interrupt_to_focus(void)
+-{
+-	/* No-op for clients; retained for API stability. */
+-}
+-
+-static void poll_sigint(void)
+-{
+-	if (!bgce_sigint_pending)
+-		return;
+-	bgce_sigint_pending = 0;
+-}
+-
+ void* input_loop(void* arg) {
+ 	(void)arg;
+ 
+ 	if (count == 0) {
+ 		printf("[BGCE] Input: no devices, input thread parked\n");
+-		while (1) {
+-			poll_sigint();
++		while (1)
+ 			sleep(1);
+-		}
+ 		return NULL;
+ 	}
+ 
+ 	printf("[BGCE] Input: polling %zu device(s)\n", count);
+ 
+ 	while (1) {
+-		/*
+-		 * Finite timeout: SIGINT handling + re-present software cursor
+-		 * after client redraws (compositor sets dirty, input paints).
+-		 */
+-		int timeout_ms = display_cursor_pending() ? 8 : 200;
+-		int ret = poll(fds, count, timeout_ms);
+-		poll_sigint();
+-		/* Always ok to call; no-op if cursor is already valid. */
+-		display_cursor_present();
++		int ret = poll(fds, count, -1);
+ 		if (ret &lt; 0) {
+ 			if (errno == EINTR)
+ 				continue;
+diff --git a/input_headless.c b/input_headless.c
+index 67226e4..11f6e82 100644
+--- a/input_headless.c
++++ b/input_headless.c
+@@ -36,10 +36,6 @@ void client_disconnected(struct Client *c)
+ 	(void)c;
+ }
+ 
+-void deliver_interrupt_to_focus(void)
+-{
+-}
+-
+ int resize_buffer(struct Client *c, int dx, int dy)
+ {
+ 	(void)c;
+diff --git a/loop.c b/loop.c
+index f321ac3..8fbc6ff 100644
+--- a/loop.c
++++ b/loop.c
+@@ -252,8 +252,12 @@ void* client_thread(void* arg) {
+ 			int ctype = msg.data.cursor_request.cursor_type;
+ 			printf("[BGCE] Client requested cursor type %d\n", ctype);
+ 			/* Only the focused client may change the cursor */
+-			if (server.focused_client == client)
++			if (server.focused_client == client) {
++				extern int mouse_x, mouse_y;
+ 				set_cursor_type((enum BGCECursorType)ctype);
++				/* Re-paint glyph via compositor at current hotspot. */
++				bgce_comp_submit_cursor(mouse_x, mouse_y);
++			}
+ 			break;
+ 		}
+ 		default:
+diff --git a/mock.c b/mock.c
+index 551961c..5b36ea9 100644
+--- a/mock.c
++++ b/mock.c
+@@ -94,7 +94,8 @@ int bgce_mock_init(uint32_t width, uint32_t height)
+ 		return -1;
+ 	}
+ 	bgce_comp_submit_full();
+-	display_cursor_present();
++	bgce_comp_submit_cursor((int)server.display_w / 2,
++	                        (int)server.display_h / 2);
+ 	mock_active = 1;
+ 	printf("[BGCE] mock init %ux%u virtual %ux%u\n",
+ 	       server.display_w, server.display_h,
+@@ -265,7 +266,7 @@ struct Client *bgce_mock_click(int screen_x, int screen_y)
+ 		bgce_mock_focus(c);
+ 	else
+ 		server.focused_client = NULL;
+-	set_cursor_pos(&amp;server, screen_x, screen_y);
++	bgce_comp_submit_cursor(screen_x, screen_y);
+ 	return c;
+ }
+ 
+@@ -309,7 +310,6 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
+ 		server.pan_y = wy * z / 100 - sy;
+ 		clamp_viewport(&amp;server);
+ 		bgce_comp_submit_full();
+-		display_cursor_present();
+ 		return;
+ 	}
+ 	z = server.zoom_pct &gt; 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+@@ -318,7 +318,6 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
+ 	server.pan_y = wy * z / 100 - sy;
+ 	clamp_viewport(&amp;server);
+ 	bgce_comp_submit_full();
+-	display_cursor_present();
+ }
+ 
+ void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y)
+@@ -334,7 +333,6 @@ void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y)
+ 	server.pan_y = pan_y;
+ 	clamp_viewport(&amp;server);
+ 	bgce_comp_submit_full();
+-	display_cursor_present();
+ }
+ 
+ void bgce_mock_alt_tab(int reverse)
+@@ -342,7 +340,6 @@ void bgce_mock_alt_tab(int reverse)
+ 	if (!mock_active)
+ 		return;
+ 	bgce_cycle_focus(&amp;server, reverse ? 1 : 0);
+-	display_cursor_present();
+ }
+ 
+ void bgce_mock_remember_focus(void)
+@@ -388,8 +385,6 @@ void bgce_announce(const char *fmt, ...)
+ 	(void)fmt;
+ }
+ 
+-volatile sig_atomic_t bgce_sigint_pending;
+-
+ void bgce_request_shutdown(void)
+ {
+ }
+diff --git a/server.c b/server.c
+index 99edb1c..4a40aa8 100644
+--- a/server.c
++++ b/server.c
+@@ -21,16 +21,6 @@
+ struct ServerState server = {}; /* Global server state */
+ struct config config = {};            /* Global config (background + shortcuts) */
+ 
+-/* SIGINT (Ctrl+C on the controlling tty) — swallow only; do not exit.
+- * Client Ctrl+C comes from /dev/input as normal keys to the focused client. */
+-volatile sig_atomic_t bgce_sigint_pending = 0;
+-
+-static void on_sigint(int sig)
+-{
+-	(void)sig;
+-	bgce_sigint_pending = 1;
+-}
+-
+ static void ensure_dir(const char *path) {
+ 	struct stat st;
+ 	if (stat(path, &amp;st) == 0 &amp;&amp; S_ISDIR(st.st_mode))
+@@ -246,7 +236,8 @@ int main(void) {
+ 	signal(SIGPIPE, SIG_IGN);
+ 
+ 	/* Ctrl+C on the tty must not kill the compositor (trap &amp; ignore). */
+-	signal(SIGINT, on_sigint);
++	/* Tty Ctrl+C must not kill the compositor; apps get Ctrl+C via /dev/input. */
++	signal(SIGINT, SIG_IGN);
+ 	/* Real shutdown: kill/SIGTERM or configured exit shortcut (e.g. ctrl+alt+q) */
+ 	signal(SIGTERM, cleanup_and_exit);
+ 
+@@ -365,8 +356,9 @@ int main(void) {
+ 	/* Full recomposite so the wallpaper fills the screen even if draw()
+ 	 * bounds are edge-clamped oddly on the first paint. */
+ 	bgce_comp_submit_full();
++	bgce_comp_submit_cursor((int)server.display_w / 2,
++	                        (int)server.display_h / 2);
+ 	bgce_comp_flush();
+-	display_cursor_present();
+ 
+ 	if (init_input() != 0) {
+ 		perror("[BGCE] Failed to start input thread");
+diff --git a/server.h b/server.h
+index 37a6c8f..331ab1e 100644
+--- a/server.h
++++ b/server.h
+@@ -5,7 +5,6 @@
+ #include "bgce.h"
+ 
+ #include &lt;pthread.h&gt;
+-#include &lt;signal.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;sys/types.h&gt;
+ 
+@@ -207,12 +206,6 @@ int apply_background(struct config* config, uint32_t* buffer,
+  */
+ void bgce_announce(const char *fmt, ...);
+ 
+-/** Set by SIGINT handler; input thread clears it (server stays up). */
+-extern volatile sig_atomic_t bgce_sigint_pending;
+-
+-/** Historical hook; SIGINT is swallowed — clients use keyboard input only. */
+-void deliver_interrupt_to_focus(void);
+-
+ /** Clean shutdown (restore VT, unlink socket). Safe from the input thread. */
+ void bgce_request_shutdown(void);
+ 
+</pre>

@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 5e5cd58</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 5e5cd58
+parent <a href=commit-ee7c9ed.html>ee7c9ed</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2025-12-29T23:53:20-03:00
+
+    fixed index page
+
+<a href=tree-5e5cd58.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/www/index.html b/www/index.html
+index 0e3038d..a5b497d 100644
+--- a/www/index.html
++++ b/www/index.html
+@@ -62,42 +62,37 @@ Here's a &lt;a href=screenshot.png&gt;screenshot&lt;/a&gt;.
+   
+ &lt;b&gt;Configuration&lt;/b&gt;
+ 
+-BGCE supports configuration for the background through a config file. By default, it looks for `~/.config/bgce.conf`.
++BGCE supports configuration through a config file.
++By default, it looks for `~/.config/bgce.conf`.
+ 
+ &lt;i&gt;Config File Format&lt;/i&gt;
+ 
+-```ini
+ [background]
+ # Background type: "color" or "image"
+ type = color
+ 
+ # For color background:
+-color = #RRGGBB   # Hex color code (e.g., #FF0000 for red)
++color = #RRGGBB   # Hex color code
+ # or
+-color = #RRGGBBAA # Hex color with alpha (e.g., #FF000080 for semi-transparent red)
++color = #RRGGBBAA # Hex color with alpha
+ 
+ # For image background:
+ #path = /path/to/image.png
+ #mode = tiled     # or "scaled"
+-```
+ 
+ 
+ &lt;i&gt;Example Config File&lt;/i&gt;
+ 
+-```ini
+ [background]
+ type = color
+ color = #336699
+-```
+ 
+ or
+ 
+-```ini
+ [background]
+ type = image
+ path = /usr/share/backgrounds/default.png
+ mode = scaled
+-```
+ 
+ 
+ &lt;i&gt;Notes&lt;/i&gt;
+</pre>

@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 4b55b72</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 4b55b72
+parent <a href=commit-92e5437.html>92e5437</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-08T13:23:53-03:00
+
+    Trap SIGINT only; detach shortcut children from process group.
+
+    Stop synthesizing Ctrl+C on SIGINT — that double-delivered with
+    /dev/input. Swallow the signal so the server stays up; clients get
+    interrupt only as keyboard events to focus. setsid() shortcut forks
+    so terminal SIGINT does not kill every launched app.
+
+<a href=tree-4b55b72.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/input.c b/input.c
+index 5e46b9b..3e3cf5d 100644
+--- a/input.c
++++ b/input.c
+@@ -8,6 +8,7 @@
+ #include &lt;linux/kd.h&gt;
+ #include &lt;math.h&gt;
+ #include &lt;poll.h&gt;
++#include &lt;signal.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+@@ -503,6 +504,18 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			} else if (sc-&gt;type == SHORTCUT_COMMAND) {
+ 				pid_t pid = fork();
+ 				if (pid == 0) {
++					/*
++					 * Leave bgce's process group / session.  Otherwise a
++					 * terminal Ctrl+C delivers SIGINT to every shortcut
++					 * child as well as the server (kernel process-group
++					 * broadcast), while bgce only meant to forward a
++					 * synthetic Ctrl+C to the focused client.
++					 */
++					if (setsid() &lt; 0)
++						/* still try to run; better than _exit */
++						(void)setpgid(0, 0);
++					signal(SIGINT, SIG_DFL);
++					signal(SIGTERM, SIG_DFL);
+ 					execl("/bin/sh", "sh", "-c", sc-&gt;value, (char *)NULL);
+ 					_exit(127);
+ 				} else if (pid &lt; 0) {
+@@ -844,52 +857,14 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 	return 0;
+ }
+ 
+-/* Send one EV_KEY to the focused client (no-op if nothing focused). */
+-static void send_key_to_focused(uint16_t code, int32_t value)
+-{
+-	struct Client *fc = server.focused_client;
+-	struct BGCEMessage msg;
+-	struct InputEvent *e;
+-
+-	if (!fc || fc-&gt;fd &lt; 0)
+-		return;
+-
+-	memset(&amp;msg, 0, sizeof(msg));
+-	msg.type = MSG_INPUT_EVENT;
+-	e = &amp;msg.data.input_event;
+-	e-&gt;type = EV_KEY;
+-	e-&gt;code = code;
+-	e-&gt;value = value;
+-	if (server.input.count &gt; 0)
+-		e-&gt;device = server.input.devs[0];
+-	bgce_send_msg(fc-&gt;fd, &amp;msg);
+-}
+-
++/*
++ * Tty Ctrl+C → SIGINT on the process group.  We only swallow it so the
++ * compositor does not exit.  Clients get Ctrl+C solely from /dev/input
++ * (keys to the focused client).  Synthesizing a chord here double-fired.
++ */
+ void deliver_interrupt_to_focus(void)
+ {
+-	struct Client *fc = server.focused_client;
+-	int inject_ctrl;
+-
+-	if (!fc || fc-&gt;fd &lt; 0) {
+-		printf("[BGCE] SIGINT/Ctrl+C: no focused client — ignored "
+-		       "(use exit shortcut to quit the server)\n");
+-		return;
+-	}
+-
+-	printf("[BGCE] SIGINT/Ctrl+C: forwarding to focused client fd=%d\n", fc-&gt;fd);
+-
+-	/*
+-	 * Clients see normal EV_KEY traffic (not Unix signals). Synthesize the
+-	 * usual Ctrl+C chord. If Ctrl is already held from the keyboard, only
+-	 * send C press/release.
+-	 */
+-	inject_ctrl = !ctrl_down;
+-	if (inject_ctrl)
+-		send_key_to_focused(KEY_LEFTCTRL, 1);
+-	send_key_to_focused(KEY_C, 1);
+-	send_key_to_focused(KEY_C, 0);
+-	if (inject_ctrl)
+-		send_key_to_focused(KEY_LEFTCTRL, 0);
++	/* No-op for clients; retained for API stability. */
+ }
+ 
+ static void poll_sigint(void)
+@@ -897,7 +872,6 @@ static void poll_sigint(void)
+ 	if (!bgce_sigint_pending)
+ 		return;
+ 	bgce_sigint_pending = 0;
+-	deliver_interrupt_to_focus();
+ }
+ 
+ void* input_loop(void* arg) {
+@@ -915,7 +889,7 @@ void* input_loop(void* arg) {
+ 	printf("[BGCE] Input: polling %zu device(s)\n", count);
+ 
+ 	while (1) {
+-		/* Finite timeout so SIGINT (set from another thread/handler) is noticed. */
++		/* Finite timeout so SIGINT is cleared and does not kill us. */
+ 		int ret = poll(fds, count, 200);
+ 		poll_sigint();
+ 		if (ret &lt; 0) {
+@@ -985,7 +959,6 @@ void* input_loop(void* arg) {
+ 				         wy &lt; (float)(c.y + wh);
+ 				if (!in)
+ 					continue;
+-				/* Report buffer-local coords so clients match their pixels. */
+ 				if (ww &gt; 0 &amp;&amp; wh &gt; 0) {
+ 					e.x = (int32_t)((wx - (float)c.x) *
+ 					                (float)c.width / (float)ww);
+diff --git a/server.c b/server.c
+index b432b94..96fecef 100644
+--- a/server.c
++++ b/server.c
+@@ -19,8 +19,8 @@
+ struct ServerState server = {}; /* Global server state */
+ struct config config = {};            /* Global config (background + shortcuts) */
+ 
+-/* SIGINT (Ctrl+C on the controlling tty) — do not kill the server; the input
+- * thread turns this into key events for the focused client. */
++/* SIGINT (Ctrl+C on the controlling tty) — swallow only; do not exit.
++ * Client Ctrl+C comes from /dev/input as normal keys to the focused client. */
+ volatile sig_atomic_t bgce_sigint_pending = 0;
+ 
+ static void on_sigint(int sig)
+@@ -242,7 +242,7 @@ int main(void) {
+ 	/* A crashed client must not take down the server on the next write(). */
+ 	signal(SIGPIPE, SIG_IGN);
+ 
+-	/* Ctrl+C on the tty must not kill the compositor — forward to focus. */
++	/* Ctrl+C on the tty must not kill the compositor (trap &amp; ignore). */
+ 	signal(SIGINT, on_sigint);
+ 	/* Real shutdown: kill/SIGTERM or configured exit shortcut (e.g. ctrl+alt+q) */
+ 	signal(SIGTERM, cleanup_and_exit);
+diff --git a/server.h b/server.h
+index d1b7546..67191fb 100644
+--- a/server.h
++++ b/server.h
+@@ -182,10 +182,10 @@ int apply_background(struct config* config, uint32_t* buffer,
+  */
+ void bgce_announce(const char *fmt, ...);
+ 
+-/** Set by SIGINT handler; input thread delivers as Ctrl+C to focus. */
++/** Set by SIGINT handler; input thread clears it (server stays up). */
+ extern volatile sig_atomic_t bgce_sigint_pending;
+ 
+-/** Forward a synthetic Ctrl+C (KEY_LEFTCTRL + KEY_C) to the focused client. */
++/** Historical hook; SIGINT is swallowed — clients use keyboard input only. */
+ void deliver_interrupt_to_focus(void);
+ 
+ /** Clean shutdown (restore VT, unlink socket). Safe from the input thread. */
+</pre>

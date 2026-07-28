@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 8c2d434</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 8c2d434
+parent <a href=commit-73974f4.html>73974f4</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-13T12:02:15-03:00
+
+    Add Alt+Tab viewport restore and fix move edge rounding.
+
+    Cycle focus with Alt+Tab / Alt+Shift+Tab, raise the target, and pan/zoom to
+    each app's last viewport from the window cache (pan alone does not write).
+    Fix client screen bounds and same-rect reblits so slow moves no longer leave
+    stale or soft edges at non-100% zoom; cover with headless screenshot tests.
+
+<a href=tree-8c2d434.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index d996b24..b40679a 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -41,11 +41,12 @@ behaviour by inspecting PNGs:
+ 
+ ```bash
+ make headless &amp;&amp; ./headless
+-# writes headless_00_bg.png … headless_08_location_restored.png
++# writes headless_00_bg.png … headless_14_alt_shift_tab.png
+ ```
+ 
+ API (see `mock.h`): `bgce_mock_init`, `bgce_mock_add_client`, `bgce_mock_draw`,
+-`bgce_mock_click`, `bgce_mock_move`, `bgce_mock_screenshot`, `bgce_mock_fini`.
++`bgce_mock_click`, `bgce_mock_move`, `bgce_mock_alt_tab`, `bgce_mock_set_viewport`,
++`bgce_mock_screenshot`, `bgce_mock_fini`.
+ 
+ On macOS, `compat/linux/` provides stub headers so headless builds without
+ kernel headers. Real `bgce` still requires Linux.
+@@ -68,12 +69,15 @@ kernel headers. Real `bgce` still requires Linux.
+   - [ ] test if events go to the correct client and only the one
+   - [X] headless stacking / move / erase screenshots
+   - [X] headless location-cache restore
++  - [X] headless Alt+Tab / viewport restore
+ 
+ ### Location cache
+ - File: `$XDG_CACHE_HOME/bgce/windows.cache` or `~/.cache/bgce/windows.cache`
+-- Format: `app_id x y` (world pixels), one entry per line
++- Format: `app_id x y [zoom_pct pan_x pan_y]` (world x/y; optional viewport)
+ - Identity: Linux `SO_PEERCRED` + `/proc/pid/comm` (fallback `"client"`)
+-- Restore on first buffer request; save on move end, MSG_MOVE, and disconnect
++- Restore position on first buffer request; restore viewport on Alt+Tab
++- Save on move end, MSG_MOVE, disconnect, and when leaving a window via Alt+Tab
++- **Desktop pan alone does not write the cache**
+ - Same binary name shares one slot (last place wins)
+ 
+ ### Zoom / pan controls
+@@ -81,6 +85,9 @@ kernel headers. Real `bgce` still requires Linux.
+ - **Alt + left-drag on empty space**: pan the viewport over the virtual desktop
+ - **Alt + left-drag on a client**: move window (existing)
+ - **Alt + right-drag on a client**: resize window (existing)
++- **Alt + Tab** / **Alt + Shift + Tab**: cycle focus (raise app); pan + zoom to
++  that app’s last viewport so it appears where it was left (does not move the
++  window rect). Shift reverses the cycle.
+ - Virtual desktop is 2× the physical resolution in each axis (4× area). Client
+   positions and buffer sizes are in world pixels; the compositor scales to the
+   screen using the current zoom and pan.
+diff --git a/display.c b/display.c
+index 6bf862a..8f682ee 100644
+--- a/display.c
++++ b/display.c
+@@ -791,21 +791,38 @@ void clamp_viewport(struct ServerState *srv)
+ 	}
+ }
+ 
+-/* Screen-space axis-aligned bounds of a client (exclusive end). */
++/*
++ * Screen-space axis-aligned bounds of a client (exclusive end).
++ *
++ * Screen pixel (sx,sy) samples world
++ *   wx = floor((sx + pan_x) * 100 / z)
++ * (see blit_client_scaled / screen_to_world).  The bounds must cover every
++ * pixel whose sample lands in [x, x+ww) × [y, y+wh):
++ *
++ *   sx0 = ceil(x * z / 100) - pan_x
++ *   sx1 = ceil((x + ww) * z / 100) - pan_x   (exclusive)
++ *
++ * Using floor(world_to_screen) for both corners under-covers the trailing
++ * edge and can leave 1px hairs / soft edges when the window moves slowly
++ * (especially at zoom ≠ 100%).
++ */
+ static void client_screen_bounds(const struct ServerState *srv,
+                                  const struct Client *cli,
+                                  int *sx0, int *sy0, int *sx1, int *sy1)
+ {
+ 	uint32_t ww = cli-&gt;world_w ? cli-&gt;world_w : cli-&gt;width;
+ 	uint32_t wh = cli-&gt;world_h ? cli-&gt;world_h : cli-&gt;height;
+-	int a, b, c, d;
+-
+-	world_to_screen(srv, (int)cli-&gt;x, (int)cli-&gt;y, &amp;a, &amp;b);
+-	world_to_screen(srv, (int)(cli-&gt;x + ww), (int)(cli-&gt;y + wh), &amp;c, &amp;d);
+-	*sx0 = a;
+-	*sy0 = b;
+-	*sx1 = c;
+-	*sy1 = d;
++	int z = zoom_pct_of(srv);
++	int x = (int)cli-&gt;x;
++	int y = (int)cli-&gt;y;
++	int w = (int)ww;
++	int h = (int)wh;
++
++	/* ceil(n/100) for n &gt;= 0 is (n + 99) / 100 */
++	*sx0 = (x * z + 99) / 100 - srv-&gt;pan_x;
++	*sy0 = (y * z + 99) / 100 - srv-&gt;pan_y;
++	*sx1 = ((x + w) * z + 99) / 100 - srv-&gt;pan_x;
++	*sy1 = ((y + h) * z + 99) / 100 - srv-&gt;pan_y;
+ 	if (*sx1 &lt;= *sx0)
+ 		*sx1 = *sx0 + 1;
+ 	if (*sy1 &lt;= *sy0)
+@@ -1504,6 +1521,7 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ 	int expose[8][4];
+ 	int nexp;
+ 	int i;
++	int same_bounds;
+ 
+ 	if (!srv || !srv-&gt;framebuffer || !c) {
+ 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
+@@ -1518,13 +1536,34 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ 	moved.y = (uint32_t)((int)c-&gt;y + wdy);
+ 	client_screen_bounds(srv, &amp;moved, &amp;nx0, &amp;ny0, &amp;nx1, &amp;ny1);
+ 
+-	if (ox0 == nx0 &amp;&amp; oy0 == ny0 &amp;&amp; ox1 == nx1 &amp;&amp; oy1 == ny1)
++	same_bounds = (ox0 == nx0 &amp;&amp; oy0 == ny0 &amp;&amp; ox1 == nx1 &amp;&amp; oy1 == ny1);
++
++	cursor_fb_begin();
++	(void)cursor_lift_all_ret();
++
++	/*
++	 * When zoomed out (or at awkward zoom percents), a 1-world-pixel move
++	 * often leaves the integer screen rect unchanged.  The buffer mapping
++	 * still shifts, so we must re-blit the mover — skipping here left
++	 * stale edge samples that looked like soft / missing borders.
++	 */
++	if (same_bounds) {
++		bx0 = nx0;
++		by0 = ny0;
++		bx1 = nx1;
++		by1 = ny1;
++		if (clip_to_display(srv, &amp;bx0, &amp;by0, &amp;bx1, &amp;by1)) {
++			blit_client_overlap(srv, &amp;moved, bx0, by0, bx1, by1);
++			for (p = srv-&gt;clients; p &amp;&amp; p != c; p = p-&gt;next)
++				blit_client_overlap(srv, p, bx0, by0, bx1, by1);
++		}
++		cursor_fb_end(1);
+ 		return;
++	}
+ 
+ 	/*
+ 	 * 1. Exact expose = old \ new.  Inflate old by 1px before subtract to
+-	 * catch integer world→screen rounding hairs that otherwise keep a
+-	 * 1-pixel ribbon of the previous window on the desktop.
++	 * catch residual hairs if bounds and samples disagree by a pixel.
+ 	 */
+ 	{
+ 		int ax0 = ox0 &gt; 0 ? ox0 - 1 : ox0;
+@@ -1540,9 +1579,6 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ 		                     expose, 8);
+ 	}
+ 
+-	cursor_fb_begin();
+-	(void)cursor_lift_all_ret();
+-
+ 	/* 2. Underlay each expose piece (everyone but the mover). */
+ 	for (i = 0; i &lt; nexp; i++)
+ 		composite_all_except(srv, c,
+diff --git a/input.c b/input.c
+index 9fea3f0..bd9d99c 100644
+--- a/input.c
++++ b/input.c
+@@ -470,6 +470,7 @@ static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t ke
+  *  ALT + RIGHT_CLICK + DRAG on a client: resize window
+  *  ALT + LEFT_CLICK + DRAG on empty space: pan the desktop
+  *  ALT + SCROLL: zoom in/out (centered on cursor)
++ *  ALT + TAB / ALT + SHIFT + TAB: cycle focus and restore that app's viewport
+  *
+  *  Returns if shortcut was handled
+  */
+@@ -495,6 +496,31 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		if (ev.value != 1)
+ 			return 0;
+ 
++		/* Alt+Tab / Alt+Shift+Tab: cycle windows (hardwired, not config). */
++		if (alt_down &amp;&amp; !ctrl_down &amp;&amp; ev.code == KEY_TAB) {
++			struct Client *old_focus = server.focused_client;
++			struct Client *now;
++
++			bgce_cycle_focus(&amp;server, shift_down ? 1 : 0);
++			now = server.focused_client;
++			if (old_focus != now) {
++				if (old_focus &amp;&amp; old_focus-&gt;fd &gt;= 0) {
++					struct BGCEMessage lost = {0};
++					lost.type = MSG_FOCUS_CHANGE;
++					lost.data.focus_event.state = 0;
++					(void)bgce_send_msg(old_focus-&gt;fd, &amp;lost);
++				}
++				if (now &amp;&amp; now-&gt;fd &gt;= 0) {
++					struct BGCEMessage got = {0};
++					got.type = MSG_FOCUS_CHANGE;
++					got.data.focus_event.state = 1;
++					(void)bgce_send_msg(now-&gt;fd, &amp;got);
++				}
++			}
++			display_cursor_present();
++			return 1;
++		}
++
+ 		struct shortcut *sc =
+ 		        match_shortcut(ctrl_down, alt_down, shift_down, ev.code);
+ 		if (sc) {
+diff --git a/location_cache.c b/location_cache.c
+index a35db7a..6fb3b13 100644
+--- a/location_cache.c
++++ b/location_cache.c
+@@ -1,10 +1,15 @@
+ /*
+- * Persist last window positions per app id under the user cache dir:
++ * Persist last window positions and viewports per app id under the user
++ * cache dir:
+  *   $XDG_CACHE_HOME/bgce/windows.cache
+  *   or ~/.cache/bgce/windows.cache
+  *
+  * File format (one entry per line):
+- *   app_id x y
++ *   app_id x y [zoom_pct pan_x pan_y]
++ *
++ * x,y are world pixels.  Optional zoom/pan are the viewport that was active
++ * when the app was last left (Alt+Tab target restore, move end, disconnect).
++ * Pure desktop pan does not write this file.
+  */
+ 
+ #define _GNU_SOURCE
+@@ -30,12 +35,17 @@ struct loc_entry {
+ 	char id[LOC_ID_MAX];
+ 	uint32_t x;
+ 	uint32_t y;
++	int zoom_pct; /* 0 = no viewport stored (legacy line) */
++	int pan_x;
++	int pan_y;
+ 	int used;
+ };
+ 
+ static struct loc_entry entries[LOC_CACHE_MAX];
+ static int entries_loaded;
+ 
++extern struct ServerState server;
++
+ static int cache_dir(char *buf, size_t buflen)
+ {
+ 	const char *xdg = getenv("XDG_CACHE_HOME");
+@@ -105,14 +115,28 @@ void location_cache_load(void)
+ 	while (fgets(line, sizeof(line), f) &amp;&amp; i &lt; LOC_CACHE_MAX) {
+ 		char id[LOC_ID_MAX];
+ 		unsigned int x, y;
++		int zoom, pan_x, pan_y;
++		int nfields;
+ 
+ 		if (line[0] == '#' || line[0] == '\n')
+ 			continue;
+-		if (sscanf(line, "%63s %u %u", id, &amp;x, &amp;y) != 3)
++		nfields = sscanf(line, "%63s %u %u %d %d %d", id, &amp;x, &amp;y, &amp;zoom,
++		                 &amp;pan_x, &amp;pan_y);
++		if (nfields != 3 &amp;&amp; nfields != 6)
+ 			continue;
+ 		strncpy(entries[i].id, id, sizeof(entries[i].id) - 1);
++		entries[i].id[sizeof(entries[i].id) - 1] = '\0';
+ 		entries[i].x = x;
+ 		entries[i].y = y;
++		if (nfields == 6 &amp;&amp; zoom &gt; 0) {
++			entries[i].zoom_pct = zoom;
++			entries[i].pan_x = pan_x;
++			entries[i].pan_y = pan_y;
++		} else {
++			entries[i].zoom_pct = 0;
++			entries[i].pan_x = 0;
++			entries[i].pan_y = 0;
++		}
+ 		entries[i].used = 1;
+ 		i++;
+ 	}
+@@ -138,12 +162,17 @@ void location_cache_save(void)
+ 		perror("[BGCE] location cache write");
+ 		return;
+ 	}
+-	fprintf(f, "# BGCE window locations: app_id x y (world pixels)\n");
++	fprintf(f, "# BGCE window locations: app_id x y [zoom pan_x pan_y]\n");
+ 	for (i = 0; i &lt; LOC_CACHE_MAX; i++) {
+ 		if (!entries[i].used)
+ 			continue;
+-		fprintf(f, "%s %u %u\n", entries[i].id, entries[i].x,
+-		        entries[i].y);
++		if (entries[i].zoom_pct &gt; 0)
++			fprintf(f, "%s %u %u %d %d %d\n", entries[i].id,
++			        entries[i].x, entries[i].y, entries[i].zoom_pct,
++			        entries[i].pan_x, entries[i].pan_y);
++		else
++			fprintf(f, "%s %u %u\n", entries[i].id, entries[i].x,
++			        entries[i].y);
+ 		n++;
+ 	}
+ 	fclose(f);
+@@ -169,7 +198,31 @@ int location_cache_lookup(const char *app_id, uint32_t *x, uint32_t *y)
+ 	return 0;
+ }
+ 
+-void location_cache_store(const char *app_id, uint32_t x, uint32_t y)
++int location_cache_lookup_viewport(const char *app_id, int *zoom_pct,
++                                   int *pan_x, int *pan_y)
++{
++	int i;
++
++	if (!app_id || !app_id[0] || !entries_loaded)
++		return 0;
++	for (i = 0; i &lt; LOC_CACHE_MAX; i++) {
++		if (entries[i].used &amp;&amp; strcmp(entries[i].id, app_id) == 0) {
++			if (entries[i].zoom_pct &lt;= 0)
++				return 0;
++			if (zoom_pct)
++				*zoom_pct = entries[i].zoom_pct;
++			if (pan_x)
++				*pan_x = entries[i].pan_x;
++			if (pan_y)
++				*pan_y = entries[i].pan_y;
++			return 1;
++		}
++	}
++	return 0;
++}
++
++void location_cache_store(const char *app_id, uint32_t x, uint32_t y,
++                          int zoom_pct, int pan_x, int pan_y)
+ {
+ 	int i;
+ 	int free_slot = -1;
+@@ -183,6 +236,11 @@ void location_cache_store(const char *app_id, uint32_t x, uint32_t y)
+ 		if (entries[i].used &amp;&amp; strcmp(entries[i].id, app_id) == 0) {
+ 			entries[i].x = x;
+ 			entries[i].y = y;
++			if (zoom_pct &gt; 0) {
++				entries[i].zoom_pct = zoom_pct;
++				entries[i].pan_x = pan_x;
++				entries[i].pan_y = pan_y;
++			}
+ 			return;
+ 		}
+ 		if (!entries[i].used &amp;&amp; free_slot &lt; 0)
+@@ -194,6 +252,15 @@ void location_cache_store(const char *app_id, uint32_t x, uint32_t y)
+ 	entries[free_slot].id[sizeof(entries[free_slot].id) - 1] = '\0';
+ 	entries[free_slot].x = x;
+ 	entries[free_slot].y = y;
++	if (zoom_pct &gt; 0) {
++		entries[free_slot].zoom_pct = zoom_pct;
++		entries[free_slot].pan_x = pan_x;
++		entries[free_slot].pan_y = pan_y;
++	} else {
++		entries[free_slot].zoom_pct = 0;
++		entries[free_slot].pan_x = 0;
++		entries[free_slot].pan_y = 0;
++	}
+ 	entries[free_slot].used = 1;
+ }
+ 
+@@ -246,11 +313,106 @@ void location_cache_identify_client(struct Client *client, int sock_fd)
+ 
+ void location_cache_remember_client(const struct Client *client)
+ {
++	int z;
++
+ 	if (!client || !client-&gt;app_id[0])
+ 		return;
+ 	/* Skip placeholder background client */
+ 	if (client-&gt;z == 0 &amp;&amp; client-&gt;fd &lt; 0)
+ 		return;
+-	location_cache_store(client-&gt;app_id, client-&gt;x, client-&gt;y);
++	z = server.zoom_pct &gt; 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
++	location_cache_store(client-&gt;app_id, client-&gt;x, client-&gt;y, z,
++	                     server.pan_x, server.pan_y);
+ 	location_cache_save();
+ }
++
++/*
++ * Raise client to the head of the stacking list and set focus.
++ * Does not send MSG_FOCUS_CHANGE (caller / input path may do that).
++ */
++static void raise_and_focus(struct ServerState *srv, struct Client *c)
++{
++	struct Client *prev;
++	struct Client *curr;
++
++	if (!srv || !c)
++		return;
++
++	if (c != srv-&gt;clients) {
++		prev = NULL;
++		curr = srv-&gt;clients;
++		while (curr &amp;&amp; curr != c) {
++			prev = curr;
++			curr = curr-&gt;next;
++		}
++		if (curr &amp;&amp; prev) {
++			prev-&gt;next = curr-&gt;next;
++			curr-&gt;next = srv-&gt;clients;
++			srv-&gt;clients = curr;
++		}
++	}
++	if (srv-&gt;focused_client &amp;&amp; srv-&gt;focused_client != c)
++		c-&gt;z = srv-&gt;focused_client-&gt;z + 1;
++	srv-&gt;focused_client = c;
++}
++
++void bgce_cycle_focus(struct ServerState *srv, int reverse)
++{
++	struct Client *list[LOC_CACHE_MAX];
++	struct Client *c;
++	struct Client *target;
++	struct Client *old_focus;
++	int n = 0;
++	int idx = 0;
++	int next;
++	int zoom, pan_x, pan_y;
++	int i;
++
++	if (!srv)
++		return;
++
++	for (c = srv-&gt;clients; c &amp;&amp; n &lt; LOC_CACHE_MAX; c = c-&gt;next) {
++		if (c-&gt;z &gt; 0)
++			list[n++] = c;
++	}
++	if (n == 0)
++		return;
++
++	old_focus = srv-&gt;focused_client;
++	if (old_focus) {
++		for (i = 0; i &lt; n; i++) {
++			if (list[i] == old_focus) {
++				idx = i;
++				break;
++			}
++		}
++		/* Snapshot position + viewport of the window we leave. */
++		location_cache_remember_client(old_focus);
++	}
++
++	if (n == 1)
++		next = 0;
++	else if (reverse)
++		next = (idx - 1 + n) % n;
++	else
++		next = (idx + 1) % n;
++
++	target = list[next];
++	raise_and_focus(srv, target);
++
++	if (location_cache_lookup_viewport(target-&gt;app_id, &amp;zoom, &amp;pan_x,
++	                                   &amp;pan_y)) {
++		if (!bgce_zoom_set(srv, zoom))
++			srv-&gt;zoom_pct = zoom; /* already at that zoom */
++		srv-&gt;pan_x = pan_x;
++		srv-&gt;pan_y = pan_y;
++		clamp_viewport(srv);
++		redraw_all(srv);
++	} else {
++		draw(srv, target);
++	}
++
++	printf("[BGCE] Alt+%sTab → '%s' zoom=%d%% pan=(%d,%d)\n",
++	       reverse ? "Shift+" : "", target-&gt;app_id,
++	       srv-&gt;zoom_pct, srv-&gt;pan_x, srv-&gt;pan_y);
++}
+diff --git a/location_cache.h b/location_cache.h
+index 1cade32..7584519 100644
+--- a/location_cache.h
++++ b/location_cache.h
+@@ -4,6 +4,7 @@
+ #include &lt;stdint.h&gt;
+ 
+ struct Client;
++struct ServerState;
+ 
+ /** Load cache from disk into memory (call once at server start). */
+ void location_cache_load(void);
+@@ -17,8 +18,19 @@ void location_cache_save(void);
+  */
+ int location_cache_lookup(const char *app_id, uint32_t *x, uint32_t *y);
+ 
+-/** Remember world position for app_id (memory only until save). */
+-void location_cache_store(const char *app_id, uint32_t x, uint32_t y);
++/**
++ * Look up last viewport (zoom + pan) for app_id.
++ * Returns 1 if a viewport was stored, 0 if unknown / legacy entry.
++ */
++int location_cache_lookup_viewport(const char *app_id, int *zoom_pct,
++                                   int *pan_x, int *pan_y);
++
++/**
++ * Remember world position and viewport for app_id (memory only until save).
++ * zoom_pct &lt;= 0 means "no viewport" (legacy / position-only entry).
++ */
++void location_cache_store(const char *app_id, uint32_t x, uint32_t y,
++                          int zoom_pct, int pan_x, int pan_y);
+ 
+ /**
+  * Fill client-&gt;app_id from the peer process (SO_PEERCRED + /proc/pid/comm
+@@ -26,7 +38,18 @@ void location_cache_store(const char *app_id, uint32_t x, uint32_t y);
+  */
+ void location_cache_identify_client(struct Client *client, int sock_fd);
+ 
+-/** Store this client's current x,y under its app_id and flush to disk. */
++/**
++ * Store this client's x,y and the current server viewport under its app_id
++ * and flush to disk.  Pure pan of the desktop does not call this.
++ */
+ void location_cache_remember_client(const struct Client *client);
+ 
++/**
++ * Alt+Tab / Alt+Shift+Tab: remember the current focus viewport, cycle to the
++ * next (or previous) client, raise it, and restore its cached zoom/pan so the
++ * window appears on screen in the same place it was left.
++ * reverse=0 → Alt+Tab, reverse=1 → Alt+Shift+Tab.
++ */
++void bgce_cycle_focus(struct ServerState *srv, int reverse);
++
+ #endif
+diff --git a/mock.c b/mock.c
+index daf121c..5257ca0 100644
+--- a/mock.c
++++ b/mock.c
+@@ -280,8 +280,16 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
+ 	int z;
+ 
+ 	screen_to_world(&amp;server, sx, sy, &amp;wx, &amp;wy);
+-	if (!bgce_zoom_set(&amp;server, zoom_pct))
++	if (!bgce_zoom_set(&amp;server, zoom_pct)) {
++		/* Still re-anchor pan even when zoom is unchanged. */
++		z = server.zoom_pct &gt; 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
++		server.pan_x = wx * z / 100 - sx;
++		server.pan_y = wy * z / 100 - sy;
++		clamp_viewport(&amp;server);
++		redraw_all(&amp;server);
++		display_cursor_present();
+ 		return;
++	}
+ 	z = server.zoom_pct &gt; 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+ 	/* pan is screen-pixel: pan = wx*z/100 - sx */
+ 	server.pan_x = wx * z / 100 - sx;
+@@ -291,6 +299,37 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
+ 	display_cursor_present();
+ }
+ 
++void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y)
++{
++	if (!mock_active)
++		return;
++	if (zoom_pct &lt; BGCE_ZOOM_PCT_MIN)
++		zoom_pct = BGCE_ZOOM_PCT_MIN;
++	if (zoom_pct &gt; BGCE_ZOOM_PCT_MAX)
++		zoom_pct = BGCE_ZOOM_PCT_MAX;
++	server.zoom_pct = zoom_pct;
++	server.pan_x = pan_x;
++	server.pan_y = pan_y;
++	clamp_viewport(&amp;server);
++	redraw_all(&amp;server);
++	display_cursor_present();
++}
++
++void bgce_mock_alt_tab(int reverse)
++{
++	if (!mock_active)
++		return;
++	bgce_cycle_focus(&amp;server, reverse ? 1 : 0);
++	display_cursor_present();
++}
++
++void bgce_mock_remember_focus(void)
++{
++	if (!mock_active || !server.focused_client)
++		return;
++	location_cache_remember_client(server.focused_client);
++}
++
+ int bgce_mock_screenshot(const char *path)
+ {
+ 	return take_screenshot(path ? path : "mock_shot.png");
+@@ -301,6 +340,26 @@ void bgce_mock_redraw_all(void)
+ 	redraw_all(&amp;server);
+ }
+ 
++int bgce_mock_fb_matches_full_redraw(void)
++{
++	size_t nbytes;
++	void *snap;
++	int match;
++
++	if (!mock_active || !server.framebuffer || server.fb_size == 0)
++		return -1;
++
++	nbytes = server.fb_size;
++	snap = malloc(nbytes);
++	if (!snap)
++		return -1;
++	memcpy(snap, server.framebuffer, nbytes);
++	redraw_all(&amp;server);
++	match = (memcmp(snap, server.framebuffer, nbytes) == 0);
++	free(snap);
++	return match ? 0 : -1;
++}
++
+ /* Stubs so we don't need server.o (which provides main). */
+ void bgce_announce(const char *fmt, ...)
+ {
+diff --git a/mock.h b/mock.h
+index c56a5e2..cddaa38 100644
+--- a/mock.h
++++ b/mock.h
+@@ -53,10 +53,32 @@ void bgce_mock_pan_screen(int sdx, int sdy);
+ /** Set absolute zoom percent (50–400, 100 = 1×) toward screen point. */
+ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy);
+ 
++/** Set absolute zoom percent and screen-pixel pan (clamped), then redraw. */
++void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y);
++
++/**
++ * Alt+Tab (reverse=0) / Alt+Shift+Tab (reverse=1): cycle focus, raise the
++ * target, and restore its cached viewport (zoom + pan).
++ */
++void bgce_mock_alt_tab(int reverse);
++
++/**
++ * Snapshot focused client's position + current viewport into the location
++ * cache (same as move-end / disconnect).  Desktop pan alone never does this.
++ */
++void bgce_mock_remember_focus(void);
++
+ /** Dump framebuffer to PNG (cursor omitted). path NULL → mock_shot.png */
+ int bgce_mock_screenshot(const char *path);
+ 
+ /** Full redraw (background + all clients). */
+ void bgce_mock_redraw_all(void);
+ 
++/**
++ * Snapshot the FB, run a full redraw, compare.  Returns 0 if identical,
++ * -1 if any pixel differs (FB left as after redraw_all).  Used to catch
++ * move damage holes / edge rounding bugs.
++ */
++int bgce_mock_fb_matches_full_redraw(void);
++
+ #endif /* BGCE_MOCK_H */
+diff --git a/server.h b/server.h
+index e64419f..2f03ae1 100644
+--- a/server.h
++++ b/server.h
+@@ -277,6 +277,13 @@ int bgce_zoom_step(struct ServerState *srv, int dir);
+ /** Set zoom to an absolute percent (clamped). Returns 1 if changed. */
+ int bgce_zoom_set(struct ServerState *srv, int zoom_pct);
+ 
++/**
++ * Alt+Tab (reverse=0) / Alt+Shift+Tab (reverse=1): cycle focus among clients,
++ * raise the target, and restore its cached zoom/pan.  Declared here for the
++ * input path; implementation lives with the location cache.
++ */
++void bgce_cycle_focus(struct ServerState *srv, int reverse);
++
+ /** Map a screen pixel to virtual-desktop (world) coordinates. */
+ void screen_to_world(const struct ServerState* srv, int sx, int sy,
+                      int* wx, int* wy);
+diff --git a/test/headless.c b/test/headless.c
+index 37b259d..9fc51a1 100644
+--- a/test/headless.c
++++ b/test/headless.c
+@@ -12,11 +12,24 @@
+ 
+ #include &lt;stdio.h&gt;
+ #include &lt;stdint.h&gt;
++#include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
++#include &lt;unistd.h&gt;
++
++/* Extern server state (owned by mock.c) for assertions. */
++extern struct ServerState server;
+ 
+ int main(void)
+ {
+ 	struct Client *a, *b, *c;
++	char cache_home[] = "/tmp/bgce_headless_cache_XXXXXX";
++
++	/* Isolate window cache so tests never touch ~/.cache. */
++	if (!mkdtemp(cache_home)) {
++		perror("headless: mkdtemp");
++		return 1;
++	}
++	setenv("XDG_CACHE_HOME", cache_home, 1);
+ 
+ 	if (bgce_mock_init(640, 480) != 0) {
+ 		fprintf(stderr, "headless: mock init failed\n");
+@@ -110,6 +123,236 @@ int main(void)
+ 			return 1;
+ 	}
+ 
++	/*
++	 * Alt+Tab: each app remembers its own viewport.  Switching focus pans
++	 * and zooms back to how that app was left — it does not move windows.
++	 */
++	{
++		int zoom_a, pan_x_a, pan_y_a;
++		int zoom_b, pan_x_b, pan_y_b;
++		int zoom_chk, pan_x_chk, pan_y_chk;
++		uint32_t ax, ay, bx, by;
++
++		bgce_mock_fini();
++		if (bgce_mock_init(640, 480) != 0) {
++			fprintf(stderr, "headless: re-init failed\n");
++			return 1;
++		}
++
++		/* A near world origin; B deeper on the virtual desktop. */
++		a = bgce_mock_add_client(40, 40, 180, 120, 0xFFE74C3C);
++		b = bgce_mock_add_client(500, 350, 180, 120, 0xFF3498DB);
++		if (!a || !b) {
++			fprintf(stderr, "headless: alt-tab clients failed\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		strncpy(a-&gt;app_id, "alt_a", sizeof(a-&gt;app_id) - 1);
++		a-&gt;app_id[sizeof(a-&gt;app_id) - 1] = '\0';
++		strncpy(b-&gt;app_id, "alt_b", sizeof(b-&gt;app_id) - 1);
++		b-&gt;app_id[sizeof(b-&gt;app_id) - 1] = '\0';
++		bgce_mock_draw(a);
++		bgce_mock_draw(b);
++
++		/*
++		 * Viewport for A: zoomed in near the origin so A is large and
++		 * sits toward the top-left of the screen (pan 0,0).
++		 */
++		bgce_mock_focus(a);
++		bgce_mock_set_viewport(200, 0, 0);
++		zoom_a = server.zoom_pct;
++		pan_x_a = server.pan_x;
++		pan_y_a = server.pan_y;
++		ax = a-&gt;x;
++		ay = a-&gt;y;
++		bgce_mock_remember_focus();
++		if (bgce_mock_screenshot("headless_09_alt_a_viewport.png") != 0)
++			return 1;
++
++		/*
++		 * Viewport for B: 1:1 zoom, panned so B (world 500,350) lands
++		 * near the middle of the 640×480 screen.
++		 *   sx = 500 - pan_x ≈ 220 → pan_x = 280
++		 *   sy = 350 - pan_y ≈ 180 → pan_y = 170
++		 */
++		bgce_mock_focus(b);
++		bgce_mock_set_viewport(100, 280, 170);
++		zoom_b = server.zoom_pct;
++		pan_x_b = server.pan_x;
++		pan_y_b = server.pan_y;
++		bx = b-&gt;x;
++		by = b-&gt;y;
++		bgce_mock_remember_focus();
++		if (bgce_mock_screenshot("headless_10_alt_b_viewport.png") != 0)
++			return 1;
++
++		/*
++		 * Pure pan must not rewrite the cache.  After panning away from B's
++		 * remembered viewport, the stored entry is still the old one.
++		 */
++		bgce_mock_pan_screen(100, 50);
++		if (!location_cache_lookup_viewport("alt_b", &amp;zoom_chk, &amp;pan_x_chk,
++		                                    &amp;pan_y_chk) ||
++		    zoom_chk != zoom_b || pan_x_chk != pan_x_b ||
++		    pan_y_chk != pan_y_b) {
++			fprintf(stderr,
++			        "headless: pan updated cache (got zoom=%d pan=%d,%d "
++			        "want %d %d,%d)\n",
++			        zoom_chk, pan_x_chk, pan_y_chk, zoom_b, pan_x_b,
++			        pan_y_b);
++			bgce_mock_fini();
++			return 1;
++		}
++		if (bgce_mock_screenshot("headless_11_panned_no_cache.png") != 0)
++			return 1;
++
++		/*
++		 * Put the live camera back on B's remembered viewport (without
++		 * re-writing the cache) so Alt+Tab leave still records the same
++		 * values we assert later.
++		 */
++		bgce_mock_set_viewport(zoom_b, pan_x_b, pan_y_b);
++
++		/* Stacking: B is focused on top.  Alt+Tab → A, restore A's view. */
++		if (server.focused_client != b) {
++			fprintf(stderr, "headless: expected focus on B before alt-tab\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		bgce_mock_alt_tab(0);
++		if (server.focused_client != a) {
++			fprintf(stderr, "headless: Alt+Tab did not focus A\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		if (server.clients != a) {
++			fprintf(stderr, "headless: Alt+Tab did not raise A\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		if (server.zoom_pct != zoom_a || server.pan_x != pan_x_a ||
++		    server.pan_y != pan_y_a) {
++			fprintf(stderr,
++			        "headless: Alt+Tab viewport for A wrong "
++			        "(zoom=%d pan=%d,%d want %d %d,%d)\n",
++			        server.zoom_pct, server.pan_x, server.pan_y, zoom_a,
++			        pan_x_a, pan_y_a);
++			bgce_mock_fini();
++			return 1;
++		}
++		/* Window positions must not change — only the camera moves. */
++		if (a-&gt;x != ax || a-&gt;y != ay || b-&gt;x != bx || b-&gt;y != by) {
++			fprintf(stderr, "headless: Alt+Tab moved a window\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		if (bgce_mock_screenshot("headless_12_alt_tab_to_a.png") != 0)
++			return 1;
++
++		/* Alt+Tab again → B with B's viewport. */
++		bgce_mock_alt_tab(0);
++		if (server.focused_client != b) {
++			fprintf(stderr, "headless: Alt+Tab did not return to B\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		if (server.zoom_pct != zoom_b || server.pan_x != pan_x_b ||
++		    server.pan_y != pan_y_b) {
++			fprintf(stderr,
++			        "headless: Alt+Tab viewport for B wrong "
++			        "(zoom=%d pan=%d,%d want %d %d,%d)\n",
++			        server.zoom_pct, server.pan_x, server.pan_y, zoom_b,
++			        pan_x_b, pan_y_b);
++			bgce_mock_fini();
++			return 1;
++		}
++		if (bgce_mock_screenshot("headless_13_alt_tab_to_b.png") != 0)
++			return 1;
++
++		/* Alt+Shift+Tab cycles backwards → A again. */
++		bgce_mock_alt_tab(1);
++		if (server.focused_client != a) {
++			fprintf(stderr, "headless: Alt+Shift+Tab did not focus A\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		if (server.zoom_pct != zoom_a || server.pan_x != pan_x_a ||
++		    server.pan_y != pan_y_a) {
++			fprintf(stderr,
++			        "headless: Alt+Shift+Tab viewport for A wrong\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		if (bgce_mock_screenshot("headless_14_alt_shift_tab.png") != 0)
++			return 1;
++	}
++
++	/*
++	 * Slow multi-step moves at several zooms must match a full recomposite.
++	 * Catches edge rounding / skipped redraw when the screen rect is stable
++	 * under a 1-world-pixel step (common when zoomed out).
++	 */
++	{
++		int zooms[] = { 50, 100, 150, 200 };
++		int zi, step;
++		int fails = 0;
++
++		bgce_mock_fini();
++		if (bgce_mock_init(640, 480) != 0) {
++			fprintf(stderr, "headless: move-edge re-init failed\n");
++			return 1;
++		}
++
++		a = bgce_mock_add_client(80, 60, 160, 100, 0xFFE67E22);
++		b = bgce_mock_add_client(200, 140, 140, 90, 0xFF8E44AD);
++		if (!a || !b) {
++			fprintf(stderr, "headless: move-edge clients failed\n");
++			bgce_mock_fini();
++			return 1;
++		}
++		/* Skip location-cache I/O during pixel-step stress. */
++		a-&gt;app_id[0] = '\0';
++		b-&gt;app_id[0] = '\0';
++		bgce_mock_draw(a);
++		bgce_mock_draw(b);
++
++		for (zi = 0; zi &lt; (int)(sizeof(zooms) / sizeof(zooms[0])); zi++) {
++			bgce_mock_set_viewport(zooms[zi], 0, 0);
++			bgce_mock_focus(a);
++			/* Walk right/down one world pixel at a time. */
++			for (step = 0; step &lt; 40; step++) {
++				bgce_mock_move(a, 1, (step % 3 == 0) ? 1 : 0);
++				if (bgce_mock_fb_matches_full_redraw() != 0) {
++					fprintf(stderr,
++					        "headless: move damage mismatch "
++					        "zoom=%d%% step=%d pos=%u,%u\n",
++					        zooms[zi], step, a-&gt;x, a-&gt;y);
++					fails++;
++					break;
++				}
++			}
++			/* Diagonal-ish reverse */
++			for (step = 0; step &lt; 25; step++) {
++				bgce_mock_move(a, -1, -1);
++				if (bgce_mock_fb_matches_full_redraw() != 0) {
++					fprintf(stderr,
++					        "headless: reverse move mismatch "
++					        "zoom=%d%% step=%d pos=%u,%u\n",
++					        zooms[zi], step, a-&gt;x, a-&gt;y);
++					fails++;
++					break;
++				}
++			}
++		}
++
++		if (bgce_mock_screenshot("headless_15_slow_move.png") != 0)
++			return 1;
++		if (fails) {
++			bgce_mock_fini();
++			return 1;
++		}
++	}
++
+ 	printf("headless complete. PNG frames written.\n");
+ 	bgce_mock_fini();
+ 	return 0;
+</pre>

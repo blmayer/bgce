@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce a21c319</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit a21c319
+parent <a href=commit-af00db9.html>af00db9</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-06T19:58:49-03:00
+
+    Announce display permission errors; forward SIGINT as Ctrl+C.
+
+    Surface /dev/fb* and DRM open failures on the real console as well as
+    the log, and treat terminal Ctrl+C as key events for the focused client
+    instead of killing the server (SIGTERM/exit shortcut still quit).
+
+<a href=tree-a21c319.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/display_drm.c b/display_drm.c
+index 3ce1693..d6d22fe 100644
+--- a/display_drm.c
++++ b/display_drm.c
+@@ -90,7 +90,13 @@ int init_display(void)
+ 			break;
+ 	}
+ 	if (drm_fd &lt; 0) {
+-		perror("[BGCE] open drm device (tried /dev/dri/card0..9)");
++		bgce_announce("[BGCE] open /dev/dri/card*: %s\n", strerror(errno));
++		if (errno == EACCES || errno == EPERM) {
++			bgce_announce(
++			        "[BGCE] no permission for the DRM device.\n"
++			        "[BGCE] add your user to the 'video' (and often 'render') group:\n"
++			        "[BGCE]   sudo usermod -aG video,render \"$USER\"\n");
++		}
+ 		return 1;
+ 	}
+ 	server.display_fd = drm_fd;
+diff --git a/display_fbdev.c b/display_fbdev.c
+index 7a85859..1bd0a6e 100644
+--- a/display_fbdev.c
++++ b/display_fbdev.c
+@@ -26,25 +26,55 @@ int init_display(void)
+ 	const char *used = NULL;
+ 	int i;
+ 
+-	for (i = 0; paths[i]; i++) {
+-		fd = open(paths[i], O_RDWR | O_CLOEXEC);
+-		if (fd &gt;= 0) {
+-			used = paths[i];
+-			break;
++	{
++		int saw_perm = 0;
++		int saw_missing = 0;
++
++		for (i = 0; paths[i]; i++) {
++			fd = open(paths[i], O_RDWR | O_CLOEXEC);
++			if (fd &gt;= 0) {
++				used = paths[i];
++				break;
++			}
++			/* Must not fail silently: after setup_log_file, only the log
++			 * would see perror unless we also write the real console. */
++			bgce_announce("[BGCE] open %s: %s\n", paths[i], strerror(errno));
++			if (errno == EACCES || errno == EPERM)
++				saw_perm = 1;
++			else if (errno == ENOENT)
++				saw_missing = 1;
++		}
++		if (fd &lt; 0) {
++			bgce_announce(
++			        "[BGCE] failed to open any of /dev/fb0, /dev/fb1, /dev/fb2\n");
++			if (saw_perm) {
++				bgce_announce(
++				        "[BGCE] no permission for the framebuffer device.\n"
++				        "[BGCE] add your user to the 'video' group, then re-login:\n"
++				        "[BGCE]   sudo usermod -aG video \"$USER\"\n"
++				        "[BGCE] and check: ls -l /dev/fb0\n");
++			} else if (saw_missing) {
++				bgce_announce(
++				        "[BGCE] no framebuffer device node found "
++				        "(is fbdev available on this system?)\n");
++			}
++			return 1;
+ 		}
+-	}
+-	if (fd &lt; 0) {
+-		perror("[BGCE] open /dev/fb*");
+-		return 1;
+ 	}
+ 
+ 	struct fb_var_screeninfo vinfo;
+ 	struct fb_fix_screeninfo finfo;
+ 	memset(&amp;vinfo, 0, sizeof(vinfo));
+ 	memset(&amp;finfo, 0, sizeof(finfo));
+-	if (ioctl(fd, FBIOGET_VSCREENINFO, &amp;vinfo) &lt; 0 ||
+-	    ioctl(fd, FBIOGET_FSCREENINFO, &amp;finfo) &lt; 0) {
+-		perror("[BGCE] FBIOGET_*SCREENINFO");
++	if (ioctl(fd, FBIOGET_VSCREENINFO, &amp;vinfo) &lt; 0) {
++		bgce_announce("[BGCE] FBIOGET_VSCREENINFO on %s: %s\n", used,
++		              strerror(errno));
++		close(fd);
++		return 1;
++	}
++	if (ioctl(fd, FBIOGET_FSCREENINFO, &amp;finfo) &lt; 0) {
++		bgce_announce("[BGCE] FBIOGET_FSCREENINFO on %s: %s\n", used,
++		              strerror(errno));
+ 		close(fd);
+ 		return 1;
+ 	}
+@@ -56,7 +86,7 @@ int init_display(void)
+ 		vinfo.xoffset = 0;
+ 		vinfo.yoffset = 0;
+ 		if (ioctl(fd, FBIOPUT_VSCREENINFO, &amp;vinfo) &lt; 0) {
+-			fprintf(stderr,
++			bgce_announce(
+ 			        "[BGCE] need 32bpp framebuffer (have %u): %s\n",
+ 			        saved_vinfo.bits_per_pixel, strerror(errno));
+ 			close(fd);
+@@ -71,8 +101,8 @@ int init_display(void)
+ 	}
+ 
+ 	if (vinfo.bits_per_pixel != 32) {
+-		fprintf(stderr, "[BGCE] unsupported bpp %u (want 32)\n",
+-		        (unsigned)vinfo.bits_per_pixel);
++		bgce_announce("[BGCE] unsupported bpp %u (want 32)\n",
++		              (unsigned)vinfo.bits_per_pixel);
+ 		close(fd);
+ 		return 1;
+ 	}
+@@ -84,7 +114,7 @@ int init_display(void)
+ 
+ 	void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+ 	if (map == MAP_FAILED) {
+-		perror("[BGCE] mmap /dev/fb");
++		bgce_announce("[BGCE] mmap %s: %s\n", used, strerror(errno));
+ 		close(fd);
+ 		return 1;
+ 	}
+@@ -105,7 +135,7 @@ int init_display(void)
+ 	       server.display_pitch, server.display_bpp);
+ 
+ 	if (display_cursor_init() != 0) {
+-		fprintf(stderr, "[BGCE] software cursor init failed\n");
++		bgce_announce("[BGCE] software cursor init failed\n");
+ 		release_display();
+ 		return 1;
+ 	}
+diff --git a/input.c b/input.c
+index 1ca97da..b665120 100644
+--- a/input.c
++++ b/input.c
+@@ -804,25 +804,88 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 	return 0;
+ }
+ 
++/* Send one EV_KEY to the focused client (no-op if nothing focused). */
++static void send_key_to_focused(uint16_t code, int32_t value)
++{
++	struct Client *fc = server.focused_client;
++	struct BGCEMessage msg;
++	struct InputEvent *e;
++
++	if (!fc || fc-&gt;fd &lt; 0)
++		return;
++
++	memset(&amp;msg, 0, sizeof(msg));
++	msg.type = MSG_INPUT_EVENT;
++	e = &amp;msg.data.input_event;
++	e-&gt;type = EV_KEY;
++	e-&gt;code = code;
++	e-&gt;value = value;
++	if (server.input.count &gt; 0)
++		e-&gt;device = server.input.devs[0];
++	bgce_send_msg(fc-&gt;fd, &amp;msg);
++}
++
++void deliver_interrupt_to_focus(void)
++{
++	struct Client *fc = server.focused_client;
++	int inject_ctrl;
++
++	if (!fc || fc-&gt;fd &lt; 0) {
++		printf("[BGCE] SIGINT/Ctrl+C: no focused client — ignored "
++		       "(use exit shortcut to quit the server)\n");
++		return;
++	}
++
++	printf("[BGCE] SIGINT/Ctrl+C: forwarding to focused client fd=%d\n", fc-&gt;fd);
++
++	/*
++	 * Clients see normal EV_KEY traffic (not Unix signals). Synthesize the
++	 * usual Ctrl+C chord. If Ctrl is already held from the keyboard, only
++	 * send C press/release.
++	 */
++	inject_ctrl = !ctrl_down;
++	if (inject_ctrl)
++		send_key_to_focused(KEY_LEFTCTRL, 1);
++	send_key_to_focused(KEY_C, 1);
++	send_key_to_focused(KEY_C, 0);
++	if (inject_ctrl)
++		send_key_to_focused(KEY_LEFTCTRL, 0);
++}
++
++static void poll_sigint(void)
++{
++	if (!bgce_sigint_pending)
++		return;
++	bgce_sigint_pending = 0;
++	deliver_interrupt_to_focus();
++}
++
+ void* input_loop(void* arg) {
+ 	(void)arg;
+ 
+ 	if (count == 0) {
+ 		printf("[BGCE] Input: no devices, input thread parked\n");
+-		while (1) pause();
++		while (1) {
++			poll_sigint();
++			sleep(1);
++		}
+ 		return NULL;
+ 	}
+ 
+ 	printf("[BGCE] Input: polling %zu device(s)\n", count);
+ 
+ 	while (1) {
+-		int ret = poll(fds, count, -1);
++		/* Finite timeout so SIGINT (set from another thread/handler) is noticed. */
++		int ret = poll(fds, count, 200);
++		poll_sigint();
+ 		if (ret &lt; 0) {
+ 			if (errno == EINTR)
+ 				continue;
+ 			fprintf(stderr, "[BGCE] Input: poll error: %s\n", strerror(errno));
+ 			break;
+ 		}
++		if (ret == 0)
++			continue;
+ 
+ 		for (size_t i = 0; i &lt; count; i++) {
+ 			if (fds[i].revents &amp; (POLLHUP | POLLERR)) {
+diff --git a/server.c b/server.c
+index 2eee958..97efa69 100644
+--- a/server.c
++++ b/server.c
+@@ -5,6 +5,7 @@
+ #include &lt;fcntl.h&gt;
+ #include &lt;pthread.h&gt;
+ #include &lt;signal.h&gt;
++#include &lt;stdarg.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+@@ -18,6 +19,16 @@
+ struct ServerState server = {}; /* Global server state */
+ struct config config = {};            /* Global config (background + shortcuts) */
+ 
++/* SIGINT (Ctrl+C on the controlling tty) — do not kill the server; the input
++ * thread turns this into key events for the focused client. */
++volatile sig_atomic_t bgce_sigint_pending = 0;
++
++static void on_sigint(int sig)
++{
++	(void)sig;
++	bgce_sigint_pending = 1;
++}
++
+ static void ensure_dir(const char *path) {
+ 	struct stat st;
+ 	if (stat(path, &amp;st) == 0 &amp;&amp; S_ISDIR(st.st_mode))
+@@ -28,6 +39,34 @@ static void ensure_dir(const char *path) {
+ 
+ static char listen_sock_path[BGCE_SOCKPATH_MAX];
+ static char log_file_path[512];
++/* Original stderr before log redirect — so permission errors are not silent. */
++static int console_fd = -1;
++
++void bgce_announce(const char *fmt, ...)
++{
++	va_list ap;
++	char buf[1024];
++	int n;
++
++	if (!fmt)
++		return;
++
++	va_start(ap, fmt);
++	n = vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	if (n &lt; 0)
++		return;
++	if (n &gt;= (int)sizeof(buf))
++		n = (int)sizeof(buf) - 1;
++
++	/* Log file (stdout/stderr may already be redirected). */
++	fwrite(buf, 1, (size_t)n, stderr);
++	fflush(stderr);
++
++	/* Original terminal, if we still have it. */
++	if (console_fd &gt;= 0)
++		(void)write(console_fd, buf, (size_t)n);
++}
+ 
+ /* Read lines from a pipe and append them to the log with timestamps. */
+ static void *log_timestamp_thread(void *arg)
+@@ -108,8 +147,15 @@ static void setup_log_file(void) {
+ 
+ 	snprintf(log_file_path, sizeof(log_file_path), "%s/bgce.log", dir);
+ 
++	/* Keep the real terminal for fatal messages after redirect. */
++	if (console_fd &lt; 0)
++		console_fd = dup(STDERR_FILENO);
++
+ 	/* Tell the user (on their original terminal) where logs are going */
+-	dprintf(STDERR_FILENO, "[BGCE] Logging to %s\n", log_file_path);
++	if (console_fd &gt;= 0)
++		dprintf(console_fd, "[BGCE] Logging to %s\n", log_file_path);
++	else
++		dprintf(STDERR_FILENO, "[BGCE] Logging to %s\n", log_file_path);
+ 
+ 	if (pipe(pipefd) &lt; 0) {
+ 		/* Fall back to untimestamped direct log */
+@@ -159,8 +205,9 @@ int main(void) {
+ 	/* A crashed client must not take down the server on the next write(). */
+ 	signal(SIGPIPE, SIG_IGN);
+ 
+-	/* Ensure VT is restored on termination signals */
+-	signal(SIGINT, cleanup_and_exit);
++	/* Ctrl+C on the tty must not kill the compositor — forward to focus. */
++	signal(SIGINT, on_sigint);
++	/* Real shutdown: kill/SIGTERM or configured exit shortcut (e.g. ctrl+alt+q) */
+ 	signal(SIGTERM, cleanup_and_exit);
+ 
+ 	memset(&amp;server, 0, sizeof(struct ServerState));
+@@ -225,7 +272,9 @@ int main(void) {
+ 	server.server_fd = fd;
+ 
+ 	if (init_display() != 0) {
+-		fprintf(stderr, "[BGCE] display init failed\n");
++		bgce_announce("[BGCE] display init failed — cannot continue\n");
++		if (log_file_path[0])
++			bgce_announce("[BGCE] details are also in %s\n", log_file_path);
+ 		release_display();
+ 		return 1;
+ 	}
+diff --git a/server.h b/server.h
+index 214e286..77f2451 100644
+--- a/server.h
++++ b/server.h
+@@ -5,6 +5,7 @@
+ #include "bgce.h"
+ 
+ #include &lt;pthread.h&gt;
++#include &lt;signal.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;sys/types.h&gt;
+ 
+@@ -158,10 +159,23 @@ int apply_background(struct config* config, uint32_t* buffer, uint32_t width, ui
+  * Server Functions
+  * ---------------------------- */
+ 
++/**
++ * After setup_log_file(), stdout/stderr go to the log file only.
++ * Use this for fatal/startup errors that must also appear on the
++ * original terminal (e.g. cannot open /dev/fb0).
++ */
++void bgce_announce(const char *fmt, ...);
++
++/** Set by SIGINT handler; input thread delivers as Ctrl+C to focus. */
++extern volatile sig_atomic_t bgce_sigint_pending;
++
++/** Forward a synthetic Ctrl+C (KEY_LEFTCTRL + KEY_C) to the focused client. */
++void deliver_interrupt_to_focus(void);
++
+ /**
+  * Display
+  */
+-int init_display();
++int init_display(void);
+ 
+ void release_display(void);
+ 
+</pre>

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce fb43a29</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit fb43a29
+parent <a href=commit-289763f.html>289763f</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-03T13:36:00-03:00
+
+    Install into flat /bin /lib /include for lin0.
+
+    Default to cc, libdrm under /include/libdrm, and make ldconfig optional so make install works on musl without /usr.
+
+<a href=tree-fb43a29.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/Makefile b/Makefile
+index 7f68e71..8fa42ec 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+-CC = gcc
+-CFLAGS = -Wall -O1 -std=c99 -fPIC -g -I/usr/include/libdrm -I.
+-LDFLAGS = -lrt -ldrm -lm
++CC ?= cc
++CFLAGS ?= -Wall -O1 -std=c99 -fPIC -g -I/include/libdrm -I.
++LDFLAGS ?= -lrt -ldrm -lm
+ 
+ SERVER_OBJS = server.o loop.o libbgce.so input.o display.o config.o
+ LIB_OBJS = libbgce.o
+@@ -22,9 +22,9 @@ client: client.c bgce.h
+ clean:
+ 	rm -f *.o bgce libbgce.so client app
+ 
+-INSTALL_BIN = /usr/bin
+-INSTALL_LIB = /usr/lib
+-INSTALL_INCLUDE = /usr/include
++INSTALL_BIN = /bin
++INSTALL_LIB = /lib
++INSTALL_INCLUDE = /include
+ 
+ .PHONY: install
+ install: bgce libbgce.so bgce.h
+@@ -34,7 +34,7 @@ install: bgce libbgce.so bgce.h
+ 	install -m 755 libbgce.so $(INSTALL_LIB)
+ 	install -d $(INSTALL_INCLUDE)
+ 	install -m 644 bgce.h $(INSTALL_INCLUDE)
+-	ldconfig
++	-ldconfig 2&gt;/dev/null || true
+ 
+ SERVER_LOG ?= server.log
+ SERVER_PID ?= server.pid
+diff --git a/README.md b/README.md
+index 08dd178..8b0a365 100644
+--- a/README.md
++++ b/README.md
+@@ -78,15 +78,20 @@ I also posted a video on my blog:
+ 
+ ## Build Instructions
+ 
++On lin0 use `/bin/cc` and install into the flat root (`/bin`, `/lib`, `/include` — no `/usr`):
++
+ ```bash
+ git clone &lt;repo-url&gt;
+-cd BGCE
+-make all client
++cd bgce
++make CC=cc CFLAGS='-Wall -O1 -std=c99 -fPIC -I/include/libdrm -I.' all client
++make install
+ ./bgce   # Start server
+ # Go to a different tty
+ ./client  # Start test client
+ ```
+ 
++Needs userspace `libdrm` headers in `/include/libdrm` and `libdrm.so` in `/lib`.
++
+ 
+ ## Configuration
+ 
+</pre>

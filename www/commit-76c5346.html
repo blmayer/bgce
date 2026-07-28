@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 76c5346</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 76c5346
+parent <a href=commit-a948cd5.html>a948cd5</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-06-09T12:05:48-03:00
+
+    updated www pages with shortcuts section
+
+<a href=tree-76c5346.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/www/index.html b/www/index.html
+index a5b497d..a753f14 100644
+--- a/www/index.html
++++ b/www/index.html
+@@ -80,6 +80,20 @@ color = #RRGGBBAA # Hex color with alpha
+ #path = /path/to/image.png
+ #mode = tiled     # or "scaled"
+ 
++[shortcuts]
++# Define keyboard shortcuts. Format:
++# &lt;combo&gt; = &lt;type&gt;:&lt;value&gt;
++#
++# type is one of:
++#   builtin  - value must be "exit" or "screenshot"
++#   command  - value is a shell command to run in a new process
++#
++# Combo examples: ctrl+alt+q, sysrq, f12, ctrl+shift+s, super+r
++
++# Defaults (active when no [shortcuts] section is present or it is empty):
++# ctrl+alt+q = builtin:exit
++# sysrq = builtin:screenshot
++
+ 
+ &lt;i&gt;Example Config File&lt;/i&gt;
+ 
+@@ -94,6 +108,17 @@ type = image
+ path = /usr/share/backgrounds/default.png
+ mode = scaled
+ 
++With custom shortcuts:
++
++[shortcuts]
++ctrl+alt+q = builtin:exit
++sysrq = builtin:screenshot
++
++# Launch programs (commands run via /bin/sh -c in a separate process)
++ctrl+alt+t = command:alacritty
++super+r = command:rofi -show drun
++f12 = command:sh -c 'import -window root ~/screenshot.png'
++
+ 
+ &lt;i&gt;Notes&lt;/i&gt;
+ 
+</pre>

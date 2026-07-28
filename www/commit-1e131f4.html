@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 1e131f4</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 1e131f4
+parent <a href=commit-1e229ee.html>1e229ee</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2026-02-07T11:53:35-03:00
+
+    added focus change messages
+
+<a href=tree-1e131f4.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/bgce.h b/bgce.h
+index fbadb09..aa89780 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -82,6 +82,11 @@ struct InputEvent {
+        struct InputDevice device;
+ };
+ 
++/* Focus event: state=0 (lost), state=1 (gained) */
++struct FocusEvent {
++	int32_t state;
++};
++
+ struct BGCEMessage {
+ 	uint32_t type;
+ 	union {
+@@ -90,6 +95,7 @@ struct BGCEMessage {
+ 		struct BufferReply buffer_reply;
+ 		struct MoveRequest move_buffer_request;
+ 		struct InputEvent input_event;
++		struct FocusEvent focus_event;
+ 		struct MoveRequest move_request;
+ 	} data;
+ };
+diff --git a/client.c b/client.c
+index e0fb4c3..b333dd2 100644
+--- a/client.c
++++ b/client.c
+@@ -87,6 +87,11 @@ int main(void) {
+ 			       ev.device.name, ev.code, ev.value);
+ 			break;
+ 		}
++		case MSG_FOCUS_CHANGE: {
++			int state = msg.data.focus_event.state;
++			printf("[BGCE Client] Focus %s\n", state ? "gained" : "lost");
++			break;
++		}
+ 		case MSG_BUFFER_CHANGE: {
+ 			struct BufferReply b = msg.data.buffer_reply;
+ 			printf("[BGCE] Buffer change event: w=%u h=%u shm_name=%s\n", b.width, b.height, b.shm_name);
+@@ -108,7 +113,6 @@ int main(void) {
+ 			printf("[BGCE Client] Unknown message type %d\n", msg.type);
+ 			break;
+ 		}
+-
+ 		// Check if 10 seconds have passed
+ 		if (time(NULL) - start_time &gt;= 10) {
+ 			printf("[BGCE Client] Timeout reached, exiting...\n");
+diff --git a/input.c b/input.c
+index d53095f..03d7dce 100644
+--- a/input.c
++++ b/input.c
+@@ -92,7 +92,7 @@ struct Client* pick_client(int x, int y) {
+ 		}
+ 		c = c-&gt;next;
+ 	}
+-	return picked-&gt;z &gt; 0 ? picked : NULL; // avoid getting the background
++	return (picked &amp;&amp; picked-&gt;z &gt; 0) ? picked : NULL; // avoid getting the background
+ }
+ 
+ int init_input(void) {
+@@ -248,9 +248,16 @@ static int handle_input_event(struct input_event ev) {
+ 	if (ev.type == EV_KEY &amp;&amp; (ev.code == BTN_LEFT || ev.code == BTN_RIGHT) &amp;&amp; ev.value == 1) {
+ 		printf("[BGCE] Click detected at (%d, %d).\n", mouse_x, mouse_y);
+ 
+-		// switch focuse
++		/* switch focus */
+ 		struct Client* c = pick_client(mouse_x, mouse_y);
++		struct Client* old_focus = server.focused_client;
+ 		if (!c) {
++			if (old_focus) {
++				struct BGCEMessage lost = {0};
++				lost.type = MSG_FOCUS_CHANGE;
++				lost.data.focus_event.state = 0;
++				bgce_send_msg(old_focus-&gt;fd, &amp;lost);
++			}
+ 			server.focused_client = NULL;
+ 			return 0;
+ 		}
+@@ -268,9 +275,26 @@ static int handle_input_event(struct input_event ev) {
+ 				server.clients = c;
+ 			}
+ 		}
+-		if (c != server.focused_client) {
+-			c-&gt;z = server.focused_client-&gt;z + 1;
++
++		if (c != old_focus) {
++			if (old_focus) {
++				struct BGCEMessage lost = {0};
++				lost.type = MSG_FOCUS_CHANGE;
++				lost.data.focus_event.state = 0;
++				bgce_send_msg(old_focus-&gt;fd, &amp;lost);
++			}
++
++			/* keep z monotonic (if no previous focus, keep current z) */
++			if (old_focus) {
++				c-&gt;z = old_focus-&gt;z + 1;
++			}
+ 			server.focused_client = c;
++
++			struct BGCEMessage got = {0};
++			got.type = MSG_FOCUS_CHANGE;
++			got.data.focus_event.state = 1;
++			bgce_send_msg(c-&gt;fd, &amp;got);
++
+ 			draw(&amp;server, *c);
+ 			printf("[BGCE] Client focused.\n");
+ 		}
+diff --git a/loop.c b/loop.c
+index 24f3377..24c69c6 100644
+--- a/loop.c
++++ b/loop.c
+@@ -32,13 +32,16 @@ void* client_thread(void* arg) {
+ 	client-&gt;next = server.clients;
+ 	client-&gt;z = server.clients-&gt;z + 1;
+ 	server.clients = client;
+-	server.focused_client = client; /* last connected client gets focus */
+ 
+-	if (!client) {
+-		fprintf(stderr, "[BGCE] No available client slots\n");
+-		close(client_fd);
+-		return NULL;
++	/* last connected client gets focus (notify old focus only; don't notify the new client yet) */
++	struct Client* old_focus = server.focused_client;
++	if (old_focus &amp;&amp; old_focus != client) {
++		struct BGCEMessage lost = {0};
++		lost.type = MSG_FOCUS_CHANGE;
++		lost.data.focus_event.state = 0;
++		bgce_send_msg(old_focus-&gt;fd, &amp;lost);
+ 	}
++	server.focused_client = client;
+ 
+ 	printf("[BGCE] Thread started for client fd=%d z=%d\n", client_fd, client-&gt;z);
+ 
+@@ -120,11 +123,10 @@ void* client_thread(void* arg) {
+ 
+ 		case MSG_DRAW: {
+ 			printf("[BGCE] Received draw event from client %s\n", client-&gt;shm_name);
+-			if (client_fd != server.focused_client-&gt;fd) {
+-				printf("[BGCE] Client is not focused!\n");
+-				break;
+-			}
+-
++			/*
++			 * Drawing must be allowed even when the client is not focused.
++			 * Focus only affects input routing.
++			 */
+ 			draw(&amp;server, *client);
+ 			break;
+ 		}
+@@ -167,9 +169,13 @@ void* client_thread(void* arg) {
+ 	}
+ 
+ 	if (server.focused_client == client) {
++		/* notify focused client it lost focus before we clear */
++		struct BGCEMessage lost = {0};
++		lost.type = MSG_FOCUS_CHANGE;
++		lost.data.focus_event.state = 0;
++		bgce_send_msg(client-&gt;fd, &amp;lost);
+ 		server.focused_client = NULL;
+ 	}
+-
+ 	close(client-&gt;fd);
+ 
+ 	printf("[BGCE] Thread exiting for client fd=%d\n", client-&gt;fd);
+diff --git a/server.c b/server.c
+index 375fe2e..3fa1b87 100644
+--- a/server.c
++++ b/server.c
+@@ -3,7 +3,6 @@
+ 
+ #include &lt;errno.h&gt;
+ #include &lt;pthread.h&gt;
+-#include &lt;signal.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+</pre>

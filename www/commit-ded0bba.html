@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce ded0bba</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit ded0bba
+parent <a href=commit-d634f6c.html>d634f6c</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-09T16:22:14-03:00
+
+    Link location_cache.o into the bgce server binary.
+
+    It was listed in SERVER_OBJS but omitted from the final link line.
+
+<a href=tree-ded0bba.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/Makefile b/Makefile
+index 757b4f6..4318308 100644
+--- a/Makefile
++++ b/Makefile
+@@ -32,7 +32,7 @@ HEADLESS_OBJS = display.o display_mock.o config.o mock.o input_headless.o locati
+ all: bgce libbgce.so
+ 
+ bgce: $(SERVER_OBJS)
+-	$(CC) $(CFLAGS) -o $@ server.o loop.o input.o display.o $(DISPLAY_OBJ) config.o -L. -lbgce $(LDFLAGS)
++	$(CC) $(CFLAGS) -o $@ server.o loop.o input.o display.o $(DISPLAY_OBJ) config.o location_cache.o -L. -lbgce $(LDFLAGS)
+ 
+ libbgce.so: $(LIB_OBJS)
+ 	$(CC) -shared -o $@ $(LIB_OBJS)
+</pre>

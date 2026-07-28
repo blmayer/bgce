@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce bd43f78</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit bd43f78
+parent <a href=commit-fcfdbd1.html>fcfdbd1</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-14T17:29:31-03:00
+
+    Add op tags and detailed draw blit logs for tear debugging.
+
+    Include op= on damage/worker lines and log draw() occlusion, visible
+    pieces, and each blit rect so MOVE/DRAW overlap is easier to correlate.
+
+<a href=tree-bd43f78.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/compositor.c b/compositor.c
+index 37289ac..09535ba 100644
+--- a/compositor.c
++++ b/compositor.c
+@@ -82,6 +82,7 @@ static int work_shutdown;
+ static __thread int tls_worker_id = -1;
+ /* Job currently running on this thread (orchestrator or worker via task). */
+ static __thread uint64_t tls_job_id;
++static __thread const char *tls_op_name;
+ 
+ static const char *op_name(enum comp_op op)
+ {
+@@ -125,18 +126,24 @@ static void debug_fflush(void)
+ void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
+                           int worker)
+ {
++	const char *op = tls_op_name ? tls_op_name : "?";
++	int w = x1 - x0;
++	int h = y1 - y0;
++
+ 	if (!bgce_debug)
+ 		return;
+ 	if (worker &lt; 0)
+ 		worker = tls_worker_id;
+ 	if (worker &gt;= 0)
+-		printf("[BGCE] damage job=%llu %s rect=(%d,%d)-(%d,%d) worker=%d\n",
+-		       (unsigned long long)tls_job_id, tag ? tag : "?",
+-		       x0, y0, x1, y1, worker);
++		printf("[BGCE] damage job=%llu op=%s %s rect=(%d,%d)-(%d,%d) "
++		       "%dx%d worker=%d\n",
++		       (unsigned long long)tls_job_id, op, tag ? tag : "?",
++		       x0, y0, x1, y1, w, h, worker);
+ 	else
+-		printf("[BGCE] damage job=%llu %s rect=(%d,%d)-(%d,%d) worker=orch\n",
+-		       (unsigned long long)tls_job_id, tag ? tag : "?",
+-		       x0, y0, x1, y1);
++		printf("[BGCE] damage job=%llu op=%s %s rect=(%d,%d)-(%d,%d) "
++		       "%dx%d worker=orch\n",
++		       (unsigned long long)tls_job_id, op, tag ? tag : "?",
++		       x0, y0, x1, y1, w, h);
+ 	debug_fflush();
+ }
+ 
+@@ -162,6 +169,7 @@ static void run_job(const struct comp_job *job)
+ 	const char *app = "";
+ 
+ 	tls_job_id = job-&gt;job_id;
++	tls_op_name = op_name(job-&gt;op);
+ 
+ 	c = (job-&gt;client_id != 0) ? bgce_comp_find_client(job-&gt;client_id) : NULL;
+ 	if (c &amp;&amp; c-&gt;app_id[0])
+@@ -315,11 +323,12 @@ static void run_job(const struct comp_job *job)
+ 	}
+ 
+ 	if (bgce_debug &amp;&amp; job-&gt;op != COMP_CURSOR) {
+-		printf("[BGCE] comp: done job=%llu %s\n",
++		printf("[BGCE] comp: done job=%llu op=%s\n",
+ 		       (unsigned long long)job-&gt;job_id, op_name(job-&gt;op));
+ 		debug_fflush();
+ 	}
+ 	tls_job_id = 0;
++	tls_op_name = NULL;
+ }
+ 
+ static void *worker_main(void *arg)
+@@ -358,9 +367,11 @@ static void *worker_main(void *arg)
+ 		pthread_mutex_unlock(&amp;work_mu);
+ 
+ 		tls_job_id = task.job_id;
++		/* Parent high-level op for MOVE subtasks is always MOVE. */
++		tls_op_name = "MOVE";
+ 
+ 		if (bgce_debug) {
+-			printf("[BGCE] worker %d: job=%llu got task '%s' "
++			printf("[BGCE] worker %d: job=%llu op=MOVE got task '%s' "
+ 			       "(claim %d/%d)\n",
+ 			       id, (unsigned long long)task.job_id,
+ 			       task.tag ? task.tag : "?", my + 1, task_batch_n);
+@@ -371,12 +382,13 @@ static void *worker_main(void *arg)
+ 			task.fn(task.arg);
+ 
+ 		if (bgce_debug) {
+-			printf("[BGCE] worker %d: job=%llu done task '%s'\n",
++			printf("[BGCE] worker %d: job=%llu op=MOVE done task '%s'\n",
+ 			       id, (unsigned long long)task.job_id,
+ 			       task.tag ? task.tag : "?");
+ 			debug_fflush();
+ 		}
+ 		tls_job_id = 0;
++		tls_op_name = NULL;
+ 
+ 		pthread_mutex_lock(&amp;work_mu);
+ 		if (tasks_left &gt; 0)
+diff --git a/display.c b/display.c
+index 54625cb..a85b547 100644
+--- a/display.c
++++ b/display.c
+@@ -1376,6 +1376,8 @@ void draw(struct ServerState *srv, struct Client *cli)
+ 	int lifted = 0;
+ 	int i;
+ 	struct Client *c;
++	uint32_t ww, wh;
++	const char *app;
+ 
+ 	if (!srv || !srv-&gt;framebuffer || !cli || !cli-&gt;buffer) {
+ 		fprintf(stderr,
+@@ -1384,8 +1386,17 @@ void draw(struct ServerState *srv, struct Client *cli)
+ 	}
+ 
+ 	client_screen_bounds(srv, cli, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1);
+-	if (!clip_to_display(srv, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1))
++	if (!clip_to_display(srv, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1)) {
++		if (bgce_comp_debug()) {
++			printf("[BGCE] draw: id=%u app='%s' off-screen, skip "
++			       "world=(%u,%u)\n",
++			       (unsigned)cli-&gt;id,
++			       cli-&gt;app_id[0] ? cli-&gt;app_id : "?",
++			       cli-&gt;x, cli-&gt;y);
++			fflush(stdout);
++		}
+ 		return;
++	}
+ 
+ 	/* Visible pieces of this client after subtracting occluders above. */
+ 	vis[0][0] = sx0;
+@@ -1403,9 +1414,25 @@ void draw(struct ServerState *srv, struct Client *cli)
+ 		client_screen_bounds(srv, c, &amp;cx0, &amp;cy0, &amp;cx1, &amp;cy1);
+ 		if (!clip_to_display(srv, &amp;cx0, &amp;cy0, &amp;cx1, &amp;cy1))
+ 			continue;
++		if (bgce_comp_debug()) {
++			printf("[BGCE] draw: occlude by id=%u app='%s' "
++			       "screen=(%d,%d)-(%d,%d)\n",
++			       (unsigned)c-&gt;id,
++			       c-&gt;app_id[0] ? c-&gt;app_id : "?",
++			       cx0, cy0, cx1, cy1);
++			fflush(stdout);
++		}
+ 		nvis = vis_subtract_occluder(vis, nvis, cx0, cy0, cx1, cy1);
+-		if (nvis &lt;= 0)
++		if (nvis &lt;= 0) {
++			if (bgce_comp_debug()) {
++				printf("[BGCE] draw: id=%u app='%s' fully covered, "
++				       "skip blit\n",
++				       (unsigned)cli-&gt;id,
++				       cli-&gt;app_id[0] ? cli-&gt;app_id : "?");
++				fflush(stdout);
++			}
+ 			return; /* fully covered by windows above */
++		}
+ 	}
+ 
+ 	if (!c) {
+@@ -1414,16 +1441,45 @@ void draw(struct ServerState *srv, struct Client *cli)
+ 		return;
+ 	}
+ 
++	ww = cli-&gt;world_w ? cli-&gt;world_w : cli-&gt;width;
++	wh = cli-&gt;world_h ? cli-&gt;world_h : cli-&gt;height;
++	app = cli-&gt;app_id[0] ? cli-&gt;app_id : "?";
++
++	if (bgce_comp_debug()) {
++		printf("[BGCE] draw: blit id=%u app='%s' world=(%u,%u) %ux%u "
++		       "bounds=(%d,%d)-(%d,%d) nvis=%d z=%d\n",
++		       (unsigned)cli-&gt;id, app, cli-&gt;x, cli-&gt;y, ww, wh,
++		       sx0, sy0, sx1, sy1, nvis, (int)cli-&gt;z);
++		for (i = 0; i &lt; nvis; i++) {
++			printf("[BGCE] draw:   piece[%d] screen=(%d,%d)-(%d,%d) "
++			       "%dx%d\n",
++			       i, vis[i][0], vis[i][1], vis[i][2], vis[i][3],
++			       vis[i][2] - vis[i][0], vis[i][3] - vis[i][1]);
++		}
++		fflush(stdout);
++	}
++
+ 	cursor_fb_begin();
+ 	for (i = 0; i &lt; nvis; i++) {
+ 		if (cursor_lift_for_rect_ret(vis[i][0], vis[i][1],
+ 		                             vis[i][2], vis[i][3]))
+ 			lifted = 1;
+ 	}
+-	for (i = 0; i &lt; nvis; i++)
++	for (i = 0; i &lt; nvis; i++) {
++		if (bgce_comp_debug()) {
++			bgce_comp_damage_log("draw-blit", vis[i][0], vis[i][1],
++			                     vis[i][2], vis[i][3], -1);
++		}
+ 		blit_client_overlap(srv, cli, vis[i][0], vis[i][1],
+ 		                    vis[i][2], vis[i][3]);
++	}
+ 	cursor_fb_end(lifted);
++
++	if (bgce_comp_debug()) {
++		printf("[BGCE] draw: done id=%u app='%s' pieces=%d lifted_cursor=%d\n",
++		       (unsigned)cli-&gt;id, app, nvis, lifted);
++		fflush(stdout);
++	}
+ }
+ 
+ /*
+@@ -1510,17 +1566,46 @@ struct move_blit_args {
+ static void move_underlay_task(void *arg)
+ {
+ 	struct move_underlay_args *a = arg;
++	struct Client *stack_dbg;
++	int nstack = 0;
+ 
+-	/* worker id comes from FCFS thread that grabbed this task */
++	/* worker id comes from claim hand-out TLS */
+ 	bgce_comp_damage_log("underlay", a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1, -1);
++	if (bgce_comp_debug()) {
++		for (stack_dbg = a-&gt;srv-&gt;clients; stack_dbg; stack_dbg = stack_dbg-&gt;next) {
++			if (stack_dbg == a-&gt;skip || !stack_dbg-&gt;buffer)
++				continue;
++			nstack++;
++		}
++		printf("[BGCE] underlay: composite %d layer(s) except skip "
++		       "id=%u into %dx%d\n",
++		       nstack,
++		       a-&gt;skip ? (unsigned)a-&gt;skip-&gt;id : 0,
++		       a-&gt;x1 - a-&gt;x0, a-&gt;y1 - a-&gt;y0);
++		fflush(stdout);
++	}
+ 	composite_all_except(a-&gt;srv, a-&gt;skip, a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1);
+ }
+ 
+ static void move_blit_task(void *arg)
+ {
+ 	struct move_blit_args *a = arg;
++	const struct Client *cli = a-&gt;cli;
+ 
+ 	bgce_comp_damage_log("mover", a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1, -1);
++	if (bgce_comp_debug() &amp;&amp; cli) {
++		uint32_t ww = cli-&gt;world_w ? cli-&gt;world_w : cli-&gt;width;
++		uint32_t wh = cli-&gt;world_h ? cli-&gt;world_h : cli-&gt;height;
++
++		printf("[BGCE] mover: blit id=%u app='%s' world=(%u,%u) %ux%u "
++		       "screen=(%d,%d)-(%d,%d) %dx%d\n",
++		       (unsigned)cli-&gt;id,
++		       cli-&gt;app_id[0] ? cli-&gt;app_id : "?",
++		       cli-&gt;x, cli-&gt;y, ww, wh,
++		       a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1,
++		       a-&gt;x1 - a-&gt;x0, a-&gt;y1 - a-&gt;y0);
++		fflush(stdout);
++	}
+ 	blit_client_overlap(a-&gt;srv, a-&gt;cli, a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1);
+ }
+ 
+</pre>

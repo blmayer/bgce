@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 03c99b3</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 03c99b3
+parent <a href=commit-a9b5a2a.html>a9b5a2a</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-11-27T13:06:29-03:00
+
+    fixed moving clients
+
+<a href=tree-03c99b3.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/bgce.h b/bgce.h
+index 03d0bcd..1e5711b 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -36,7 +36,7 @@ enum {
+  * Data Structures
+  * ---------------------------- */
+ 
+-struct BGCEInputDevice {
++struct InputDevice {
+ 	uint16_t id;        // internal index of server
+ 	uint16_t type_mask; // bitmask: KEY, REL, ABS, etc
+ 	char name[256];
+@@ -47,7 +47,7 @@ struct ServerInfo {
+ 	uint32_t height;
+ 	uint32_t color_depth;
+ 	uint16_t input_device_count;
+-	struct BGCEInputDevice devices[MAX_INPUT_DEVICES];
++	struct InputDevice devices[MAX_INPUT_DEVICES];
+ };
+ 
+ struct BufferRequest {
+@@ -68,18 +68,18 @@ struct BufferReply {
+ 	uint32_t height;
+ };
+ 
+-enum BGCEInputType {
++enum InputType {
+ 	INPUT_KEYBOARD,
+ 	INPUT_MOUSE_MOVE,
+ 	INPUT_MOUSE_BUTTON,
+ };
+ 
+ struct InputEvent {
+-	enum BGCEInputType type;
+ 	uint32_t code; /* key code or button code */
+ 	int32_t value; /* press=1, release=0, or delta */
+ 	int32_t x;     /* optional: for mouse move */
+ 	int32_t y;     /* optional: for mouse move */
++	struct InputDevice device;
+ };
+ 
+ struct BGCEMessage {
+@@ -90,7 +90,7 @@ struct BGCEMessage {
+ 		struct BufferReply buffer_reply;
+ 		struct MoveBufferRequest move_buffer_request;
+ 		struct InputEvent input_event;
+-		
++
+ 	} data;
+ };
+ 
+@@ -121,8 +121,6 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
+  */
+ void* bgce_get_buffer(int conn, const struct BufferRequest req);
+ 
+-int bgce_move_buffer(int fd, const struct MoveBufferRequest req);
+-
+ /**
+  * Send a draw command to the server, telling it to blit the
+  * shared memory contents to the framebuffer.
+diff --git a/client.c b/client.c
+index 7cdc3ff..3a62389 100644
+--- a/client.c
++++ b/client.c
+@@ -3,11 +3,13 @@
+ #include &lt;linux/input.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;stdio.h&gt;
+-#include &lt;string.h&gt;
+ #include &lt;time.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+ int main(void) {
++	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
++	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
++
+ 	int conn = bgce_connect();
+ 	if (conn &lt; 0) {
+ 		fprintf(stderr, "[BGCE] Failed to connect\n");
+@@ -75,8 +77,8 @@ int main(void) {
+ 			struct InputEvent ev = msg.data.input_event;
+ 
+ 			/* Example: Print keyboard/mouse input */
+-			printf("[BGCE Client] Input event: type=%hu code=%hu value=%d\n",
+-			       ev.type, ev.code, ev.value);
++			printf("[BGCE Client] Input event: device=%s code=%hu value=%d\n",
++			       ev.device.name, ev.code, ev.value);
+ 			break;
+ 		}
+ 
+diff --git a/display.c b/display.c
+index 55027c5..92f69af 100644
+--- a/display.c
++++ b/display.c
+@@ -83,19 +83,19 @@ static int drm_destroy_dumb(int fd, uint32_t handle) {
+ 	return 0;
+ }
+ 
+-static void draw_gradient(uint8_t* buf, uint32_t stride, uint32_t width, uint32_t height) {
+-	/* Buf is assumed 32bpp (ARGB or XRGB), stride in bytes */
+-	for (uint32_t y = 0; y &lt; height; y++) {
+-		uint32_t* line = (uint32_t*)(buf + y * stride);
+-		for (uint32_t x = 0; x &lt; width; x++) {
+-			uint8_t r = (x * 255) / (width - 1);
+-			uint8_t g = (y * 255) / (height - 1);
+-			uint8_t b = 128;
+-			/* Use XRGB (no alpha) for scanout */
+-			line[x] = (r &lt;&lt; 16) | (g &lt;&lt; 8) | b;
+-		}
+-	}
+-}
++// static void draw_gradient(uint8_t* buf, uint32_t stride, uint32_t width, uint32_t height) {
++// 	/* Buf is assumed 32bpp (ARGB or XRGB), stride in bytes */
++// 	for (uint32_t y = 0; y &lt; height; y++) {
++// 		uint32_t* line = (uint32_t*)(buf + y * stride);
++// 		for (uint32_t x = 0; x &lt; width; x++) {
++// 			uint8_t r = (x * 255) / (width - 1);
++// 			uint8_t g = (y * 255) / (height - 1);
++// 			uint8_t b = 128;
++// 			/* Use XRGB (no alpha) for scanout */
++// 			line[x] = (r &lt;&lt; 16) | (g &lt;&lt; 8) | b;
++// 		}
++// 	}
++// }
+ 
+ static void draw_cursor(uint8_t* buf, uint32_t stride, uint32_t w, uint32_t h) {
+ 	/* Cursor is ARGB8888 */
+@@ -241,7 +241,6 @@ int init_display() {
+ 
+ 	/* Clear/draw content */
+ 	memset(server.framebuffer, 0x00, scanout_size);
+-	draw_gradient((uint8_t*)server.framebuffer, scanout_pitch, width, height);
+ 
+ 	/* Create framebuffer object for scanout.
+ 	 * Prefer drmModeAddFB2 (for specifying pixel-format), fallback to drmModeAddFB.
+@@ -273,11 +272,9 @@ int init_display() {
+ 	}
+ 
+ 	/* ---------- Create dumb cursor buffer (small ARGB) ---------- */
+-	const uint32_t cur_w = 64;
+-	const uint32_t cur_h = 64;
+ 
+ 	struct drm_mode_create_dumb cur_create = {0};
+-	if (drm_create_dumb(drm_fd, cur_w, cur_h, 32, &amp;cur_create) &lt; 0) {
++	if (drm_create_dumb(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, 32, &amp;cur_create) &lt; 0) {
+ 		fprintf(stderr, "Failed to create dumb buffer for cursor\n");
+ 		return -1;
+ 	}
+@@ -297,7 +294,7 @@ int init_display() {
+ 	}
+ 	memset(cur_map, 0, cur_size);
+ 
+-	draw_cursor((uint8_t*)cur_map, cur_pitch, cur_w, cur_h);
++	draw_cursor((uint8_t*)cur_map, cur_pitch, CURSOR_WIDTH, CURSOR_HEIGHT);
+ 
+ #ifdef DRM_FORMAT_ARGB8888
+ 	{
+@@ -314,7 +311,7 @@ int init_display() {
+ 	if (!cur_fb) {
+ 		/* Legacy fb creation for cursor might not support alpha; still try */
+ 		uint32_t depth = 24;
+-		if (drmModeAddFB(drm_fd, cur_w, cur_h, depth, 32, cur_pitch, cur_handle, &amp;cur_fb) != 0) {
++		if (drmModeAddFB(drm_fd, CURSOR_WIDTH, CURSOR_HEIGHT, depth, 32, cur_pitch, cur_handle, &amp;cur_fb) != 0) {
+ 			fprintf(stderr, "drmModeAddFB for cursor failed\n");
+ 			return -1;
+ 		}
+@@ -327,7 +324,7 @@ int init_display() {
+ 	}
+ 
+ 	/* ---------- Set cursor ---------- */
+-	if (drmModeSetCursor(drm_fd, crtc_id, cur_handle, cur_w, cur_h) != 0) {
++	if (drmModeSetCursor(drm_fd, crtc_id, cur_handle, CURSOR_WIDTH, CURSOR_HEIGHT) != 0) {
+ 		fprintf(stderr, "drmModeSetCursor failed: %s\n", strerror(errno));
+ 		/* keep going — maybe hardware doesn't support cursor */
+ 	} else {
+@@ -341,8 +338,10 @@ int init_display() {
+ }
+ 
+ void draw(struct ServerState* srv, struct Client cli) {
+-	if (!srv || !srv-&gt;framebuffer || !cli.buffer)
++	if (!srv || !srv-&gt;framebuffer || !cli.buffer) {
++		fprintf(stderr, "Draw: Invalid server, framebuffer, or client buffer\n");
+ 		return;
++	}
+ 
+ 	uint32_t screen_w = srv-&gt;display_w;
+ 	uint32_t screen_h = srv-&gt;display_h;
+@@ -370,8 +369,10 @@ void draw(struct ServerState* srv, struct Client cli) {
+ 		end_y = screen_h;
+ 
+ 	/* Entire window is outside screen */
+-	if (start_x &gt;= end_x || start_y &gt;= end_y)
++	if (start_x &gt;= end_x || start_y &gt;= end_y) {
++		fprintf(stderr, "Draw: Client entirely outside screen\n");
+ 		return;
++	}
+ 
+ 	int src_start_x = start_x - cx;
+ 	int src_start_y = start_y - cy;
+@@ -390,71 +391,101 @@ void draw(struct ServerState* srv, struct Client cli) {
+ 	}
+ }
+ 
+-void redraw_region(struct ServerState* srv, int old_x, int old_y, int new_x, int new_y, int width, int height) {
+-	if (!srv || !srv-&gt;framebuffer)
++/*
++ * The situation:
++ *
++ *                         . (x,y)
++ *                         +----------------+
++ *                         |     rect A     | dy
++ *                         +----+-----------+----+
++ *                         |    |                |
++ *                         |    |                |
++ *                         |    |                |
++ *                         |  B |                |
++ *                         +----+                |
++ *                           dx |                |
++ *                              +----------------+
++ *
++ * So we redraw the rectangles:
++ * A: (x, y) (x+width, y+dy) and
++ * B: (x, y+dy) (x+dx, y+height)
++ */
++void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy) {
++	if (!srv || !srv-&gt;framebuffer) {
++		fprintf(stderr, "Redraw: Invalid server, framebuffer, or client\n");
+ 		return;
++	}
+ 
++	uint32_t width = c.width;
++	uint32_t height = c.height;
+ 	uint32_t screen_w = srv-&gt;display_w;
+ 	uint32_t screen_h = srv-&gt;display_h;
+ 
+-	/* Calculate the exposed area (difference between old and new regions) */
+-	int exposed_start_x = old_x &lt; new_x ? old_x : new_x;
+-	int exposed_end_x = old_x + width &gt; new_x + width ? old_x + width : new_x + width;
+-	int exposed_start_y = old_y &lt; new_y ? old_y : new_y;
+-	int exposed_end_y = old_y + height &gt; new_y + height ? old_y + height : new_y + height;
+-
+-	/* Only redraw the non-overlapping part */
+-	if (old_x &lt; new_x) {
+-		exposed_end_x = old_x + (new_x - old_x);
+-	} else if (old_x &gt; new_x) {
+-		exposed_start_x = new_x + width;
+-	}
+-
+-	if (old_y &lt; new_y) {
+-		exposed_end_y = old_y + (new_y - old_y);
+-	} else if (old_y &gt; new_y) {
+-		exposed_start_y = new_y + height;
+-	}
+-
+-	/* Clip the exposed region to the screen boundaries */
+-	int start_x = exposed_start_x &lt; 0 ? 0 : exposed_start_x;
+-	int start_y = exposed_start_y &lt; 0 ? 0 : exposed_start_y;
+-
+-	int end_x = exposed_end_x &gt; (int)screen_w ? screen_w : exposed_end_x;
+-	int end_y = exposed_end_y &gt; (int)screen_h ? screen_h : exposed_end_y;
+-
+-	if (start_x &gt;= end_x || start_y &gt;= end_y)
+-		return;
+-
+-	int copy_w = end_x - start_x;
+-	int copy_h = end_y - start_y;
+-
+-	uint32_t screen_stride_pixels = screen_w;
+-
+-	/* Iterate over clients to find overlapping ones */
+-	for (int i = 0; i &lt; srv-&gt;client_count; i++) {
+-		struct Client* cli = &amp;srv-&gt;clients[i];
+-		if (!cli-&gt;buffer)
+-			continue;
++	/* Rectangle A: Exposed area in y-direction */
++	int rect_a_start_x = c.x;
++	int rect_a_start_y = dy &gt; 0 ? c.y : c.y + height + dy;
++	int rect_a_end_x = c.x + width;
++	int rect_a_end_y = dy &gt; 0 ? c.y + dy : c.y + height;
++
++	/* Rectangle B: Exposed area in x-direction */
++	int rect_b_start_x = dx &gt; 0 ? c.x : c.x + width + dx;
++	int rect_b_start_y = c.y + (dy &gt; 0 ? dy : 0);
++	int rect_b_end_x = dx &gt; 0 ? c.x + dx : c.x + width;
++	int rect_b_end_y = c.y + height + (dy &gt; 0 ? dy : 0);
++
++	/* Clip rectangles to screen boundaries */
++	rect_a_start_x = rect_a_start_x &lt; 0 ? 0 : rect_a_start_x;
++	rect_a_start_y = rect_a_start_y &lt; 0 ? 0 : rect_a_start_y;
++	rect_a_end_x = rect_a_end_x &gt; (int)screen_w ? screen_w : rect_a_end_x;
++	rect_a_end_y = rect_a_end_y &gt; (int)screen_h ? screen_h : rect_a_end_y;
++
++	rect_b_start_x = rect_b_start_x &lt; 0 ? 0 : rect_b_start_x;
++	rect_b_start_y = rect_b_start_y &lt; 0 ? 0 : rect_b_start_y;
++	rect_b_end_x = rect_b_end_x &gt; (int)screen_w ? screen_w : rect_b_end_x;
++	rect_b_end_y = rect_b_end_y &gt; (int)screen_h ? screen_h : rect_b_end_y;
++
++	struct Client* cli = c.next;
++	while (cli) {
++		/* Redraw Rectangle A */
++		if (dy) {
++			int cli_end_x = cli-&gt;x + cli-&gt;width;
++			int cli_end_y = cli-&gt;y + cli-&gt;height;
++
++			int overlap_start_x = rect_a_start_x &gt; cli-&gt;x ? rect_a_start_x : cli-&gt;x;
++			int overlap_start_y = rect_a_start_y &gt; cli-&gt;y ? rect_a_start_y : cli-&gt;y;
++
++			int overlap_end_x = rect_a_end_x &lt; cli_end_x ? rect_a_end_x : cli_end_x;
++			int overlap_end_y = rect_a_end_y &lt; cli_end_y ? rect_a_end_y : cli_end_y;
++
++			if (overlap_start_x &lt; overlap_end_x &amp;&amp; overlap_start_y &lt; overlap_end_y) {
++				for (int y = overlap_start_y; y &lt; overlap_end_y; y++) {
++					uint32_t* drow = (uint32_t*)srv-&gt;framebuffer + y * screen_w + overlap_start_x;
++					uint32_t* srow = (uint32_t*)cli-&gt;buffer + (y - cli-&gt;y) * cli-&gt;width + (overlap_start_x - cli-&gt;x);
++					memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
++				}
++			}
++		}
+ 
+-		/* Check if this client overlaps with the exposed region */
+-		int cli_end_x = cli-&gt;x + cli-&gt;width;
+-		int cli_end_y = cli-&gt;y + cli-&gt;height;
++		/* Redraw Rectangle B */
++		if (dx) {
++			int cli_end_x = cli-&gt;x + cli-&gt;width;
++			int cli_end_y = cli-&gt;y + cli-&gt;height;
+ 
+-		int overlap_start_x = start_x &gt; cli-&gt;x ? start_x : cli-&gt;x;
+-		int overlap_start_y = start_y &gt; cli-&gt;y ? start_y : cli-&gt;y;
++			int overlap_start_x = rect_b_start_x &gt; cli-&gt;x ? rect_b_start_x : cli-&gt;x;
++			int overlap_start_y = rect_b_start_y &gt; cli-&gt;y ? rect_b_start_y : cli-&gt;y;
+ 
+-		int overlap_end_x = end_x &lt; cli_end_x ? end_x : cli_end_x;
+-		int overlap_end_y = end_y &lt; cli_end_y ? end_y : cli_end_y;
++			int overlap_end_x = rect_b_end_x &lt; cli_end_x ? rect_b_end_x : cli_end_x;
++			int overlap_end_y = rect_b_end_y &lt; cli_end_y ? rect_b_end_y : cli_end_y;
+ 
+-		if (overlap_start_x &lt; overlap_end_x &amp;&amp; overlap_start_y &lt; overlap_end_y) {
+-			/* Redraw the overlapping part of the client */
+-			for (int y = overlap_start_y; y &lt; overlap_end_y; y++) {
+-				uint32_t* drow = (uint32_t*)srv-&gt;framebuffer + y * screen_stride_pixels + overlap_start_x;
+-				uint32_t* srow = (uint32_t*)cli-&gt;buffer + (y - cli-&gt;y) * cli-&gt;width + (overlap_start_x - cli-&gt;x);
+-				memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
++			if (overlap_start_x &lt; overlap_end_x &amp;&amp; overlap_start_y &lt; overlap_end_y) {
++				for (int y = overlap_start_y; y &lt; overlap_end_y; y++) {
++					uint32_t* drow = (uint32_t*)srv-&gt;framebuffer + y * screen_w + overlap_start_x;
++					uint32_t* srow = (uint32_t*)cli-&gt;buffer + (y - cli-&gt;y) * cli-&gt;width + (overlap_start_x - cli-&gt;x);
++					memcpy(drow, srow, (overlap_end_x - overlap_start_x) * 4);
++				}
+ 			}
+ 		}
++		cli = cli-&gt;next;
+ 	}
+ }
+ 
+diff --git a/input.c b/input.c
+index b28dfe8..13ec77f 100644
+--- a/input.c
++++ b/input.c
+@@ -50,6 +50,7 @@ struct Client* pick_client(int x, int y) {
+ 		if (x &gt;= c-&gt;x &amp;&amp; x &lt;= (c-&gt;x + c-&gt;width) &amp;&amp;
+ 		    y &gt;= c-&gt;y &amp;&amp; y &lt;= (c-&gt;y + c-&gt;height)) {
+ 			picked = c;
++			break;
+ 		}
+ 		c = c-&gt;next;
+ 	}
+@@ -153,7 +154,7 @@ static int handle_input_event(struct input_event ev) {
+ 		}
+ 		if (ctrl_down == 1 &amp;&amp; alt_down == 1 &amp;&amp; ev.code == KEY_Q) {
+ 			printf("[BGCE] Ctrl+Alt+Q pressed, exiting.\n");
+-			return 1;
++			exit(1);
+ 		}
+ 	}
+ 
+@@ -203,7 +204,7 @@ static int handle_input_event(struct input_event ev) {
+ 			drag.start_win_width = c-&gt;width;
+ 			drag.start_win_height = c-&gt;height;
+ 			drag.type = DRAG_MOVE;
+-			printf("[BGCE] move event.\n");
++			printf("[BGCE] Starting move event.\n");
+ 			return 1;
+ 		}
+ 	}
+@@ -255,10 +256,11 @@ static int handle_input_event(struct input_event ev) {
+ 		        mouse_y);
+ 
+ 		if (drag.active &amp;&amp; drag.type == DRAG_MOVE) {
+-			printf("[BGCE] Draging client\n");
+-
+ 			int dx = mouse_x - drag.start_mouse_x;
+ 			int dy = mouse_y - drag.start_mouse_y;
++			drag.start_mouse_x = mouse_x;
++			drag.start_mouse_y = mouse_y;
++			printf("[BGCE] Draging client: dx=%d, dy=%d\n", dx, dy);
+ 
+ 			struct Client* c = drag.target;
+ 			if (!c) {
+@@ -266,17 +268,12 @@ static int handle_input_event(struct input_event ev) {
+ 				return 1; // Should not happen
+ 			}
+ 
+-			uint32_t old_x = c-&gt;x;
+-			uint32_t old_y = c-&gt;y;
+-			uint32_t new_x = drag.start_win_x + dx;
+-			uint32_t new_y = drag.start_win_y + dy;
+-
+ 			// Redraw the old region before moving
+-			redraw_region(&amp;server, old_x, old_y, new_x, new_y, c-&gt;width, c-&gt;height);
++			redraw_region(&amp;server, *c, dx, dy);
+ 
+ 			// Update client's position
+-			c-&gt;x = new_x;
+-			c-&gt;y = new_y;
++			c-&gt;x = c-&gt;x + dx;
++			c-&gt;y = c-&gt;y + dy;
+ 			draw(&amp;server, *c);
+ 			return 1;
+ 		}
+@@ -317,7 +314,6 @@ void* input_loop(void* arg) {
+ 					break;
+ 
+ 				if (handle_input_event(ev)) {
+-					printf("[BGCE] Event handled\n");
+ 					continue;
+ 				}
+ 
+@@ -326,33 +322,27 @@ void* input_loop(void* arg) {
+ 				}
+ 
+ 				struct InputEvent e = {0};
++				e.device = server.input.devs[i];
++				e.code = ev.code;
+ 
+ 				if (ev.type == EV_KEY) {
+-					e.type = INPUT_KEYBOARD;
+-					e.code = ev.code;
+ 					e.value = ev.value;
+ 				} else if (ev.type == EV_REL) {
+-					e.type = INPUT_MOUSE_MOVE;
+ 					if (ev.code == REL_X)
+-						e.x = ev.value;
++						e.value = ev.value;
+ 					else if (ev.code == REL_Y)
+-						e.y = ev.value;
++						e.value = ev.value;
+ 				} else if (ev.type == EV_SYN) {
+ 					continue;
+ 				} else {
+ 					continue;
+ 				}
+ 
+-				for (int sub = 0; sub &lt; MAX_INPUT_DEVICES; sub++) {
+-					if (server.focused_client-&gt;inputs[sub] == i) {
+-						/* Send to focused client */
+-						struct BGCEMessage msg;
+-						msg.type = MSG_INPUT_EVENT;
+-						msg.data.input_event = e;
+-
+-						bgce_send_msg(server.focused_client-&gt;fd, &amp;msg);
+-					}
+-				}
++				/* Send to focused client */
++				struct BGCEMessage msg;
++				msg.type = MSG_INPUT_EVENT;
++				msg.data.input_event = e;
++				bgce_send_msg(server.focused_client-&gt;fd, &amp;msg);
+ 			}
+ 		}
+ 	}
+diff --git a/libbgce.c b/libbgce.c
+index ab7c873..a0e7d6b 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -69,7 +69,7 @@ int bgce_get_server_info(int conn, struct ServerInfo* info) {
+ 	if (bgce_recv_msg(conn, &amp;msg) &lt;= 0)
+ 		return -3;
+ 
+-	memcpy(info, msg.data, sizeof(struct ServerInfo));
++	*info = msg.data.server_info;
+ 
+ 	return 0;
+ }
+@@ -81,7 +81,7 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
+ 
+ 	struct BGCEMessage msg;
+ 	msg.type = MSG_GET_BUFFER;
+-	memcpy(msg.data, &amp;req, sizeof(req));
++	msg.data.buffer_request = req;
+ 
+ 	int code = bgce_send_msg(conn, &amp;msg);
+ 	if (code &lt;= 0)
+@@ -91,7 +91,7 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
+ 		return NULL;
+ 
+ 	struct BufferReply reply;
+-	memcpy(&amp;reply, msg.data, sizeof(reply));
++	reply = msg.data.buffer_reply;
+ 
+ 	size_t size = reply.width * reply.height * 4;
+ 	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
+@@ -110,15 +110,6 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
+ 	return buf;
+ }
+ 
+-int bgce_move_buffer(int conn, struct MoveBufferRequest req) {
+-	struct BGCEMessage msg;
+-	msg.type = MSG_BUFFER_CHANGE;
+-	memcpy(msg.data, &amp;req, sizeof(req));
+-
+-	int code = bgce_send_msg(conn, &amp;msg);
+-	return code;
+-}
+-
+ /* Public API: Draw current buffer */
+ int bgce_draw(int conn) {
+ 	if (conn &lt; 0)
+diff --git a/loop.c b/loop.c
+index e934755..904a004 100644
+--- a/loop.c
++++ b/loop.c
+@@ -39,10 +39,6 @@ void* client_thread(void* arg) {
+ 		return NULL;
+ 	}
+ 
+-	// Initialize the client
+-	client-&gt;fd = client_fd;
+-	server.focused_client = client; /* last connected client gets focus */
+-
+ 	printf("[BGCE] Thread started for client fd=%d\n", client_fd);
+ 
+ 	while (1) {
+@@ -96,8 +92,10 @@ void* client_thread(void* arg) {
+ 			client-&gt;buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+ 			client-&gt;width = req.width;
+ 			client-&gt;height = req.height;
++			client-&gt;x = 0;
++			client-&gt;y = 0;
+ 			close(shm_fd);
+-			printf("Server buffer: %p size=%zu (%dx%d) name=%s\n",
++			printf("[BGCE] Client buffer: %p size=%zu (%dx%d) name=%s\n",
+ 			       client-&gt;buffer,
+ 			       client-&gt;width * client-&gt;height * 4UL,
+ 			       client-&gt;width, client-&gt;height,
+@@ -113,15 +111,10 @@ void* client_thread(void* arg) {
+ 		}
+ 
+ 		case MSG_DRAW: {
+-			printf("[BGCE] Drawing from client %d (%dx%d)\n",
+-			       client-&gt;fd, client-&gt;width, client-&gt;height);
+-			if (client_fd == server.focused_client-&gt;fd) {
+-				if (!client-&gt;buffer) {
+-					fprintf(stderr, "[BGCE] Client has no buffer!\n");
+-					break;
+-				}
+-				printf("[BGCE] Drawing from focused client %d\n", client_fd);
+-				printf("[BGCE] First pixel: %08x\n", ((uint32_t*)client-&gt;buffer)[0]);
++			printf("[BGCE] Received draw event from client %s\n", client-&gt;shm_name);
++			if (client_fd != server.focused_client-&gt;fd) {
++				printf("[BGCE] Client is not focused!\n");
++				break;
+ 			}
+ 
+ 			draw(&amp;server, *client);
+@@ -158,10 +151,6 @@ void* client_thread(void* arg) {
+ 		server.focused_client = NULL;
+ 	}
+ 
+-	if (server.focused_client == client) {
+-		server.focused_client = NULL;
+-	}
+-
+ 	close(client-&gt;fd);
+ 
+ 	printf("[BGCE] Thread exiting for client fd=%d\n", client-&gt;fd);
+diff --git a/server.c b/server.c
+index af0b4b0..38060a8 100644
+--- a/server.c
++++ b/server.c
+@@ -26,11 +26,12 @@ int main(void) {
+ 
+ 	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
+ 	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
+-	
++
+ 	memset(&amp;server, 0, sizeof(struct ServerState));
+ 	server.drm_fd = -1;
+ 	server.framebuffer = NULL;
+ 	server.crtc_id = 0;
++	server.client_count = 0;
+ 
+ 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+ 	if (fd &lt; 0) {
+@@ -65,6 +66,21 @@ int main(void) {
+ 	}
+ 	printf("[BGCE] Display initialised\n");
+ 
++	/* Add a background client */
++	struct Client background_client;
++	background_client.x = 0;
++	background_client.y = 0;
++	background_client.z = -1; // Special case
++	background_client.width = server.display_w;
++	background_client.height = server.display_h;
++	background_client.buffer = malloc(server.display_w * server.display_h * 4);
++	memset(background_client.buffer, 0xaa, server.display_w * server.display_h * 4);
++	background_client.next = NULL;
++	server.clients = &amp;background_client;
++
++	puts("[BGCE] Drawing background");
++	draw(&amp;server, background_client);
++
+ 	if (init_input() != 0) {
+ 		perror("[BGCE] Failed to start input thread");
+ 		return 4;
+diff --git a/server.h b/server.h
+index c11a723..d21137c 100644
+--- a/server.h
++++ b/server.h
+@@ -23,6 +23,7 @@ struct Client {
+ 	uint32_t height;
+ 	uint32_t x;
+ 	uint32_t y;
++	uint32_t z;
+ 	struct Client* next;
+ 	int inputs[MAX_INPUT_DEVICES];
+ };
+@@ -33,7 +34,7 @@ struct Client {
+ 
+ struct InputState {
+ 	int fds[MAX_INPUT_DEVICES];
+-	struct BGCEInputDevice devs[MAX_INPUT_DEVICES];
++	struct InputDevice devs[MAX_INPUT_DEVICES];
+ 	size_t count;
+ };
+ 
+@@ -58,18 +59,11 @@ struct ServerState {
+  * Cursor
+  * ---------------------------- */
+ 
+-#define CURSOR_WIDTH 8
+-#define CURSOR_HEIGHT 8
++#define CURSOR_WIDTH 64
++#define CURSOR_HEIGHT 64
+ #define CURSOR_HOTSPOT_X 0
+ #define CURSOR_HOTSPOT_Y 0
+ 
+-struct CursorState {
+-    int x;
+-    int y;
+-    uint32_t background_buffer[CURSOR_WIDTH * CURSOR_HEIGHT];
+-    int active; // 0 for hidden, 1 for visible
+-};
+-
+ 
+ /* ----------------------------
+  * Server Functions
+@@ -86,7 +80,7 @@ void set_drm_cursor(struct ServerState* srv, int x, int y);
+ 
+ void draw(struct ServerState* srv, struct Client cli);
+ 
+-void redraw_region(struct ServerState* srv, int old_x, int old_y, int new_x, int new_y, int width, int height);
++void redraw_region(struct ServerState* srv, struct Client c, int dx, int dy);
+ 
+ /**
+  * Input device related functions
+</pre>

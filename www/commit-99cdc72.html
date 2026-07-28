@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 99cdc72</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 99cdc72
+parent <a href=commit-924fcda.html>924fcda</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-06T13:44:40-03:00
+
+    Fix cursor trail, config logging, and file-backed client buffers.
+
+    Replace POSIX shm with mmap'd files under the user cache dir, restore
+    software cursor underlay before compositing, and log the full effective
+    config after load_config.
+
+<a href=tree-99cdc72.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/Makefile b/Makefile
+index af951ce..0b92bfb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@ CC ?= cc
+ BACKEND ?= fbdev
+ 
+ CFLAGS ?= -Wall -O1 -std=c99 -fPIC -g -I.
+-LDFLAGS ?= -lrt -lm -lpthread
++LDFLAGS ?= -lm -lpthread
+ 
+ ifeq ($(BACKEND),drm)
+ CFLAGS += -DBGCE_USE_DRM -I/include/libdrm
+@@ -21,10 +21,10 @@ bgce: $(SERVER_OBJS)
+ 	$(CC) $(CFLAGS) -o $@ server.o loop.o input.o display.o $(DISPLAY_OBJ) config.o -L. -lbgce $(LDFLAGS)
+ 
+ libbgce.so: $(LIB_OBJS)
+-	$(CC) -shared -o $@ $(LIB_OBJS) -lrt
++	$(CC) -shared -o $@ $(LIB_OBJS)
+ 
+ client: client.c bgce.h
+-	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce -lrt
++	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce
+ 
+ %.o: %.c
+ 	$(CC) $(CFLAGS) -c $&lt; -o $@
+diff --git a/bgce.h b/bgce.h
+index 8204c13..a43a282 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -150,11 +150,19 @@ int bgce_get_server_info(int fd, struct ServerInfo* out_info);
+ 
+ /**
+  * Request a shared memory buffer from the server.
+- * Fills in the reply structure with shm name and dimensions.
+- * Returns 0 on success, -1 on failure.
++ * Returns a mapped buffer pointer on success, or NULL on failure.
+  */
+ void* bgce_get_buffer(int conn, const struct BufferRequest req);
+ 
++/**
++ * Shared pixel buffers (server creates, client maps by token in BufferReply.shm_name).
++ * File-backed under the user cache directory (mmap MAP_SHARED), never /dev/shm:
++ *   $XDG_CACHE_HOME/bgce/buf/&lt;token&gt;  or  $HOME/.cache/bgce/buf/&lt;token&gt;
++ */
++int bgce_buf_create(char *name, size_t namelen, size_t size);
++int bgce_buf_open(const char *name);
++void bgce_buf_unlink(const char *name);
++
+ int bgce_move(int fd, int x, int y);
+ 
+ /**
+diff --git a/config.c b/config.c
+index a2bd951..62ad533 100644
+--- a/config.c
++++ b/config.c
+@@ -430,26 +430,32 @@ static void load_cursor_theme(const char* theme_dir, struct cursor_theme* theme)
+ 	}
+ }
+ 
+-// Parse config file
+-int parse_config(struct config* config) {
++// Load config file
++int load_config(struct config* config) {
+ 	const char* home = getenv("HOME");
+ 	char user_config[512];
++	FILE* file = NULL;
++
++	// Initialize with defaults even if the file is missing
++	config-&gt;type = BG_COLOR;
++	config-&gt;color = 0xAAAAAAAA; // Default gray
++	config-&gt;mode = IMAGE_SCALED;
++	config-&gt;path[0] = '\0';
++	config-&gt;shortcut_count = 0;
++	memset(&amp;config-&gt;cursors, 0, sizeof(config-&gt;cursors));
++
+ 	if (!home) {
++		set_default_shortcuts(config);
+ 		return -1;
+ 	}
+ 	snprintf(user_config, sizeof(user_config), "%s/.config/bgce.conf", home);
+-	FILE* file = fopen(user_config, "r");
++	file = fopen(user_config, "r");
+ 	if (!file) {
+ 		perror("[BGCE] Open config file");
++		set_default_shortcuts(config);
+ 		return -1;
+ 	}
+ 
+-	// Initialize with defaults
+-	config-&gt;type = BG_COLOR;
+-	config-&gt;color = 0xAAAAAAAA; // Default gray
+-	config-&gt;shortcut_count = 0;
+-	memset(&amp;config-&gt;cursors, 0, sizeof(config-&gt;cursors));
+-
+ 	char line[1024];
+ 	char current_section[256] = "";
+ 
+@@ -537,6 +543,112 @@ int parse_config(struct config* config) {
+ 	return 0;
+ }
+ 
++static const char* key_code_name(uint16_t code)
++{
++	static char fallback[16];
++
++	if (code &gt;= KEY_1 &amp;&amp; code &lt;= KEY_9) {
++		fallback[0] = (char)('1' + (code - KEY_1));
++		fallback[1] = '\0';
++		return fallback;
++	}
++	if (code == KEY_0)
++		return "0";
++
++	switch (code) {
++	case KEY_A: return "a"; case KEY_B: return "b"; case KEY_C: return "c";
++	case KEY_D: return "d"; case KEY_E: return "e"; case KEY_F: return "f";
++	case KEY_G: return "g"; case KEY_H: return "h"; case KEY_I: return "i";
++	case KEY_J: return "j"; case KEY_K: return "k"; case KEY_L: return "l";
++	case KEY_M: return "m"; case KEY_N: return "n"; case KEY_O: return "o";
++	case KEY_P: return "p"; case KEY_Q: return "q"; case KEY_R: return "r";
++	case KEY_S: return "s"; case KEY_T: return "t"; case KEY_U: return "u";
++	case KEY_V: return "v"; case KEY_W: return "w"; case KEY_X: return "x";
++	case KEY_Y: return "y"; case KEY_Z: return "z";
++	case KEY_F1: return "f1"; case KEY_F2: return "f2"; case KEY_F3: return "f3";
++	case KEY_F4: return "f4"; case KEY_F5: return "f5"; case KEY_F6: return "f6";
++	case KEY_F7: return "f7"; case KEY_F8: return "f8"; case KEY_F9: return "f9";
++	case KEY_F10: return "f10"; case KEY_F11: return "f11"; case KEY_F12: return "f12";
++	case KEY_ESC: return "esc";
++	case KEY_ENTER: return "enter";
++	case KEY_SPACE: return "space";
++	case KEY_TAB: return "tab";
++	case KEY_BACKSPACE: return "backspace";
++	case KEY_DELETE: return "delete";
++	case KEY_INSERT: return "insert";
++	case KEY_HOME: return "home";
++	case KEY_END: return "end";
++	case KEY_PAGEUP: return "pgup";
++	case KEY_PAGEDOWN: return "pgdn";
++	case KEY_UP: return "up";
++	case KEY_DOWN: return "down";
++	case KEY_LEFT: return "left";
++	case KEY_RIGHT: return "right";
++	case KEY_SYSRQ: return "sysrq";
++	default:
++		snprintf(fallback, sizeof(fallback), "key_%u", (unsigned)code);
++		return fallback;
++	}
++}
++
++void print_config(const struct config* config)
++{
++	int i;
++	int cursor_loaded = 0;
++
++	if (!config)
++		return;
++
++	printf("[BGCE] === loaded config ===\n");
++
++	if (config-&gt;type == BG_COLOR) {
++		printf("[BGCE] background: type=color color=#%08X\n", config-&gt;color);
++	} else {
++		printf("[BGCE] background: type=image path=%s mode=%s\n",
++		       config-&gt;path[0] ? config-&gt;path : "(none)",
++		       config-&gt;mode == IMAGE_TILED ? "tiled" : "scaled");
++	}
++
++	printf("[BGCE] shortcuts: %d\n", config-&gt;shortcut_count);
++	for (i = 0; i &lt; config-&gt;shortcut_count; i++) {
++		const struct shortcut* sc = &amp;config-&gt;shortcuts[i];
++		char combo[64];
++		int n = 0;
++
++		combo[0] = '\0';
++		if (sc-&gt;combo.ctrl)
++			n += snprintf(combo + n, sizeof(combo) - (size_t)n, "%sctrl",
++			              n ? "+" : "");
++		if (sc-&gt;combo.alt)
++			n += snprintf(combo + n, sizeof(combo) - (size_t)n, "%salt",
++			              n ? "+" : "");
++		if (sc-&gt;combo.shift)
++			n += snprintf(combo + n, sizeof(combo) - (size_t)n, "%sshift",
++			              n ? "+" : "");
++		if (sc-&gt;combo.key) {
++			n += snprintf(combo + n, sizeof(combo) - (size_t)n, "%s%s",
++			              n ? "+" : "", key_code_name(sc-&gt;combo.key));
++		}
++		if (!combo[0])
++			snprintf(combo, sizeof(combo), "(none)");
++
++		if (sc-&gt;type == SHORTCUT_BUILTIN)
++			printf("[BGCE]   %s = builtin:%s\n", combo, sc-&gt;value);
++		else if (sc-&gt;type == SHORTCUT_COMMAND)
++			printf("[BGCE]   %s = command:%s\n", combo, sc-&gt;value);
++		else
++			printf("[BGCE]   %s = (unknown type %d)\n", combo, (int)sc-&gt;type);
++	}
++
++	for (i = 0; i &lt; BGCE_CURSOR_COUNT; i++) {
++		if (config-&gt;cursors.images[i])
++			cursor_loaded++;
++	}
++	printf("[BGCE] cursors: %d theme image(s) loaded (of %d types)\n",
++	       cursor_loaded, BGCE_CURSOR_COUNT);
++	printf("[BGCE] === end config ===\n");
++}
++
+ // Apply background to a buffer
+ int apply_background(struct config* config, uint32_t* buffer, uint32_t width, uint32_t height) {
+ 	if (config-&gt;type == BG_COLOR) {
+diff --git a/display.c b/display.c
+index 0dcf285..8452df0 100644
+--- a/display.c
++++ b/display.c
+@@ -386,8 +386,10 @@ int display_cursor_init(void)
+ 	cursor_x = (int)server.display_w / 2;
+ 	cursor_y = (int)server.display_h / 2;
+ 	clamp_cursor_pos(&amp;cursor_x, &amp;cursor_y);
++	/* Not visible yet: first scene draw restores (no-op) then paints.
++	 * Painting here would capture a black/empty underlay and leave a
++	 * permanent black square on the first mouse move. */
+ 	cursor_visible = 0;
+-	cursor_paint();
+ 	return 0;
+ }
+ 
+@@ -684,9 +686,11 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
+ void redraw_all(struct ServerState* srv) {
+ 	if (!srv || !srv-&gt;framebuffer)
+ 		return;
++	/* Restore underlay before overwriting framebuffer pixels. */
++	cursor_restore();
+ 	composite_chain_to_rect(srv, srv-&gt;clients, 0, 0,
+ 	                        (int)srv-&gt;display_w, (int)srv-&gt;display_h);
+-	display_cursor_refresh();
++	cursor_paint();
+ }
+ 
+ void draw(struct ServerState* srv, struct Client cli) {
+@@ -710,8 +714,11 @@ void draw(struct ServerState* srv, struct Client cli) {
+ 	if (sx0 &gt;= sx1 || sy0 &gt;= sy1)
+ 		return;
+ 
++	/* Must restore before blit: otherwise underlay is stale and the next
++	 * cursor move leaves a black rectangle at the old position. */
++	cursor_restore();
+ 	blit_client_overlap(srv, &amp;cli, sx0, sy0, sx1, sy1);
+-	display_cursor_refresh();
++	cursor_paint();
+ }
+ 
+ /*
+@@ -753,9 +760,10 @@ void redraw_region(struct ServerState* srv, struct Client c, int wdx, int wdy) {
+ 
+ 	/* Fill the union with everything behind the moving client; caller
+ 	 * then draw()s the client on top at its new position. */
++	cursor_restore();
+ 	if (ux0 &lt; ux1 &amp;&amp; uy0 &lt; uy1)
+ 		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
+-	display_cursor_refresh();
++	cursor_paint();
+ }
+ 
+ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy) {
+@@ -793,9 +801,10 @@ void redraw_from_resize(struct ServerState* srv, struct Client c, int dx, int dy
+ 		uy1 = (int)srv-&gt;display_h;
+ 
+ 	/* Everything behind the resized client into the union; draw() later. */
++	cursor_restore();
+ 	if (ux0 &lt; ux1 &amp;&amp; uy0 &lt; uy1)
+ 		composite_chain_to_rect(srv, c.next, ux0, uy0, ux1, uy1);
+-	display_cursor_refresh();
++	cursor_paint();
+ }
+ 
+ int take_screenshot(const char* filename) {
+diff --git a/input.c b/input.c
+index daaef12..6ba9393 100644
+--- a/input.c
++++ b/input.c
+@@ -58,39 +58,54 @@ extern struct ServerState server;
+ extern struct config config;
+ 
+ int resize_buffer(struct Client* c, int dx, int dy) {
+-	// for resize we must reallocate the buffer
+-	// Unmap and unlink old buffer
++	char old_name[64];
++	size_t buf_size;
++	int shm_fd;
++	void *map;
++	uint32_t new_w, new_h;
++
++	if (!c)
++		return 0;
++
++	new_w = (uint32_t)((int)c-&gt;width + dx);
++	new_h = (uint32_t)((int)c-&gt;height + dy);
++	if (new_w == 0 || new_h == 0)
++		return 0;
++
++	old_name[0] = '\0';
+ 	if (c-&gt;buffer) {
+ 		munmap(c-&gt;buffer, c-&gt;width * c-&gt;height * BGCE_BYTES_PER_PIXEL);
+-		shm_unlink(c-&gt;shm_name);
++		c-&gt;buffer = NULL;
++		strncpy(old_name, c-&gt;shm_name, sizeof(old_name) - 1);
++		old_name[sizeof(old_name) - 1] = '\0';
+ 	}
+ 
+-	// Create new shared memory name and object
+-	snprintf(c-&gt;shm_name, sizeof(c-&gt;shm_name),
+-	         "bgce_buf_%d_%ld", getpid(), time(NULL));
+-	int shm_fd = shm_open(c-&gt;shm_name, O_CREAT | O_RDWR, 0600);
++	buf_size = (size_t)new_w * new_h * BGCE_BYTES_PER_PIXEL;
++	shm_fd = bgce_buf_create(c-&gt;shm_name, sizeof(c-&gt;shm_name), buf_size);
+ 	if (shm_fd &lt; 0) {
+-		perror("[BGCE] shm_open for resize");
++		perror("[BGCE] create buffer for resize");
++		if (old_name[0])
++			bgce_buf_unlink(old_name);
+ 		return 0;
+ 	}
+ 
+-	size_t buf_size = (c-&gt;width + dx) * (c-&gt;height + dy) * BGCE_BYTES_PER_PIXEL;
+-	if (ftruncate(shm_fd, buf_size) &lt; 0) {
+-		perror("[BGCE] ftruncate for resize");
+-		close(shm_fd);
+-		return 0;
+-	}
+-
+-	c-&gt;buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+-	if (c-&gt;buffer == MAP_FAILED) {
++	map = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++	close(shm_fd);
++	if (map == MAP_FAILED) {
+ 		perror("[BGCE] mmap for resize");
+-		close(shm_fd);
++		bgce_buf_unlink(c-&gt;shm_name);
++		c-&gt;shm_name[0] = '\0';
++		if (old_name[0])
++			bgce_buf_unlink(old_name);
+ 		return 0;
+ 	}
+ 
+-	c-&gt;width += dx;
+-	c-&gt;height += dy;
+-	close(shm_fd);
++	if (old_name[0])
++		bgce_buf_unlink(old_name);
++
++	c-&gt;buffer = map;
++	c-&gt;width = new_w;
++	c-&gt;height = new_h;
+ 	printf("[BGCE] Client resized: %p size=%zu (%dx%d) name=%s\n",
+ 	       c-&gt;buffer,
+ 	       c-&gt;width * c-&gt;height * 4UL,
+diff --git a/libbgce.c b/libbgce.c
+index 1ec91fc..8118390 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -7,6 +7,7 @@
+ #include &lt;string.h&gt;
+ #include &lt;sys/mman.h&gt;
+ #include &lt;sys/socket.h&gt;
++#include &lt;sys/stat.h&gt;
+ #include &lt;sys/un.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+@@ -29,6 +30,164 @@ char *bgce_socket_path(char *buf, size_t buflen)
+ 	return buf;
+ }
+ 
++/* Shared buffers live under the user cache dir (not /dev/shm):
++ *   $XDG_CACHE_HOME/bgce/buf/   or   $HOME/.cache/bgce/buf/
++ */
++static int bgce_mkdir_p(const char *path)
++{
++	struct stat st;
++
++	if (!path || !path[0])
++		return -1;
++	if (stat(path, &amp;st) == 0)
++		return S_ISDIR(st.st_mode) ? 0 : -1;
++	if (mkdir(path, 0700) &lt; 0 &amp;&amp; errno != EEXIST)
++		return -1;
++	return 0;
++}
++
++static int bgce_buf_dir(char *buf, size_t buflen)
++{
++	const char *xdg;
++	const char *home;
++	int n;
++
++	if (!buf || buflen &lt; 32)
++		return -1;
++
++	xdg = getenv("XDG_CACHE_HOME");
++	if (xdg &amp;&amp; xdg[0] == '/') {
++		n = snprintf(buf, buflen, "%s/bgce/buf", xdg);
++	} else {
++		home = getenv("HOME");
++		if (!home || !home[0])
++			return -1;
++		n = snprintf(buf, buflen, "%s/.cache/bgce/buf", home);
++	}
++
++	if (n &lt; 0 || (size_t)n &gt;= buflen)
++		return -1;
++	return 0;
++}
++
++static int bgce_buf_file_path(const char *token, char *path, size_t pathlen)
++{
++	char dir[512];
++
++	if (!token || !token[0] || token[0] == '/' || strchr(token, '/'))
++		return -1;
++	if (bgce_buf_dir(dir, sizeof(dir)) &lt; 0)
++		return -1;
++	if (snprintf(path, pathlen, "%s/%s", dir, token) &lt; 0 ||
++	    strlen(path) &gt;= pathlen)
++		return -1;
++	return 0;
++}
++
++static int bgce_ensure_buf_dir(void)
++{
++	const char *xdg;
++	const char *home;
++	char path[512];
++
++	xdg = getenv("XDG_CACHE_HOME");
++	if (xdg &amp;&amp; xdg[0] == '/') {
++		if (snprintf(path, sizeof(path), "%s", xdg) &gt;= (int)sizeof(path))
++			return -1;
++		if (bgce_mkdir_p(path) &lt; 0)
++			return -1;
++		if (snprintf(path, sizeof(path), "%s/bgce", xdg) &gt;= (int)sizeof(path))
++			return -1;
++		if (bgce_mkdir_p(path) &lt; 0)
++			return -1;
++		if (snprintf(path, sizeof(path), "%s/bgce/buf", xdg) &gt;= (int)sizeof(path))
++			return -1;
++		return bgce_mkdir_p(path);
++	}
++
++	home = getenv("HOME");
++	if (!home || !home[0])
++		return -1;
++	if (snprintf(path, sizeof(path), "%s/.cache", home) &gt;= (int)sizeof(path))
++		return -1;
++	if (bgce_mkdir_p(path) &lt; 0)
++		return -1;
++	if (snprintf(path, sizeof(path), "%s/.cache/bgce", home) &gt;= (int)sizeof(path))
++		return -1;
++	if (bgce_mkdir_p(path) &lt; 0)
++		return -1;
++	if (snprintf(path, sizeof(path), "%s/.cache/bgce/buf", home) &gt;= (int)sizeof(path))
++		return -1;
++	return bgce_mkdir_p(path);
++}
++
++int bgce_buf_create(char *name, size_t namelen, size_t size)
++{
++	unsigned char rnd[4];
++	int fd;
++	int rfd;
++	char path[512];
++
++	if (!name || namelen &lt; 16 || size == 0)
++		return -1;
++
++	if (bgce_ensure_buf_dir() &lt; 0)
++		return -1;
++
++	rfd = open("/dev/urandom", O_RDONLY);
++	if (rfd &lt; 0)
++		return -1;
++	if (read(rfd, rnd, sizeof(rnd)) != (ssize_t)sizeof(rnd)) {
++		close(rfd);
++		return -1;
++	}
++	close(rfd);
++
++	if (snprintf(name, namelen, "bgce_%02x%02x%02x%02x",
++	             rnd[0], rnd[1], rnd[2], rnd[3]) &lt; 0 ||
++	    (size_t)strlen(name) &gt;= namelen)
++		return -1;
++	if (bgce_buf_file_path(name, path, sizeof(path)) &lt; 0)
++		return -1;
++
++	fd = open(path, O_CREAT | O_RDWR | O_EXCL, 0600);
++	if (fd &lt; 0)
++		return -1;
++	if (ftruncate(fd, (off_t)size) &lt; 0) {
++		int e = errno;
++		close(fd);
++		unlink(path);
++		errno = e;
++		return -1;
++	}
++	return fd;
++}
++
++int bgce_buf_open(const char *name)
++{
++	char path[512];
++
++	if (!name || !name[0]) {
++		errno = EINVAL;
++		return -1;
++	}
++	if (bgce_buf_file_path(name, path, sizeof(path)) &lt; 0) {
++		errno = EINVAL;
++		return -1;
++	}
++	return open(path, O_RDWR);
++}
++
++void bgce_buf_unlink(const char *name)
++{
++	char path[512];
++
++	if (!name || !name[0])
++		return;
++	if (bgce_buf_file_path(name, path, sizeof(path)) == 0)
++		unlink(path);
++}
++
+ /* Write exactly 'size' bytes */
+ ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg) {
+ 	size_t size = sizeof(struct BGCEMessage);
+@@ -105,7 +264,7 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
+ 	if (conn &lt; 0)
+ 		return NULL;
+ 
+-	struct BGCEMessage msg;
++	struct BGCEMessage msg = {0};
+ 	msg.type = MSG_GET_BUFFER;
+ 	msg.data.buffer_request = req;
+ 
+@@ -116,20 +275,25 @@ void* bgce_get_buffer(int conn, struct BufferRequest req) {
+ 	if (bgce_recv_msg(conn, &amp;msg) &lt;= 0)
+ 		return NULL;
+ 
+-	struct BufferReply reply;
+-	reply = msg.data.buffer_reply;
++	struct BufferReply reply = msg.data.buffer_reply;
++	if (reply.status != 0 || reply.width == 0 || reply.height == 0 ||
++	    !reply.shm_name[0]) {
++		fprintf(stderr, "[BGCE] buffer request failed (status=%d name='%s')\n",
++		        reply.status, reply.shm_name);
++		return NULL;
++	}
+ 
+-	size_t size = reply.width * reply.height * 4;
+-	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
++	size_t size = (size_t)reply.width * reply.height * 4;
++	int shm_fd = bgce_buf_open(reply.shm_name);
+ 	if (shm_fd &lt; 0) {
+-		perror("[BGCE] shm_open (client)");
++		perror("[BGCE] open buffer (client)");
+ 		return NULL;
+ 	}
+ 
+ 	void* buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++	close(shm_fd);
+ 	if (buf == MAP_FAILED) {
+ 		perror("[BGCE] mmap (client)");
+-		close(shm_fd);
+ 		return NULL;
+ 	}
+ 
+diff --git a/loop.c b/loop.c
+index c520c6f..622dbc0 100644
+--- a/loop.c
++++ b/loop.c
+@@ -8,7 +8,6 @@
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+ #include &lt;sys/mman.h&gt;
+-#include &lt;time.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+ /* Externs from server.c */
+@@ -72,36 +71,70 @@ void* client_thread(void* arg) {
+ 
+ 		case MSG_GET_BUFFER: {
+ 			struct BufferRequest req = msg.data.buffer_request;
++			struct BufferReply reply = {0};
++			size_t buf_size;
++			int shm_fd;
++			void *map;
++			char old_name[64];
++			int had_buffer;
++
+ 			printf(
+ 			        "[BGCE] Client requested buffer of size %dx%d\n",
+ 			        req.width,
+ 			        req.height);
+ 
+-			snprintf(client-&gt;shm_name, sizeof(client-&gt;shm_name),
+-			         "bgce_buf_%d_%ld", getpid(), time(NULL));
++			reply.status = -1;
++			msg.type = MSG_GET_BUFFER;
++
++			if (req.width == 0 || req.height == 0) {
++				fprintf(stderr, "[BGCE] invalid buffer size %ux%u\n",
++				        req.width, req.height);
++				msg.data.buffer_reply = reply;
++				bgce_send_msg(client_fd, &amp;msg);
++				break;
++			}
+ 
+-			/* Unmap and unlink the existing buffer (resize path). */
+-			int had_buffer = client-&gt;buffer != NULL;
++			/* Unmap and remember old token before creating a new one. */
++			had_buffer = client-&gt;buffer != NULL;
++			old_name[0] = '\0';
+ 			if (had_buffer) {
+ 				printf("[BGCE] Client already has a buffer, unmapping.\n");
+ 				munmap(client-&gt;buffer, client-&gt;width * client-&gt;height * 4);
+-				shm_unlink(client-&gt;shm_name);
++				client-&gt;buffer = NULL;
++				strncpy(old_name, client-&gt;shm_name, sizeof(old_name) - 1);
++				old_name[sizeof(old_name) - 1] = '\0';
+ 			}
+ 
+-			int shm_fd = shm_open(client-&gt;shm_name, O_CREAT | O_RDWR, 0600);
++			buf_size = (size_t)req.width * req.height * 4;
++			shm_fd = bgce_buf_create(client-&gt;shm_name,
++			                         sizeof(client-&gt;shm_name), buf_size);
+ 			if (shm_fd &lt; 0) {
+-				perror("[BGCE] shm_open");
++				perror("[BGCE] create buffer");
++				if (old_name[0])
++					bgce_buf_unlink(old_name);
++				msg.data.buffer_reply = reply;
++				bgce_send_msg(client_fd, &amp;msg);
+ 				break;
+ 			}
+ 
+-			size_t buf_size = req.width * req.height * 4;
+-			if (ftruncate(shm_fd, buf_size) &lt; 0) {
+-				perror("[BGCE] ftruncate");
+-				close(shm_fd);
++			map = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED,
++			           shm_fd, 0);
++			close(shm_fd);
++			if (map == MAP_FAILED) {
++				perror("[BGCE] mmap buffer");
++				bgce_buf_unlink(client-&gt;shm_name);
++				client-&gt;shm_name[0] = '\0';
++				if (old_name[0])
++					bgce_buf_unlink(old_name);
++				msg.data.buffer_reply = reply;
++				bgce_send_msg(client_fd, &amp;msg);
+ 				break;
+ 			}
+ 
+-			client-&gt;buffer = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++			if (old_name[0])
++				bgce_buf_unlink(old_name);
++
++			client-&gt;buffer = map;
+ 			client-&gt;width = req.width;
+ 			client-&gt;height = req.height;
+ 			/* First buffer only: place at the current viewport so the window
+@@ -120,15 +153,15 @@ void* client_thread(void* arg) {
+ 				client-&gt;x = (uint32_t)wx;
+ 				client-&gt;y = (uint32_t)wy;
+ 			}
+-			close(shm_fd);
+ 			printf("[BGCE] Client buffer: %p size=%zu (%dx%d) name=%s\n",
+ 			       client-&gt;buffer,
+ 			       client-&gt;width * client-&gt;height * 4UL,
+ 			       client-&gt;width, client-&gt;height,
+ 			       client-&gt;shm_name);
+ 
+-			struct BufferReply reply = {0};
+-			strncpy(reply.shm_name, client-&gt;shm_name, sizeof(reply.shm_name));
++			reply.status = 0;
++			strncpy(reply.shm_name, client-&gt;shm_name, sizeof(reply.shm_name) - 1);
++			reply.shm_name[sizeof(reply.shm_name) - 1] = '\0';
+ 			reply.width = req.width;
+ 			reply.height = req.height;
+ 			msg.data.buffer_reply = reply;
+@@ -172,7 +205,9 @@ void* client_thread(void* arg) {
+ 
+ 	if (client-&gt;buffer) {
+ 		munmap(client-&gt;buffer, client-&gt;width * client-&gt;height * 4);
+-		shm_unlink(client-&gt;shm_name);
++		client-&gt;buffer = NULL;
++		bgce_buf_unlink(client-&gt;shm_name);
++		client-&gt;shm_name[0] = '\0';
+ 	}
+ 
+ 	// Remove client from the linked list
+diff --git a/server.c b/server.c
+index 97c7da7..1d52ed1 100644
+--- a/server.c
++++ b/server.c
+@@ -97,12 +97,12 @@ int main(void) {
+ 
+ 	char* home = getenv("HOME");
+ 	if (home) {
+-		char user_config[512];
+-		snprintf(user_config, sizeof(user_config), "%s/.config/bgce.conf", home);
+-		parse_config(&amp;config);
++		if (load_config(&amp;config) != 0)
++			fprintf(stderr, "[BGCE] No config at ~/.config/bgce.conf; using defaults\n");
++	} else {
++		fprintf(stderr, "[BGCE] HOME unset; using default config\n");
+ 	}
+-	printf("[BGCE] Loaded config type=%u, path=%s, mode=%u, shortcuts=%d\n",
+-	       config.type, config.path, config.mode, config.shortcut_count);
++	print_config(&amp;config);
+ 
+ 	if (!bgce_socket_path(listen_sock_path, sizeof(listen_sock_path))) {
+ 		fprintf(stderr, "[BGCE] socket path too long\n");
+diff --git a/server.h b/server.h
+index e63ebe3..dc26c0c 100644
+--- a/server.h
++++ b/server.h
+@@ -139,8 +139,10 @@ struct config {
+ 	struct cursor_theme cursors;
+ };
+ 
+-// Parse config file
+-int parse_config(struct config* config);
++// Load config file (~/.config/bgce.conf) and apply defaults
++int load_config(struct config* config);
++/** Log the full effective configuration (background, shortcuts, cursors). */
++void print_config(const struct config* config);
+ int apply_background(struct config* config, uint32_t* buffer, uint32_t width, uint32_t height);
+ 
+ /* ----------------------------
+</pre>

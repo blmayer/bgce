@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 4d83b14</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 4d83b14
+parent <a href=commit-b78e689.html>b78e689</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2025-12-23T22:19:08-03:00
+
+    renamed config struct
+
+<a href=tree-4d83b14.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/config.c b/config.c
+index 5a6173b..f744077 100644
+--- a/config.c
++++ b/config.c
+@@ -40,7 +40,7 @@ static uint32_t parse_hex_color(const char* str) {
+ }
+ 
+ // Parse config file
+-int parse_config(struct BackgroundConfig* config) {
++int parse_config(struct config* config) {
+ 	const char* home = getenv("HOME");
+ 	char user_config[512];
+ 	if (!home) {
+@@ -112,7 +112,7 @@ int parse_config(struct BackgroundConfig* config) {
+ }
+ 
+ // Apply background to a buffer
+-int apply_background(struct BackgroundConfig* config, uint32_t* buffer, uint32_t width, uint32_t height) {
++int apply_background(struct config* config, uint32_t* buffer, uint32_t width, uint32_t height) {
+ 	if (config-&gt;type == BG_COLOR) {
+ 		// Fill with solid color
+ 		for (uint32_t i = 0; i &lt; width * height; i++) {
+diff --git a/server.c b/server.c
+index 81d4d56..375fe2e 100644
+--- a/server.c
++++ b/server.c
+@@ -13,22 +13,7 @@
+ 
+ struct ServerState server = {}; /* Global server state */
+ 
+-/* Cleanup on Ctrl+C */
+-static void handle_sigint(int sig) {
+-	(void)sig;
+-	printf("[BGCE] Got sigint, shutting down.\n");
+-
+-	unlink(SOCKET_PATH);
+-	release_display();
+-	free(server.framebuffer);
+-	printf("\n[BGCE] Server terminated.\n");
+-
+-	exit(0);
+-}
+-
+ int main(void) {
+-	signal(SIGINT, handle_sigint);
+-
+ 	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
+ 	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
+ 
+@@ -38,7 +23,7 @@ int main(void) {
+ 	server.crtc_id = 0;
+ 	server.client_count = 0;
+ 
+-	struct BackgroundConfig config;
++	struct config config;
+ 	char* home = getenv("HOME");
+ 	if (home) {
+ 		char user_config[512];
+diff --git a/server.h b/server.h
+index cf3b466..4870e60 100644
+--- a/server.h
++++ b/server.h
+@@ -69,8 +69,8 @@ typedef enum {
+ 	IMAGE_SCALED
+ } ImageMode;
+ 
+-// Background configuration
+-struct BackgroundConfig {
++// Background configuration for now
++struct config {
+ 	BackgroundType type;
+ 	uint32_t color; // RGBA format
+ 	ImageMode mode;
+@@ -78,8 +78,8 @@ struct BackgroundConfig {
+ };
+ 
+ // Parse config file
+-int parse_config(struct BackgroundConfig* config);
+-int apply_background(struct BackgroundConfig* config, uint32_t* buffer, uint32_t width, uint32_t height);
++int parse_config(struct config* config);
++int apply_background(struct config* config, uint32_t* buffer, uint32_t width, uint32_t height);
+ 
+ /* ----------------------------
+  * Cursor
+</pre>

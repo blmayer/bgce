@@ -1,0 +1,1452 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 6a4d501</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 6a4d501
+parent <a href=commit-4e768c4.html>4e768c4</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-14T12:07:56-03:00
+
+    Add compositor job queue with FCFS blit workers.
+
+    Move framebuffer paints off input/client threads onto an orchestrator and
+    a free three-worker task pool (MOVE underlays and mover grab FCFS). Headless
+    uses sync inline mode; enable BGCE_DEBUG_DAMAGE=1 for rect logs. Also wires
+    natural_scrolling, Alt+Tab builtins, and related input/config paths.
+
+<a href=tree-6a4d501.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 56a42a5..0c2affd 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -16,6 +16,10 @@ Implement a minimal Linux graphical environment that runs without root, manages
+ - **IPC:** UNIX domain sockets for commands, FIFO for input events.
+ - **Buffers:** Each client has an off-screen buffer; server composites into real framebuffer.
+ - **Rendering:** CPU-based memory blitting only (no OpenGL/DRI accel for now).
++- **Compositor:** `compositor.c` owns a job queue + orchestrator thread; paint
++  algorithms stay in `display.c`. MOVE enqueues underlay/mover as free tasks;
++  3 blit workers grab FCFS (not pinned to L0/L1/mover). No coalescing yet.
++  Headless uses sync (inline) mode. Debug damage: `BGCE_DEBUG_DAMAGE=1`.
+ - **MSG_DRAW:** Blit only the client that asked, clipped by opaque windows
+   above (subtract their rects). Do **not** full-stack recompose wallpaper /
+   clients below on ordinary draw — that was a regression (blink/refill).
+@@ -89,7 +93,8 @@ kernel headers. Real `bgce` still requires Linux.
+ - **Alt + right-drag on a client**: resize window (existing)
+ - **Alt + Tab** / **Alt + Shift + Tab**: cycle focus (raise app); pan + zoom to
+   that app’s last viewport so it appears where it was left (does not move the
+-  window rect). Shift reverses the cycle.
++  window rect). Shift reverses the cycle. Defaults are config builtins
++  `alttab` / `alttab_prev` under `[shortcuts]` (overrideable).
+ - Virtual desktop is 2× the physical resolution in each axis (4× area). Client
+   positions and buffer sizes are in world pixels; the compositor scales to the
+   screen using the current zoom and pan.
+diff --git a/Makefile b/Makefile
+index 4318308..89cd33d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,16 +23,16 @@ else
+ DISPLAY_OBJ = display_fbdev.o
+ endif
+ 
+-SERVER_OBJS = server.o loop.o libbgce.so input.o display.o $(DISPLAY_OBJ) config.o location_cache.o
++SERVER_OBJS = server.o loop.o libbgce.so input.o display.o $(DISPLAY_OBJ) config.o location_cache.o compositor.o
+ LIB_OBJS = libbgce.o
+ 
+ # Headless mock compositor (no fbdev/input) — works on macOS + Linux
+-HEADLESS_OBJS = display.o display_mock.o config.o mock.o input_headless.o location_cache.o
++HEADLESS_OBJS = display.o display_mock.o config.o mock.o input_headless.o location_cache.o compositor.o
+ 
+ all: bgce libbgce.so
+ 
+ bgce: $(SERVER_OBJS)
+-	$(CC) $(CFLAGS) -o $@ server.o loop.o input.o display.o $(DISPLAY_OBJ) config.o location_cache.o -L. -lbgce $(LDFLAGS)
++	$(CC) $(CFLAGS) -o $@ server.o loop.o input.o display.o $(DISPLAY_OBJ) config.o location_cache.o compositor.o -L. -lbgce $(LDFLAGS)
+ 
+ libbgce.so: $(LIB_OBJS)
+ 	$(CC) -shared -o $@ $(LIB_OBJS)
+diff --git a/compositor.c b/compositor.c
+new file mode 100644
+index 0000000..fada85f
+--- /dev/null
++++ b/compositor.c
+@@ -0,0 +1,538 @@
++/*
++ * compositor.c — high-level job queue + orchestrator + free FCFS blit workers.
++ *
++ * display.c owns paint algorithms; this file owns when they run and threading.
++ *
++ * Two levels:
++ *   1) Job queue  — DRAW/MOVE/PAN/… consumed by the orchestrator (ordered).
++ *   2) Task queue — fine-grained paint fns; 3 workers grab FCFS (any worker
++ *                   can take underlay or mover work during a MOVE).
++ */
++
++#include "compositor.h"
++#include "server.h"
++
++#include &lt;errno.h&gt;
++#include &lt;pthread.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++
++extern struct ServerState server;
++
++#define COMP_QUEUE_CAP 256
++#define COMP_NWORKERS 3
++#define TASK_QUEUE_CAP 16
++
++enum comp_op {
++	COMP_DRAW = 1,
++	COMP_MOVE,
++	COMP_PAN,
++	COMP_ERASE,
++	COMP_FULL,
++	COMP_QUIT
++};
++
++struct comp_job {
++	enum comp_op op;
++	uint32_t client_id;
++	int old_x, old_y, new_x, new_y;
++	int sdx, sdy;
++	uint32_t erase_x, erase_y, erase_ww, erase_wh;
++};
++
++struct paint_task {
++	void (*fn)(void *);
++	void *arg;
++};
++
++static struct comp_job queue[COMP_QUEUE_CAP];
++static int q_head, q_tail, q_count;
++
++static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t q_not_empty = PTHREAD_COND_INITIALIZER;
++static pthread_cond_t q_not_full = PTHREAD_COND_INITIALIZER;
++static pthread_cond_t q_idle = PTHREAD_COND_INITIALIZER;
++
++static pthread_t orch_thread;
++static pthread_t workers[COMP_NWORKERS];
++
++static int comp_inited;
++static int comp_sync;
++static int orch_running;
++static int job_in_flight;
++static int damage_debug;
++
++/* ---- Free FCFS task queue for blit workers ---- */
++static pthread_mutex_t work_mu = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t work_cv = PTHREAD_COND_INITIALIZER;
++static pthread_cond_t work_done_cv = PTHREAD_COND_INITIALIZER;
++static struct paint_task task_q[TASK_QUEUE_CAP];
++static int tq_head, tq_tail, tq_count;
++static int tasks_left; /* incomplete tasks in the current batch */
++static int workers_running;
++static int work_shutdown;
++
++static __thread int tls_worker_id = -1;
++
++static void damage_init(void)
++{
++	const char *e = getenv("BGCE_DEBUG_DAMAGE");
++
++	damage_debug = (e &amp;&amp; e[0] &amp;&amp; e[0] != '0');
++	if (damage_debug)
++		printf("[BGCE] compositor: BGCE_DEBUG_DAMAGE on\n");
++}
++
++int bgce_comp_worker_id(void)
++{
++	return tls_worker_id;
++}
++
++void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
++                          int worker)
++{
++	if (!damage_debug)
++		return;
++	if (worker &lt; 0)
++		worker = tls_worker_id;
++	if (worker &gt;= 0)
++		printf("[BGCE] damage %s rect=(%d,%d)-(%d,%d) worker=%d\n",
++		       tag ? tag : "?", x0, y0, x1, y1, worker);
++	else
++		printf("[BGCE] damage %s rect=(%d,%d)-(%d,%d)\n",
++		       tag ? tag : "?", x0, y0, x1, y1);
++}
++
++struct Client *bgce_comp_find_client(uint32_t client_id)
++{
++	struct Client *c;
++
++	if (client_id == 0)
++		return NULL;
++	for (c = server.clients; c; c = c-&gt;next) {
++		if (c-&gt;id == client_id)
++			return c;
++	}
++	return NULL;
++}
++
++static void run_job(const struct comp_job *job)
++{
++	struct Client *c;
++	struct Client gone;
++	int wdx, wdy;
++	uint32_t save_x, save_y;
++
++	switch (job-&gt;op) {
++	case COMP_DRAW:
++		c = bgce_comp_find_client(job-&gt;client_id);
++		if (c)
++			draw(&amp;server, c);
++		break;
++
++	case COMP_MOVE:
++		c = bgce_comp_find_client(job-&gt;client_id);
++		if (!c)
++			break;
++		wdx = job-&gt;new_x - job-&gt;old_x;
++		wdy = job-&gt;new_y - job-&gt;old_y;
++		if (wdx == 0 &amp;&amp; wdy == 0)
++			break;
++		/*
++		 * Logical position may already be at new (or further ahead).
++		 * Paint from old → new, then restore whatever input set.
++		 */
++		save_x = c-&gt;x;
++		save_y = c-&gt;y;
++		c-&gt;x = (uint32_t)job-&gt;old_x;
++		c-&gt;y = (uint32_t)job-&gt;old_y;
++		redraw_region(&amp;server, c, wdx, wdy);
++		c-&gt;x = save_x;
++		c-&gt;y = save_y;
++		break;
++
++	case COMP_PAN:
++		if (job-&gt;sdx || job-&gt;sdy)
++			redraw_pan(&amp;server, job-&gt;sdx, job-&gt;sdy);
++		break;
++
++	case COMP_ERASE:
++		memset(&amp;gone, 0, sizeof(gone));
++		gone.x = job-&gt;erase_x;
++		gone.y = job-&gt;erase_y;
++		gone.world_w = job-&gt;erase_ww;
++		gone.world_h = job-&gt;erase_wh;
++		gone.width = job-&gt;erase_ww;
++		gone.height = job-&gt;erase_wh;
++		erase_client(&amp;server, &amp;gone);
++		break;
++
++	case COMP_FULL:
++		redraw_all(&amp;server);
++		break;
++
++	case COMP_QUIT:
++	default:
++		break;
++	}
++}
++
++static void *worker_main(void *arg)
++{
++	int id = (int)(intptr_t)arg;
++
++	tls_worker_id = id;
++
++	for (;;) {
++		struct paint_task task;
++
++		memset(&amp;task, 0, sizeof(task));
++
++		pthread_mutex_lock(&amp;work_mu);
++		while (!work_shutdown &amp;&amp; tq_count == 0)
++			pthread_cond_wait(&amp;work_cv, &amp;work_mu);
++		if (work_shutdown &amp;&amp; tq_count == 0) {
++			pthread_mutex_unlock(&amp;work_mu);
++			break;
++		}
++		/* FCFS: first waiting worker takes the head task. */
++		if (tq_count == 0) {
++			pthread_mutex_unlock(&amp;work_mu);
++			continue;
++		}
++		task = task_q[tq_head];
++		tq_head = (tq_head + 1) % TASK_QUEUE_CAP;
++		tq_count--;
++		pthread_mutex_unlock(&amp;work_mu);
++
++		if (task.fn)
++			task.fn(task.arg);
++
++		pthread_mutex_lock(&amp;work_mu);
++		if (tasks_left &gt; 0)
++			tasks_left--;
++		if (tasks_left == 0)
++			pthread_cond_signal(&amp;work_done_cv);
++		pthread_mutex_unlock(&amp;work_mu);
++	}
++
++	tls_worker_id = -1;
++	return NULL;
++}
++
++void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
++                         void *a1, void (*f2)(void *), void *a2)
++{
++	int n = 0;
++	int i;
++	void (*fns[3])(void *) = { f0, f1, f2 };
++	void *args[3] = { a0, a1, a2 };
++
++	for (i = 0; i &lt; 3; i++) {
++		if (fns[i])
++			n++;
++	}
++	if (n == 0)
++		return;
++
++	/* Sync mode or workers not up: serial on caller. */
++	if (comp_sync || !workers_running) {
++		for (i = 0; i &lt; 3; i++) {
++			if (fns[i])
++				fns[i](args[i]);
++		}
++		return;
++	}
++
++	/*
++	 * Push all tasks, then wait.  Workers race to grab them (FCFS);
++	 * which worker paints L0 vs mover is not fixed.
++	 */
++	pthread_mutex_lock(&amp;work_mu);
++	/* Only one batch at a time (orchestrator is single-threaded). */
++	while (tasks_left &gt; 0)
++		pthread_cond_wait(&amp;work_done_cv, &amp;work_mu);
++
++	tq_head = tq_tail = tq_count = 0;
++	tasks_left = n;
++	for (i = 0; i &lt; 3; i++) {
++		if (!fns[i])
++			continue;
++		if (tq_count &gt;= TASK_QUEUE_CAP) {
++			/* Should not happen with n &lt;= 3; run overflow serial. */
++			pthread_mutex_unlock(&amp;work_mu);
++			fns[i](args[i]);
++			pthread_mutex_lock(&amp;work_mu);
++			if (tasks_left &gt; 0)
++				tasks_left--;
++			continue;
++		}
++		task_q[tq_tail].fn = fns[i];
++		task_q[tq_tail].arg = args[i];
++		tq_tail = (tq_tail + 1) % TASK_QUEUE_CAP;
++		tq_count++;
++	}
++	pthread_cond_broadcast(&amp;work_cv);
++	while (tasks_left &gt; 0)
++		pthread_cond_wait(&amp;work_done_cv, &amp;work_mu);
++	pthread_mutex_unlock(&amp;work_mu);
++}
++
++static void enqueue(const struct comp_job *job)
++{
++	if (comp_sync) {
++		run_job(job);
++		return;
++	}
++
++	pthread_mutex_lock(&amp;q_mu);
++	while (q_count &gt;= COMP_QUEUE_CAP)
++		pthread_cond_wait(&amp;q_not_full, &amp;q_mu);
++	queue[q_tail] = *job;
++	q_tail = (q_tail + 1) % COMP_QUEUE_CAP;
++	q_count++;
++	pthread_cond_signal(&amp;q_not_empty);
++	pthread_mutex_unlock(&amp;q_mu);
++}
++
++static int dequeue(struct comp_job *out)
++{
++	pthread_mutex_lock(&amp;q_mu);
++	while (q_count == 0 &amp;&amp; orch_running)
++		pthread_cond_wait(&amp;q_not_empty, &amp;q_mu);
++	if (q_count == 0) {
++		pthread_mutex_unlock(&amp;q_mu);
++		return 0;
++	}
++	*out = queue[q_head];
++	q_head = (q_head + 1) % COMP_QUEUE_CAP;
++	q_count--;
++	job_in_flight = 1;
++	pthread_cond_signal(&amp;q_not_full);
++	pthread_mutex_unlock(&amp;q_mu);
++	return 1;
++}
++
++static void job_done(void)
++{
++	pthread_mutex_lock(&amp;q_mu);
++	job_in_flight = 0;
++	if (q_count == 0)
++		pthread_cond_broadcast(&amp;q_idle);
++	pthread_mutex_unlock(&amp;q_mu);
++}
++
++static void *orchestrator_main(void *arg)
++{
++	struct comp_job job;
++
++	(void)arg;
++	for (;;) {
++		if (!dequeue(&amp;job))
++			break;
++		if (job.op == COMP_QUIT) {
++			job_done();
++			break;
++		}
++		run_job(&amp;job);
++		job_done();
++	}
++	return NULL;
++}
++
++int bgce_comp_init(int sync_mode)
++{
++	int i;
++
++	if (comp_inited)
++		bgce_comp_shutdown();
++
++	damage_init();
++	comp_sync = sync_mode ? 1 : 0;
++	q_head = q_tail = q_count = 0;
++	job_in_flight = 0;
++	work_shutdown = 0;
++	tq_head = tq_tail = tq_count = 0;
++	tasks_left = 0;
++	workers_running = 0;
++	orch_running = 0;
++
++	if (comp_sync) {
++		comp_inited = 1;
++		printf("[BGCE] compositor: sync mode (inline paint)\n");
++		return 0;
++	}
++
++	orch_running = 1;
++	if (pthread_create(&amp;orch_thread, NULL, orchestrator_main, NULL) != 0) {
++		perror("[BGCE] compositor orchestrator");
++		orch_running = 0;
++		comp_sync = 1;
++		comp_inited = 1;
++		return -1;
++	}
++
++	for (i = 0; i &lt; COMP_NWORKERS; i++) {
++		if (pthread_create(&amp;workers[i], NULL, worker_main,
++		                   (void *)(intptr_t)i) != 0) {
++			perror("[BGCE] compositor worker");
++			/* Fall back: parallel3 will run serial. */
++			break;
++		}
++		workers_running++;
++	}
++
++	comp_inited = 1;
++	printf("[BGCE] compositor: async job queue, %d FCFS blit worker(s)\n",
++	       workers_running);
++	return 0;
++}
++
++void bgce_comp_shutdown(void)
++{
++	struct comp_job quit;
++	int i;
++
++	if (!comp_inited)
++		return;
++
++	if (!comp_sync &amp;&amp; orch_running) {
++		memset(&amp;quit, 0, sizeof(quit));
++		quit.op = COMP_QUIT;
++		enqueue(&amp;quit);
++		pthread_join(orch_thread, NULL);
++		orch_running = 0;
++	}
++
++	if (workers_running &gt; 0) {
++		pthread_mutex_lock(&amp;work_mu);
++		work_shutdown = 1;
++		pthread_cond_broadcast(&amp;work_cv);
++		pthread_mutex_unlock(&amp;work_mu);
++		for (i = 0; i &lt; workers_running; i++)
++			pthread_join(workers[i], NULL);
++		workers_running = 0;
++	}
++
++	comp_inited = 0;
++	comp_sync = 0;
++	q_head = q_tail = q_count = 0;
++	printf("[BGCE] compositor: shutdown\n");
++}
++
++void bgce_comp_flush(void)
++{
++	if (!comp_inited || comp_sync)
++		return;
++
++	pthread_mutex_lock(&amp;q_mu);
++	while (q_count &gt; 0 || job_in_flight)
++		pthread_cond_wait(&amp;q_idle, &amp;q_mu);
++	pthread_mutex_unlock(&amp;q_mu);
++}
++
++void bgce_comp_submit_draw(uint32_t client_id)
++{
++	struct comp_job j;
++
++	if (!comp_inited) {
++		struct Client *c = bgce_comp_find_client(client_id);
++		if (c)
++			draw(&amp;server, c);
++		return;
++	}
++	memset(&amp;j, 0, sizeof(j));
++	j.op = COMP_DRAW;
++	j.client_id = client_id;
++	enqueue(&amp;j);
++}
++
++void bgce_comp_submit_move(uint32_t client_id, int old_x, int old_y, int new_x,
++                           int new_y)
++{
++	struct comp_job j;
++
++	if (!comp_inited) {
++		struct Client *c = bgce_comp_find_client(client_id);
++		int wdx, wdy;
++		uint32_t sx, sy;
++
++		if (!c)
++			return;
++		wdx = new_x - old_x;
++		wdy = new_y - old_y;
++		sx = c-&gt;x;
++		sy = c-&gt;y;
++		c-&gt;x = (uint32_t)old_x;
++		c-&gt;y = (uint32_t)old_y;
++		redraw_region(&amp;server, c, wdx, wdy);
++		c-&gt;x = sx;
++		c-&gt;y = sy;
++		return;
++	}
++	memset(&amp;j, 0, sizeof(j));
++	j.op = COMP_MOVE;
++	j.client_id = client_id;
++	j.old_x = old_x;
++	j.old_y = old_y;
++	j.new_x = new_x;
++	j.new_y = new_y;
++	enqueue(&amp;j);
++}
++
++void bgce_comp_submit_pan(int sdx, int sdy)
++{
++	struct comp_job j;
++
++	if (!comp_inited) {
++		if (sdx || sdy)
++			redraw_pan(&amp;server, sdx, sdy);
++		return;
++	}
++	memset(&amp;j, 0, sizeof(j));
++	j.op = COMP_PAN;
++	j.sdx = sdx;
++	j.sdy = sdy;
++	enqueue(&amp;j);
++}
++
++void bgce_comp_submit_erase(uint32_t x, uint32_t y, uint32_t world_w,
++                            uint32_t world_h)
++{
++	struct comp_job j;
++
++	if (!comp_inited) {
++		struct Client gone;
++
++		memset(&amp;gone, 0, sizeof(gone));
++		gone.x = x;
++		gone.y = y;
++		gone.world_w = world_w;
++		gone.world_h = world_h;
++		gone.width = world_w;
++		gone.height = world_h;
++		erase_client(&amp;server, &amp;gone);
++		return;
++	}
++	memset(&amp;j, 0, sizeof(j));
++	j.op = COMP_ERASE;
++	j.erase_x = x;
++	j.erase_y = y;
++	j.erase_ww = world_w;
++	j.erase_wh = world_h;
++	enqueue(&amp;j);
++}
++
++void bgce_comp_submit_full(void)
++{
++	struct comp_job j;
++
++	if (!comp_inited) {
++		redraw_all(&amp;server);
++		return;
++	}
++	memset(&amp;j, 0, sizeof(j));
++	j.op = COMP_FULL;
++	enqueue(&amp;j);
++}
+diff --git a/compositor.h b/compositor.h
+new file mode 100644
+index 0000000..83ab9f6
+--- /dev/null
++++ b/compositor.h
+@@ -0,0 +1,75 @@
++#ifndef BGCE_COMPOSITOR_H
++#define BGCE_COMPOSITOR_H
++
++#include &lt;stdint.h&gt;
++
++struct Client;
++
++/**
++ * Compositor: owns framebuffer writes via a job queue.
++ *
++ * - Async mode: orchestrator pops high-level jobs (DRAW/MOVE/PAN/…).
++ *   A pool of 3 blit workers runs fine-grained tasks from a free FCFS
++ *   task queue (any worker can take any task — underlay or mover, etc.).
++ *   No coalescing — every submitted event is painted.
++ * - Sync mode (headless/mock): submit runs paint on the caller; parallel
++ *   tasks run serially.
++ *
++ * Debug rect logs: set env BGCE_DEBUG_DAMAGE=1.
++ */
++
++/** Start compositor. sync_mode != 0 → no background threads (inline paint). */
++int bgce_comp_init(int sync_mode);
++
++/** Stop workers, drain queue, join threads. Safe if never inited. */
++void bgce_comp_shutdown(void);
++
++/** Block until the queue is empty and no job is in flight. */
++void bgce_comp_flush(void);
++
++/** MSG_DRAW: blit one client (clipped by windows above). */
++void bgce_comp_submit_draw(uint32_t client_id);
++
++/**
++ * Window move by world delta.  Caller has already applied new_x/new_y to the
++ * client; the job paints from (old_x,old_y) → (new_x,new_y).
++ */
++void bgce_comp_submit_move(uint32_t client_id, int old_x, int old_y,
++                           int new_x, int new_y);
++
++/** Desktop pan by screen-pixel delta (caller already updated pan, or not —
++ *  pan job applies redraw_pan which updates pan inside display). */
++void bgce_comp_submit_pan(int sdx, int sdy);
++
++/**
++ * Client gone: repaint its former footprint.  Geometry is snapshotted in the
++ * job (safe after the Client is unlinked / freed).
++ */
++void bgce_comp_submit_erase(uint32_t x, uint32_t y, uint32_t world_w,
++                            uint32_t world_h);
++
++/** Full-scene recomposite (zoom, Alt+Tab viewport, hard invalidate). */
++void bgce_comp_submit_full(void);
++
++/**
++ * Enqueue up to three independent paint tasks and wait until all complete.
++ * Workers grab tasks first-come-first-serve (not pinned to L0/L1/mover).
++ * NULL function slots are skipped.  In sync mode, runs serially.
++ */
++void bgce_comp_parallel3(void (*f0)(void *), void *a0, void (*f1)(void *),
++                         void *a1, void (*f2)(void *), void *a2);
++
++/**
++ * Id of the blit worker running this thread (0..2), or -1 if not a worker
++ * (serial/sync path).  Useful for damage debug logs.
++ */
++int bgce_comp_worker_id(void);
++
++/** Debug: log a damage rect if BGCE_DEBUG_DAMAGE is set. worker=-1 → auto/serial. */
++void bgce_comp_damage_log(const char *tag, int x0, int y0, int x1, int y1,
++                          int worker);
++
++/** Look up a live client by id (for paint paths). */
++struct Client *bgce_comp_find_client(uint32_t client_id);
++
++#endif /* BGCE_COMPOSITOR_H */
+diff --git a/config.c b/config.c
+index 2bcc78b..1133dc6 100644
+--- a/config.c
++++ b/config.c
+@@ -212,6 +212,12 @@ static enum shortcut_parse_result parse_shortcut_rhs(const char* rhs, struct sho
+ 		} else if (strcmp(valstr, "screenshot") == 0) {
+ 			strcpy(out-&gt;value, "screenshot");
+ 			return SHORTCUT_PARSE_OK;
++		} else if (strcmp(valstr, "alttab") == 0) {
++			strcpy(out-&gt;value, "alttab");
++			return SHORTCUT_PARSE_OK;
++		} else if (strcmp(valstr, "alttab_prev") == 0) {
++			strcpy(out-&gt;value, "alttab_prev");
++			return SHORTCUT_PARSE_OK;
+ 		}
+ 		return SHORTCUT_PARSE_UNSUPPORTED_BUILTIN;
+ 	} else if (strcmp(typestr, "command") == 0) {
+@@ -226,11 +232,12 @@ static enum shortcut_parse_result parse_shortcut_rhs(const char* rhs, struct sho
+ 	return SHORTCUT_PARSE_BAD_FORMAT;
+ }
+ 
+-// Ensure the default exit and screenshot shortcuts exist unless the user
+-// has explicitly provided their own binding for those actions.
++// Ensure default builtins exist unless the user bound those actions already.
+ static void set_default_shortcuts(struct config* config) {
+ 	bool has_exit = false;
+ 	bool has_screenshot = false;
++	bool has_alttab = false;
++	bool has_alttab_prev = false;
+ 
+ 	for (int i = 0; i &lt; config-&gt;shortcut_count; i++) {
+ 		if (config-&gt;shortcuts[i].type == SHORTCUT_BUILTIN) {
+@@ -238,6 +245,10 @@ static void set_default_shortcuts(struct config* config) {
+ 				has_exit = true;
+ 			else if (strcmp(config-&gt;shortcuts[i].value, "screenshot") == 0)
+ 				has_screenshot = true;
++			else if (strcmp(config-&gt;shortcuts[i].value, "alttab") == 0)
++				has_alttab = true;
++			else if (strcmp(config-&gt;shortcuts[i].value, "alttab_prev") == 0)
++				has_alttab_prev = true;
+ 		}
+ 	}
+ 
+@@ -260,6 +271,28 @@ static void set_default_shortcuts(struct config* config) {
+ 		strcpy(config-&gt;shortcuts[idx].value, "screenshot");
+ 		config-&gt;shortcut_count++;
+ 	}
++
++	/* Alt+Tab / Alt+Shift+Tab — window cycle + viewport restore */
++	if (!has_alttab &amp;&amp; config-&gt;shortcut_count &lt; MAX_SHORTCUTS) {
++		int idx = config-&gt;shortcut_count;
++		memset(&amp;config-&gt;shortcuts[idx], 0, sizeof(config-&gt;shortcuts[0]));
++		config-&gt;shortcuts[idx].combo.alt = 1;
++		config-&gt;shortcuts[idx].combo.key = KEY_TAB;
++		config-&gt;shortcuts[idx].type = SHORTCUT_BUILTIN;
++		strcpy(config-&gt;shortcuts[idx].value, "alttab");
++		config-&gt;shortcut_count++;
++	}
++
++	if (!has_alttab_prev &amp;&amp; config-&gt;shortcut_count &lt; MAX_SHORTCUTS) {
++		int idx = config-&gt;shortcut_count;
++		memset(&amp;config-&gt;shortcuts[idx], 0, sizeof(config-&gt;shortcuts[0]));
++		config-&gt;shortcuts[idx].combo.alt = 1;
++		config-&gt;shortcuts[idx].combo.shift = 1;
++		config-&gt;shortcuts[idx].combo.key = KEY_TAB;
++		config-&gt;shortcuts[idx].type = SHORTCUT_BUILTIN;
++		strcpy(config-&gt;shortcuts[idx].value, "alttab_prev");
++		config-&gt;shortcut_count++;
++	}
+ }
+ 
+ /* ---------------------------------------------------------------
+diff --git a/display.c b/display.c
+index 8f682ee..fbd7fde 100644
+--- a/display.c
++++ b/display.c
+@@ -5,6 +5,7 @@
+ 
+ #define STB_IMAGE_WRITE_IMPLEMENTATION
+ 
++#include "compositor.h"
+ #include "server.h"
+ #include &lt;errno.h&gt;
+ #include &lt;fcntl.h&gt;
+@@ -1510,6 +1511,36 @@ static void composite_all_except(struct ServerState *srv,
+  *   - Expose underlay that skips the wallpaper (c-&gt;next-only when the
+  *     chain is wrong) — leaves “L of old window” on the desktop.
+  */
++/* Args for parallel MOVE underlay / mover blit (stack-local, join before return). */
++struct move_underlay_args {
++	struct ServerState *srv;
++	const struct Client *skip;
++	int x0, y0, x1, y1;
++};
++
++struct move_blit_args {
++	struct ServerState *srv;
++	const struct Client *cli;
++	int x0, y0, x1, y1;
++};
++
++static void move_underlay_task(void *arg)
++{
++	struct move_underlay_args *a = arg;
++
++	/* worker id comes from FCFS thread that grabbed this task */
++	bgce_comp_damage_log("underlay", a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1, -1);
++	composite_all_except(a-&gt;srv, a-&gt;skip, a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1);
++}
++
++static void move_blit_task(void *arg)
++{
++	struct move_blit_args *a = arg;
++
++	bgce_comp_damage_log("mover", a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1, -1);
++	blit_client_overlap(a-&gt;srv, a-&gt;cli, a-&gt;x0, a-&gt;y0, a-&gt;x1, a-&gt;y1);
++}
++
+ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ {
+ 	struct Client moved;
+@@ -1522,6 +1553,10 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ 	int nexp;
+ 	int i;
+ 	int same_bounds;
++	struct move_underlay_args uargs[2];
++	struct move_blit_args bargs;
++	void (*f0)(void *) = NULL, (*f1)(void *) = NULL, (*f2)(void *) = NULL;
++	void *a0 = NULL, *a1 = NULL, *a2 = NULL;
+ 
+ 	if (!srv || !srv-&gt;framebuffer || !c) {
+ 		fprintf(stderr, "[BGCE] Redraw: Invalid server, framebuffer, or client\n");
+@@ -1553,6 +1588,7 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ 		bx1 = nx1;
+ 		by1 = ny1;
+ 		if (clip_to_display(srv, &amp;bx0, &amp;by0, &amp;bx1, &amp;by1)) {
++			bgce_comp_damage_log("mover-same", bx0, by0, bx1, by1, -1);
+ 			blit_client_overlap(srv, &amp;moved, bx0, by0, bx1, by1);
+ 			for (p = srv-&gt;clients; p &amp;&amp; p != c; p = p-&gt;next)
+ 				blit_client_overlap(srv, p, bx0, by0, bx1, by1);
+@@ -1579,21 +1615,62 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ 		                     expose, 8);
+ 	}
+ 
+-	/* 2. Underlay each expose piece (everyone but the mover). */
+-	for (i = 0; i &lt; nexp; i++)
+-		composite_all_except(srv, c,
+-		                     expose[i][0], expose[i][1],
+-		                     expose[i][2], expose[i][3]);
+-
+-	/* 3. Moving client: full buffer blit at new place only. */
++	/* 3. Mover rect (computed before parallel section). */
+ 	bx0 = nx0;
+ 	by0 = ny0;
+ 	bx1 = nx1;
+ 	by1 = ny1;
+-	if (clip_to_display(srv, &amp;bx0, &amp;by0, &amp;bx1, &amp;by1))
+-		blit_client_overlap(srv, &amp;moved, bx0, by0, bx1, by1);
++	if (!clip_to_display(srv, &amp;bx0, &amp;by0, &amp;bx1, &amp;by1)) {
++		bx0 = by0 = bx1 = by1 = 0;
++	}
++
++	/*
++	 * 2+3. Enqueue up to two expose underlays + mover blit as free tasks;
++	 * 3 workers grab FCFS (not pinned to L0/L1/mover).  Remaining expose
++	 * strips (rare) run serial after the join.  Expose ∩ new is empty.
++	 */
++	if (nexp &gt; 0) {
++		uargs[0].srv = srv;
++		uargs[0].skip = c;
++		uargs[0].x0 = expose[0][0];
++		uargs[0].y0 = expose[0][1];
++		uargs[0].x1 = expose[0][2];
++		uargs[0].y1 = expose[0][3];
++		f0 = move_underlay_task;
++		a0 = &amp;uargs[0];
++	}
++	if (nexp &gt; 1) {
++		uargs[1].srv = srv;
++		uargs[1].skip = c;
++		uargs[1].x0 = expose[1][0];
++		uargs[1].y0 = expose[1][1];
++		uargs[1].x1 = expose[1][2];
++		uargs[1].y1 = expose[1][3];
++		f1 = move_underlay_task;
++		a1 = &amp;uargs[1];
++	}
++	if (bx1 &gt; bx0 &amp;&amp; by1 &gt; by0) {
++		bargs.srv = srv;
++		bargs.cli = &amp;moved;
++		bargs.x0 = bx0;
++		bargs.y0 = by0;
++		bargs.x1 = bx1;
++		bargs.y1 = by1;
++		f2 = move_blit_task;
++		a2 = &amp;bargs;
++	}
++
++	bgce_comp_parallel3(f0, a0, f1, a1, f2, a2);
++
++	/* Extra expose pieces beyond the first two (uncommon). */
++	for (i = 2; i &lt; nexp; i++) {
++		bgce_comp_damage_log("underlay", expose[i][0], expose[i][1],
++		                     expose[i][2], expose[i][3], -1);
++		composite_all_except(srv, c, expose[i][0], expose[i][1],
++		                     expose[i][2], expose[i][3]);
++	}
+ 
+-	/* 4. Windows above: redraw over old∪new. */
++	/* 4. Windows above: redraw over old∪new (serial, z-order). */
+ 	ux0 = ox0 &lt; nx0 ? ox0 : nx0;
+ 	uy0 = oy0 &lt; ny0 ? oy0 : ny0;
+ 	ux1 = ox1 &gt; nx1 ? ox1 : nx1;
+@@ -1607,6 +1684,7 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ 	if (uy1 &lt; (int)srv-&gt;display_h)
+ 		uy1++;
+ 	if (clip_to_display(srv, &amp;ux0, &amp;uy0, &amp;ux1, &amp;uy1)) {
++		bgce_comp_damage_log("above", ux0, uy0, ux1, uy1, -1);
+ 		for (p = srv-&gt;clients; p &amp;&amp; p != c; p = p-&gt;next)
+ 			blit_client_overlap(srv, p, ux0, uy0, ux1, uy1);
+ 	}
+diff --git a/input.c b/input.c
+index 0e082b8..bbe8599 100644
+--- a/input.c
++++ b/input.c
+@@ -1,4 +1,5 @@
+ #include "bgce.h"   /* for access to global server state */
++#include "compositor.h"
+ #include "location_cache.h"
+ #include "server.h" /* for access to global server state */
+ 
+@@ -191,7 +192,7 @@ static void apply_zoom_at_cursor(int dir)
+ 	server.pan_x = wx * z / 100 - mouse_x;
+ 	server.pan_y = wy * z / 100 - mouse_y;
+ 	clamp_viewport(&amp;server);
+-	redraw_all(&amp;server);
++	bgce_comp_submit_full();
+ 	display_cursor_present();
+ 	printf("[BGCE] Zoom: %d%%  pan=(%d, %d)  was %d%%\n",
+ 	       server.zoom_pct, server.pan_x, server.pan_y, old_pct);
+@@ -439,30 +440,51 @@ int init_input(void) {
+ 
+ /*
+  * Check if current modifier+key state matches a configured shortcut.
+- * Required modifiers on the binding must be held; bare keys (no mods in the
+- * binding) only match when no mods are held.
++ * Modifiers must match exactly (so alt+tab does not also fire on
++ * alt+shift+tab, and bare keys never fire with mods held).
+  */
+ static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t key) {
+ 	for (int i = 0; i &lt; config.shortcut_count; i++) {
+-		struct shortcut* sc = &amp;config.shortcuts[i];
+-		int bare;
++		struct shortcut *sc = &amp;config.shortcuts[i];
+ 
+ 		if (sc-&gt;combo.key != key)
+ 			continue;
+-		if (sc-&gt;combo.ctrl &amp;&amp; !ctrl)
++		if (!!sc-&gt;combo.ctrl != !!ctrl)
+ 			continue;
+-		if (sc-&gt;combo.alt &amp;&amp; !alt)
++		if (!!sc-&gt;combo.alt != !!alt)
+ 			continue;
+-		if (sc-&gt;combo.shift &amp;&amp; !shift)
+-			continue;
+-		bare = !sc-&gt;combo.ctrl &amp;&amp; !sc-&gt;combo.alt &amp;&amp; !sc-&gt;combo.shift;
+-		if (bare &amp;&amp; (ctrl || alt || shift))
++		if (!!sc-&gt;combo.shift != !!shift)
+ 			continue;
+ 		return sc;
+ 	}
+ 	return NULL;
+ }
+ 
++/* Run focus cycle (Alt+Tab family). reverse=1 → previous window. */
++static void run_alttab(int reverse)
++{
++	struct Client *old_focus = server.focused_client;
++	struct Client *now;
++
++	bgce_cycle_focus(&amp;server, reverse ? 1 : 0);
++	now = server.focused_client;
++	if (old_focus != now) {
++		if (old_focus &amp;&amp; old_focus-&gt;fd &gt;= 0) {
++			struct BGCEMessage lost = {0};
++			lost.type = MSG_FOCUS_CHANGE;
++			lost.data.focus_event.state = 0;
++			(void)bgce_send_msg(old_focus-&gt;fd, &amp;lost);
++		}
++		if (now &amp;&amp; now-&gt;fd &gt;= 0) {
++			struct BGCEMessage got = {0};
++			got.type = MSG_FOCUS_CHANGE;
++			got.data.focus_event.state = 1;
++			(void)bgce_send_msg(now-&gt;fd, &amp;got);
++		}
++	}
++	display_cursor_present();
++}
++
+ /*
+  * Keyboard shortcuts are configured via the config file ([shortcuts] section).
+  * Built-in behavior for mouse modifiers:
+@@ -470,7 +492,7 @@ static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t ke
+  *  ALT + RIGHT_CLICK + DRAG on a client: resize window
+  *  ALT + LEFT_CLICK + DRAG on empty space: pan the desktop
+  *  ALT + SCROLL: zoom in/out (centered on cursor)
+- *  ALT + TAB / ALT + SHIFT + TAB: cycle focus and restore that app's viewport
++ *  Config builtins (defaults): alt+tab / alt+shift+tab → cycle focus
+  *
+  *  Returns if shortcut was handled
+  */
+@@ -496,31 +518,6 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 		if (ev.value != 1)
+ 			return 0;
+ 
+-		/* Alt+Tab / Alt+Shift+Tab: cycle windows (hardwired, not config). */
+-		if (alt_down &amp;&amp; !ctrl_down &amp;&amp; ev.code == KEY_TAB) {
+-			struct Client *old_focus = server.focused_client;
+-			struct Client *now;
+-
+-			bgce_cycle_focus(&amp;server, shift_down ? 1 : 0);
+-			now = server.focused_client;
+-			if (old_focus != now) {
+-				if (old_focus &amp;&amp; old_focus-&gt;fd &gt;= 0) {
+-					struct BGCEMessage lost = {0};
+-					lost.type = MSG_FOCUS_CHANGE;
+-					lost.data.focus_event.state = 0;
+-					(void)bgce_send_msg(old_focus-&gt;fd, &amp;lost);
+-				}
+-				if (now &amp;&amp; now-&gt;fd &gt;= 0) {
+-					struct BGCEMessage got = {0};
+-					got.type = MSG_FOCUS_CHANGE;
+-					got.data.focus_event.state = 1;
+-					(void)bgce_send_msg(now-&gt;fd, &amp;got);
+-				}
+-			}
+-			display_cursor_present();
+-			return 1;
+-		}
+-
+ 		struct shortcut *sc =
+ 		        match_shortcut(ctrl_down, alt_down, shift_down, ev.code);
+ 		if (sc) {
+@@ -544,6 +541,14 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 					printf("[BGCE] Shortcut: builtin screenshot\n");
+ 					take_screenshot("screenshot.png");
+ 					return 1;
++				} else if (strcmp(sc-&gt;value, "alttab") == 0) {
++					printf("[BGCE] Shortcut: builtin alttab\n");
++					run_alttab(0);
++					return 1;
++				} else if (strcmp(sc-&gt;value, "alttab_prev") == 0) {
++					printf("[BGCE] Shortcut: builtin alttab_prev\n");
++					run_alttab(1);
++					return 1;
+ 				}
+ 				printf("[BGCE] Shortcut: unknown builtin '%s'\n",
+ 				       sc-&gt;value);
+@@ -644,10 +649,8 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			struct Client* c = drag.target;
+ 			if (c &amp;&amp; resize_buffer(c, drag.dx, drag.dy)) {
+ 				printf("[BGCE] Redrawing dx=%d dy=%d.\n", drag.dx, drag.dy);
+-				if (drag.dx &lt; 0 || drag.dy &lt; 0) {
+-					redraw_from_resize(&amp;server, *c, drag.dx, drag.dy);
+-				}
+-				draw(&amp;server, c);
++				/* Full recompose is rare (resize end only). */
++				bgce_comp_submit_full();
+ 
+ 				struct BGCEMessage msg;
+ 				msg.type = MSG_BUFFER_CHANGE;
+@@ -739,11 +742,10 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 			(void)bgce_send_msg(c-&gt;fd, &amp;got);
+ 
+ 			/*
+-			 * Raise only: blit this client on top.  Do not wait for the
+-			 * app to finish a heavy redraw — that runs on the client
+-			 * thread when it posts MSG_DRAW.  Never do client work here.
++			 * Raise only: blit this client on top.  Paint is queued; the
++			 * app's heavy redraw still arrives later via MSG_DRAW.
+ 			 */
+-			draw(&amp;server, c);
++			bgce_comp_submit_draw(c-&gt;id);
+ 			printf("[BGCE] Client focused (fd=%d).\n", c-&gt;fd);
+ 		}
+ 
+@@ -823,25 +825,30 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 
+ 				if (sp &lt; 1)
+ 					sp = 256;
+-				/* Integer screen pixels; redraw_pan copies the FB. */
++				/* Integer screen pixels; pan paint is queued. */
+ 				sdx = dx * sp / 256;
+ 				sdy = dy * sp / 256;
+ 				if (sdx || sdy)
+-					redraw_pan(&amp;server, sdx, sdy);
++					bgce_comp_submit_pan(sdx, sdy);
+ 				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				break;
+ 			}
+ 			case DRAG_MOVE: {
+ 				struct Client* c = drag.target;
++				int old_x, old_y;
++				int wdx, wdy;
++
+ 				if (!c)
+ 					return 1;
+-				int wdx, wdy;
+ 				screen_delta_to_world(dx, dy, config.move_speed,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				if (wdx || wdy) {
+-					redraw_region(&amp;server, c, wdx, wdy);
+-					c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
+-					c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
++					old_x = (int)c-&gt;x;
++					old_y = (int)c-&gt;y;
++					c-&gt;x = (uint32_t)(old_x + wdx);
++					c-&gt;y = (uint32_t)(old_y + wdy);
++					bgce_comp_submit_move(c-&gt;id, old_x, old_y,
++					                      (int)c-&gt;x, (int)c-&gt;y);
+ 				}
+ 				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				break;
+@@ -918,21 +925,26 @@ static int handle_input_event(struct input_event ev, size_t dev_idx) {
+ 				sdx = dx * sp / 256;
+ 				sdy = dy * sp / 256;
+ 				if (sdx || sdy)
+-					redraw_pan(&amp;server, sdx, sdy);
++					bgce_comp_submit_pan(sdx, sdy);
+ 				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				break;
+ 			}
+ 			case DRAG_MOVE: {
+ 				struct Client* c = drag.target;
++				int ox, oy;
++				int wdx, wdy;
++
+ 				if (!c)
+ 					return 1;
+-				int wdx, wdy;
+ 				screen_delta_to_world(dx, dy, config.move_speed,
+ 				                     &amp;drag.acc_x, &amp;drag.acc_y, &amp;wdx, &amp;wdy);
+ 				if (wdx || wdy) {
+-					redraw_region(&amp;server, c, wdx, wdy);
+-					c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
+-					c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
++					ox = (int)c-&gt;x;
++					oy = (int)c-&gt;y;
++					c-&gt;x = (uint32_t)(ox + wdx);
++					c-&gt;y = (uint32_t)(oy + wdy);
++					bgce_comp_submit_move(c-&gt;id, ox, oy,
++					                      (int)c-&gt;x, (int)c-&gt;y);
+ 				}
+ 				set_cursor_pos(&amp;server, mouse_x, mouse_y);
+ 				break;
+diff --git a/location_cache.c b/location_cache.c
+index 6fb3b13..6b2a3e8 100644
+--- a/location_cache.c
++++ b/location_cache.c
+@@ -13,6 +13,7 @@
+  */
+ 
+ #define _GNU_SOURCE
++#include "compositor.h"
+ #include "location_cache.h"
+ #include "server.h"
+ 
+@@ -407,9 +408,9 @@ void bgce_cycle_focus(struct ServerState *srv, int reverse)
+ 		srv-&gt;pan_x = pan_x;
+ 		srv-&gt;pan_y = pan_y;
+ 		clamp_viewport(srv);
+-		redraw_all(srv);
++		bgce_comp_submit_full();
+ 	} else {
+-		draw(srv, target);
++		bgce_comp_submit_draw(target-&gt;id);
+ 	}
+ 
+ 	printf("[BGCE] Alt+%sTab → '%s' zoom=%d%% pan=(%d,%d)\n",
+diff --git a/loop.c b/loop.c
+index e0d3161..f321ac3 100644
+--- a/loop.c
++++ b/loop.c
+@@ -1,6 +1,7 @@
+ #define _XOPEN_SOURCE 700
+ 
+ #include "bgce.h"
++#include "compositor.h"
+ #include "location_cache.h"
+ #include "server.h"
+ 
+@@ -14,6 +15,8 @@
+ /* Externs from server.c */
+ extern struct ServerState server;
+ 
++static uint32_t next_client_id = 1;
++
+ void* client_thread(void* arg) {
+ 	int client_fd = *(int*)arg;
+ 	free(arg);
+@@ -27,6 +30,9 @@ void* client_thread(void* arg) {
+ 	}
+ 
+ 	client-&gt;fd = client_fd;
++	client-&gt;id = next_client_id++;
++	if (client-&gt;id == 0)
++		client-&gt;id = next_client_id++;
+ 	location_cache_identify_client(client, client_fd);
+ 
+ 	/* Background client is always first; keep the list non-empty. */
+@@ -225,10 +231,10 @@ void* client_thread(void* arg) {
+ 
+ 		case MSG_DRAW: {
+ 			/*
+-			 * Blit this client only (clipped by windows above).
+-			 * On this client thread only — never on the input thread.
++			 * Queue a blit of this client (clipped by windows above).
++			 * Paint runs on the compositor thread, not here.
+ 			 */
+-			draw(&amp;server, client);
++			bgce_comp_submit_draw(client-&gt;id);
+ 			break;
+ 		}
+ 		case MSG_MOVE: {
+@@ -292,11 +298,17 @@ void* client_thread(void* arg) {
+ 
+ 	/*
+ 	 * Only repaint the closed window's screen rect from whatever is still
+-	 * in the stack (background + windows that sat under / overlapped it).
+-	 * Other on-screen clients outside that rect are left alone.
++	 * in the stack.  Snapshot geometry into the job so paint is safe after
++	 * free; flush so no in-flight DRAW still references this client.
+ 	 */
+ 	location_cache_remember_client(client);
+-	erase_client(&amp;server, client);
++	{
++		uint32_t ww = client-&gt;world_w ? client-&gt;world_w : client-&gt;width;
++		uint32_t wh = client-&gt;world_h ? client-&gt;world_h : client-&gt;height;
++
++		bgce_comp_submit_erase(client-&gt;x, client-&gt;y, ww, wh);
++		bgce_comp_flush();
++	}
+ 
+ 	printf("[BGCE] Client thread finished (fd=%d); server still running\n", client_fd);
+ 	free(client);
+diff --git a/mock.c b/mock.c
+index 95b3daf..551961c 100644
+--- a/mock.c
++++ b/mock.c
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include "mock.h"
++#include "compositor.h"
+ #include "location_cache.h"
+ 
+ #include &lt;stdio.h&gt;
+@@ -18,6 +19,7 @@ struct Client *pick_client(int x, int y);
+ 
+ static struct Client *bg_client;
+ static int mock_active;
++static uint32_t mock_next_id = 1;
+ 
+ static void fill_u32(uint32_t *buf, size_t n, uint32_t v)
+ {
+@@ -86,7 +88,12 @@ int bgce_mock_init(uint32_t width, uint32_t height)
+ 
+ 	init_input();
+ 	location_cache_load();
+-	redraw_all(&amp;server);
++	/* Sync compositor: paint inline so headless tests need no flush. */
++	if (bgce_comp_init(1) != 0) {
++		release_display();
++		return -1;
++	}
++	bgce_comp_submit_full();
+ 	display_cursor_present();
+ 	mock_active = 1;
+ 	printf("[BGCE] mock init %ux%u virtual %ux%u\n",
+@@ -102,6 +109,8 @@ void bgce_mock_fini(void)
+ 	if (!mock_active)
+ 		return;
+ 
++	bgce_comp_shutdown();
++
+ 	c = server.clients;
+ 	while (c) {
+ 		struct Client *n = c-&gt;next;
+@@ -148,6 +157,9 @@ struct Client *bgce_mock_add_client(uint32_t x, uint32_t y,
+ 	c-&gt;x = x;
+ 	c-&gt;y = y;
+ 	c-&gt;fd = -1;
++	c-&gt;id = mock_next_id++;
++	if (c-&gt;id == 0)
++		c-&gt;id = mock_next_id++;
+ 	snprintf(c-&gt;app_id, sizeof(c-&gt;app_id), "mock_%u",
+ 	         (unsigned)server.client_count + 1);
+ 	/* Restore last place if this app_id was cached (tests can set app_id). */
+@@ -178,7 +190,7 @@ void bgce_mock_draw(struct Client *c)
+ {
+ 	if (!c)
+ 		return;
+-	draw(&amp;server, c);
++	bgce_comp_submit_draw(c-&gt;id);
+ }
+ 
+ void bgce_mock_remove_client(struct Client *c)
+@@ -205,7 +217,12 @@ void bgce_mock_remove_client(struct Client *c)
+ 		server.focused_client = NULL;
+ 
+ 	location_cache_remember_client(c);
+-	erase_client(&amp;server, c);
++	{
++		uint32_t ww = c-&gt;world_w ? c-&gt;world_w : c-&gt;width;
++		uint32_t wh = c-&gt;world_h ? c-&gt;world_h : c-&gt;height;
++
++		bgce_comp_submit_erase(c-&gt;x, c-&gt;y, ww, wh);
++	}
+ 	if (c-&gt;buffer)
+ 		free(c-&gt;buffer);
+ 	free(c);
+@@ -238,7 +255,7 @@ void bgce_mock_focus(struct Client *c)
+ 	if (server.focused_client)
+ 		c-&gt;z = server.focused_client-&gt;z + 1;
+ 	server.focused_client = c;
+-	draw(&amp;server, c);
++	bgce_comp_submit_draw(c-&gt;id);
+ }
+ 
+ struct Client *bgce_mock_click(int screen_x, int screen_y)
+@@ -254,11 +271,15 @@ struct Client *bgce_mock_click(int screen_x, int screen_y)
+ 
+ void bgce_mock_move(struct Client *c, int wdx, int wdy)
+ {
++	int old_x, old_y;
++
+ 	if (!c || (wdx == 0 &amp;&amp; wdy == 0))
+ 		return;
+-	redraw_region(&amp;server, c, wdx, wdy);
+-	c-&gt;x = (uint32_t)((int)c-&gt;x + wdx);
+-	c-&gt;y = (uint32_t)((int)c-&gt;y + wdy);
++	old_x = (int)c-&gt;x;
++	old_y = (int)c-&gt;y;
++	c-&gt;x = (uint32_t)(old_x + wdx);
++	c-&gt;y = (uint32_t)(old_y + wdy);
++	bgce_comp_submit_move(c-&gt;id, old_x, old_y, (int)c-&gt;x, (int)c-&gt;y);
+ 	location_cache_remember_client(c);
+ }
+ 
+@@ -272,7 +293,7 @@ void bgce_mock_pan_screen(int sdx, int sdy)
+ 	scx = sdx * sp / 256;
+ 	scy = sdy * sp / 256;
+ 	if (scx || scy)
+-		redraw_pan(&amp;server, scx, scy);
++		bgce_comp_submit_pan(scx, scy);
+ }
+ 
+ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
+@@ -287,7 +308,7 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
+ 		server.pan_x = wx * z / 100 - sx;
+ 		server.pan_y = wy * z / 100 - sy;
+ 		clamp_viewport(&amp;server);
+-		redraw_all(&amp;server);
++		bgce_comp_submit_full();
+ 		display_cursor_present();
+ 		return;
+ 	}
+@@ -296,7 +317,7 @@ void bgce_mock_zoom_to(int zoom_pct, int sx, int sy)
+ 	server.pan_x = wx * z / 100 - sx;
+ 	server.pan_y = wy * z / 100 - sy;
+ 	clamp_viewport(&amp;server);
+-	redraw_all(&amp;server);
++	bgce_comp_submit_full();
+ 	display_cursor_present();
+ }
+ 
+@@ -312,7 +333,7 @@ void bgce_mock_set_viewport(int zoom_pct, int pan_x, int pan_y)
+ 	server.pan_x = pan_x;
+ 	server.pan_y = pan_y;
+ 	clamp_viewport(&amp;server);
+-	redraw_all(&amp;server);
++	bgce_comp_submit_full();
+ 	display_cursor_present();
+ }
+ 
+@@ -338,7 +359,7 @@ int bgce_mock_screenshot(const char *path)
+ 
+ void bgce_mock_redraw_all(void)
+ {
+-	redraw_all(&amp;server);
++	bgce_comp_submit_full();
+ }
+ 
+ int bgce_mock_fb_matches_full_redraw(void)
+@@ -355,7 +376,7 @@ int bgce_mock_fb_matches_full_redraw(void)
+ 	if (!snap)
+ 		return -1;
+ 	memcpy(snap, server.framebuffer, nbytes);
+-	redraw_all(&amp;server);
++	bgce_comp_submit_full();
+ 	match = (memcmp(snap, server.framebuffer, nbytes) == 0);
+ 	free(snap);
+ 	return match ? 0 : -1;
+diff --git a/server.c b/server.c
+index 614dd63..99edb1c 100644
+--- a/server.c
++++ b/server.c
+@@ -1,5 +1,6 @@
+ #include "server.h"
+ #include "bgce.h"
++#include "compositor.h"
+ #include "location_cache.h"
+ 
+ #include &lt;errno.h&gt;
+@@ -114,6 +115,7 @@ static void *log_timestamp_thread(void *arg)
+ 
+ static void cleanup_and_exit(int sig) {
+ 	(void)sig;
++	bgce_comp_shutdown();
+ 	if (listen_sock_path[0])
+ 		unlink(listen_sock_path);
+ 	if (server.server_fd &gt;= 0) {
+@@ -357,9 +359,13 @@ int main(void) {
+ 	                 server.virtual_w, server.virtual_h);
+ 
+ 	puts("[BGCE] Drawing background");
++	/* Async compositor owns FB writes after this. */
++	if (bgce_comp_init(0) != 0)
++		fprintf(stderr, "[BGCE] compositor init failed; using sync fallback\n");
+ 	/* Full recomposite so the wallpaper fills the screen even if draw()
+ 	 * bounds are edge-clamped oddly on the first paint. */
+-	redraw_all(&amp;server);
++	bgce_comp_submit_full();
++	bgce_comp_flush();
+ 	display_cursor_present();
+ 
+ 	if (init_input() != 0) {
+diff --git a/server.h b/server.h
+index 8b65537..37a6c8f 100644
+--- a/server.h
++++ b/server.h
+@@ -27,6 +27,8 @@
+ struct Client {
+ 	int fd;
+ 	pid_t pid;
++	/* Stable id for compositor jobs (never 0 when live). */
++	uint32_t id;
+ 	/* Stable app key for location cache (e.g. /proc/pid/comm). */
+ 	char app_id[64];
+ 	char shm_name[64];
+</pre>

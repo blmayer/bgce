@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 50f62f3</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 50f62f3
+parent <a href=commit-5603abb.html>5603abb</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-14T17:42:35-03:00
+
+    Log every blit_client_overlap during MOVE underlay/mover.
+
+    MOVE never calls draw(); add blit/underlay-stack/above logs so drag
+    damage shows which client buffers are copied into each strip.
+
+<a href=tree-50f62f3.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/display.c b/display.c
+index a85b547..74bc511 100644
+--- a/display.c
++++ b/display.c
+@@ -1019,6 +1019,25 @@ static void blit_client_overlap(struct ServerState *srv, const struct Client *cl
+ 	wh = (int)(cli-&gt;world_h ? cli-&gt;world_h : cli-&gt;height);
+ 	z = zoom_pct_of(srv);
+ 
++	/*
++	 * Shared by MSG_DRAW, MOVE underlay/mover/above, pan edges, etc.
++	 * Logs every actual FB blit so MOVE is visible even though it never
++	 * calls draw().
++	 */
++	if (bgce_comp_debug()) {
++		const char *app = cli-&gt;app_id[0] ? cli-&gt;app_id : "?";
++		const char *path = (z == BGCE_ZOOM_PCT_1X &amp;&amp; bw == ww &amp;&amp; bh == wh)
++		                           ? "1to1"
++		                           : "scaled";
++
++		printf("[BGCE] blit: id=%u app='%s' z=%d world=(%u,%u) %dx%d "
++		       "clip=(%d,%d)-(%d,%d) %dx%d path=%s\n",
++		       (unsigned)cli-&gt;id, app, (int)cli-&gt;z,
++		       cli-&gt;x, cli-&gt;y, ww, wh,
++		       ox0, oy0, ox1, oy1, ox1 - ox0, oy1 - oy0, path);
++		fflush(stdout);
++	}
++
+ 	if (z == BGCE_ZOOM_PCT_1X &amp;&amp; bw == ww &amp;&amp; bh == wh) {
+ 		blit_client_1to1(dst, screen_w, src, bw, bh,
+ 		                 (int)cli-&gt;x, (int)cli-&gt;y,
+@@ -1518,6 +1537,20 @@ static void composite_all_except(struct ServerState *srv,
+ 			continue;
+ 		stack[i++] = c;
+ 	}
++	if (bgce_comp_debug()) {
++		printf("[BGCE] underlay-stack: %d layer(s) into "
++		       "screen=(%d,%d)-(%d,%d) %dx%d skip_id=%u\n",
++		       n, x0, y0, x1, y1, x1 - x0, y1 - y0,
++		       skip ? (unsigned)skip-&gt;id : 0);
++		for (i = n - 1; i &gt;= 0; i--) {
++			printf("[BGCE] underlay-stack:   [%d] id=%u app='%s' "
++			       "z=%d world=(%u,%u)\n",
++			       n - 1 - i, (unsigned)stack[i]-&gt;id,
++			       stack[i]-&gt;app_id[0] ? stack[i]-&gt;app_id : "?",
++			       (int)stack[i]-&gt;z, stack[i]-&gt;x, stack[i]-&gt;y);
++		}
++		fflush(stdout);
++	}
+ 	/* stack[0] is topmost among remaining; paint bottom → top. */
+ 	for (i = n - 1; i &gt;= 0; i--)
+ 		blit_client_overlap(srv, stack[i], x0, y0, x1, y1);
+@@ -1760,6 +1793,17 @@ void redraw_region(struct ServerState *srv, struct Client *c, int wdx, int wdy)
+ 	}
+ 	if (clip_to_display(srv, &amp;ux0, &amp;uy0, &amp;ux1, &amp;uy1)) {
+ 		bgce_comp_damage_log("above", ux0, uy0, ux1, uy1, -1);
++		if (bgce_comp_debug()) {
++			int nabove = 0;
++			for (p = srv-&gt;clients; p &amp;&amp; p != c; p = p-&gt;next)
++				if (p-&gt;buffer)
++					nabove++;
++			printf("[BGCE] above: re-blit %d window(s) over "
++			       "screen=(%d,%d)-(%d,%d) %dx%d (mover id=%u)\n",
++			       nabove, ux0, uy0, ux1, uy1, ux1 - ux0, uy1 - uy0,
++			       (unsigned)c-&gt;id);
++			fflush(stdout);
++		}
+ 		for (p = srv-&gt;clients; p &amp;&amp; p != c; p = p-&gt;next)
+ 			blit_client_overlap(srv, p, ux0, uy0, ux1, uy1);
+ 	}
+</pre>

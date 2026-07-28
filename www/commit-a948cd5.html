@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce a948cd5</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit a948cd5
+parent <a href=commit-1e131f4.html>1e131f4</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-06-08T15:02:20-03:00
+
+    added [shortcuts] section for configurable keyboard shortcuts
+
+    added support for a [shortcuts] section in ~/.config/bgce.conf using
+    the existing INI-style key=value format.
+    
+    shortcuts are defined as:
+    
+        [shortcuts]
+        ctrl+alt+q = builtin:exit
+        sysrq = builtin:screenshot
+        ctrl+alt+t = command:alacritty
+    
+    - builtin only accepts "exit" or "screenshot" (exact match)
+    - command values are executed asynchronously via fork() + /bin/sh -c
+    - SIGCHLD is set to SIG_IGN at startup to reap children
+    - default exit (ctrl+alt+q) and screenshot (sysrq) bindings are kept
+      unless the user explicitly provides their own for that action
+    - invalid entries produce clear [BGCE] error logs on stderr
+    - parse results now use enum shortcut_parse_result
+    
+    updated config parser, input handling, and README.
+
+<a href=tree-a948cd5.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/README.md b/README.md
+index 98f2c8e..1caf8e9 100644
+--- a/README.md
++++ b/README.md
+@@ -108,6 +108,20 @@ color = #RRGGBBAA # Hex color with alpha (e.g., #FF000080 for semi-transparent r
+ # For image background:
+ #path = /path/to/image.png
+ #mode = tiled     # or "scaled"
++
++[shortcuts]
++# Define keyboard shortcuts. Format:
++# &lt;combo&gt; = &lt;type&gt;:&lt;value&gt;
++#
++# type is one of:
++#   builtin  - value must be "exit" or "screenshot"
++#   command  - value is a shell command to run in a new process
++#
++# Combo examples: ctrl+alt+q, sysrq, f12, ctrl+shift+s, super+r
++
++# Defaults (active when no [shortcuts] section is present or it is empty):
++# ctrl+alt+q = builtin:exit
++# sysrq = builtin:screenshot
+ ```
+ 
+ ### Example Config File
+@@ -127,6 +141,19 @@ path = /usr/share/backgrounds/default.png
+ mode = scaled
+ ```
+ 
++With custom shortcuts:
++
++```ini
++[shortcuts]
++ctrl+alt+q = builtin:exit
++sysrq = builtin:screenshot
++
++# Launch programs (commands run via /bin/sh -c in a separate process)
++ctrl+alt+t = command:alacritty
++super+r = command:rofi -show drun
++f12 = command:sh -c 'import -window root ~/screenshot.png'
++```
++
+ 
+ ### Notes
+ 
+diff --git a/config.c b/config.c
+index 5c03f76..b4a2c53 100644
+--- a/config.c
++++ b/config.c
+@@ -1,5 +1,7 @@
+ #include "server.h"
+ #include &lt;ctype.h&gt;
++#include &lt;linux/input.h&gt;
++#include &lt;stdbool.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+@@ -39,6 +41,226 @@ static uint32_t parse_hex_color(const char* str) {
+ 	return (a &lt;&lt; 24) | (r &lt;&lt; 16) | (g &lt;&lt; 8) | b;
+ }
+ 
++// Map key name string to Linux key code (KEY_*)
++static uint16_t parse_key_name(const char* name) {
++	if (!name || !*name)
++		return 0;
++
++	// Normalize: lowercase, strip optional KEY_ prefix
++	char buf[32];
++	strncpy(buf, name, sizeof(buf) - 1);
++	buf[sizeof(buf) - 1] = '\0';
++	for (char* p = buf; *p; p++)
++		*p = tolower((unsigned char)*p);
++
++	// Strip KEY_ prefix if present
++	const char* k = buf;
++	if (strncmp(buf, "key_", 4) == 0)
++		k = buf + 4;
++
++	// Common aliases
++	if (strcmp(k, "sysrq") == 0 || strcmp(k, "print") == 0 || strcmp(k, "printscreen") == 0 || strcmp(k, "prtsc") == 0)
++		return KEY_SYSRQ;
++	if (strcmp(k, "esc") == 0 || strcmp(k, "escape") == 0)
++		return KEY_ESC;
++	if (strcmp(k, "ret") == 0 || strcmp(k, "return") == 0 || strcmp(k, "enter") == 0)
++		return KEY_ENTER;
++	if (strcmp(k, "space") == 0)
++		return KEY_SPACE;
++	if (strcmp(k, "tab") == 0)
++		return KEY_TAB;
++	if (strcmp(k, "backspace") == 0 || strcmp(k, "bksp") == 0)
++		return KEY_BACKSPACE;
++	if (strcmp(k, "del") == 0 || strcmp(k, "delete") == 0)
++		return KEY_DELETE;
++	if (strcmp(k, "ins") == 0 || strcmp(k, "insert") == 0)
++		return KEY_INSERT;
++	if (strcmp(k, "home") == 0)
++		return KEY_HOME;
++	if (strcmp(k, "end") == 0)
++		return KEY_END;
++	if (strcmp(k, "pgup") == 0 || strcmp(k, "pageup") == 0)
++		return KEY_PAGEUP;
++	if (strcmp(k, "pgdn") == 0 || strcmp(k, "pagedown") == 0)
++		return KEY_PAGEDOWN;
++	if (strcmp(k, "up") == 0)
++		return KEY_UP;
++	if (strcmp(k, "down") == 0)
++		return KEY_DOWN;
++	if (strcmp(k, "left") == 0)
++		return KEY_LEFT;
++	if (strcmp(k, "right") == 0)
++		return KEY_RIGHT;
++
++	// Function keys
++	if (k[0] == 'f' &amp;&amp; k[1] &gt;= '1' &amp;&amp; k[1] &lt;= '9') {
++		int n = atoi(k + 1);
++		if (n &gt;= 1 &amp;&amp; n &lt;= 12) {
++			static const uint16_t fkeys[] = {
++				0, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6,
++				KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12
++			};
++			return fkeys[n];
++		}
++	}
++
++	// Single letter keys a-z
++	if (k[0] &gt;= 'a' &amp;&amp; k[0] &lt;= 'z' &amp;&amp; k[1] == '\0') {
++		// KEY_A is 30, KEY_B is 48, etc. They are not contiguous in a nice way.
++		// Use a small table for letters and digits.
++		static const struct { char c; uint16_t code; } letters[] = {
++			{'a', KEY_A}, {'b', KEY_B}, {'c', KEY_C}, {'d', KEY_D}, {'e', KEY_E},
++			{'f', KEY_F}, {'g', KEY_G}, {'h', KEY_H}, {'i', KEY_I}, {'j', KEY_J},
++			{'k', KEY_K}, {'l', KEY_L}, {'m', KEY_M}, {'n', KEY_N}, {'o', KEY_O},
++			{'p', KEY_P}, {'q', KEY_Q}, {'r', KEY_R}, {'s', KEY_S}, {'t', KEY_T},
++			{'u', KEY_U}, {'v', KEY_V}, {'w', KEY_W}, {'x', KEY_X}, {'y', KEY_Y},
++			{'z', KEY_Z},
++		};
++		for (size_t i = 0; i &lt; sizeof(letters) / sizeof(letters[0]); i++) {
++			if (letters[i].c == k[0])
++				return letters[i].code;
++		}
++	}
++
++	// Digits 0-9
++	if (k[0] &gt;= '0' &amp;&amp; k[0] &lt;= '9' &amp;&amp; k[1] == '\0') {
++		static const uint16_t digits[] = {
++			KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9
++		};
++		return digits[k[0] - '0'];
++	}
++
++	// Fallback: try KEY_XXX directly via a small set of known names
++	if (strcmp(k, "leftctrl") == 0 || strcmp(k, "ctrl") == 0)
++		return KEY_LEFTCTRL;
++	if (strcmp(k, "rightctrl") == 0)
++		return KEY_RIGHTCTRL;
++	if (strcmp(k, "leftalt") == 0 || strcmp(k, "alt") == 0)
++		return KEY_LEFTALT;
++	if (strcmp(k, "rightalt") == 0)
++		return KEY_RIGHTALT;
++	if (strcmp(k, "leftshift") == 0 || strcmp(k, "shift") == 0)
++		return KEY_LEFTSHIFT;
++	if (strcmp(k, "rightshift") == 0)
++		return KEY_RIGHTSHIFT;
++
++	return 0;
++}
++
++// Parse a combo string like "ctrl+alt+q" or "sysrq" into a key_combo
++static struct key_combo parse_key_combo(const char* str) {
++	struct key_combo kc = {0, 0, 0, 0};
++	if (!str || !*str)
++		return kc;
++
++	char buf[128];
++	strncpy(buf, str, sizeof(buf) - 1);
++	buf[sizeof(buf) - 1] = '\0';
++
++	// Split on '+'
++	char* token = strtok(buf, "+");
++	while (token) {
++		// Trim token
++		while (isspace((unsigned char)*token))
++			token++;
++		char* end = token + strlen(token) - 1;
++		while (end &gt; token &amp;&amp; isspace((unsigned char)*end)) {
++			*end = '\0';
++			end--;
++		}
++
++		uint16_t code = parse_key_name(token);
++		if (code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL)
++			kc.ctrl = 1;
++		else if (code == KEY_LEFTALT || code == KEY_RIGHTALT)
++			kc.alt = 1;
++		else if (code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT)
++			kc.shift = 1;
++		else if (code != 0)
++			kc.key = code;
++
++		token = strtok(NULL, "+");
++	}
++
++	return kc;
++}
++
++// Parse a shortcut rhs of the form "builtin:exit" or "command:alacritty -e foo"
++// Stores into out and returns SHORTCUT_PARSE_OK on success.
++static enum shortcut_parse_result parse_shortcut_rhs(const char* rhs, struct shortcut* out) {
++	if (!rhs || !*rhs || !out)
++		return SHORTCUT_PARSE_BAD_FORMAT;
++
++	char buf[512];
++	strncpy(buf, rhs, sizeof(buf) - 1);
++	buf[sizeof(buf) - 1] = '\0';
++
++	char* colon = strchr(buf, ':');
++	if (!colon)
++		return SHORTCUT_PARSE_BAD_FORMAT;
++
++	*colon = '\0';
++	char* typestr = trim(buf);
++	char* valstr = trim(colon + 1);
++
++	if (strcmp(typestr, "builtin") == 0) {
++		out-&gt;type = SHORTCUT_BUILTIN;
++		if (strcmp(valstr, "exit") == 0) {
++			strcpy(out-&gt;value, "exit");
++			return SHORTCUT_PARSE_OK;
++		} else if (strcmp(valstr, "screenshot") == 0) {
++			strcpy(out-&gt;value, "screenshot");
++			return SHORTCUT_PARSE_OK;
++		}
++		return SHORTCUT_PARSE_UNSUPPORTED_BUILTIN;
++	} else if (strcmp(typestr, "command") == 0) {
++		if (*valstr == '\0')
++			return SHORTCUT_PARSE_EMPTY_COMMAND;
++		out-&gt;type = SHORTCUT_COMMAND;
++		strncpy(out-&gt;value, valstr, sizeof(out-&gt;value) - 1);
++		out-&gt;value[sizeof(out-&gt;value) - 1] = '\0';
++		return SHORTCUT_PARSE_OK;
++	}
++
++	return SHORTCUT_PARSE_BAD_FORMAT;
++}
++
++// Ensure the default exit and screenshot shortcuts exist unless the user
++// has explicitly provided their own binding for those actions.
++static void set_default_shortcuts(struct config* config) {
++	bool has_exit = false;
++	bool has_screenshot = false;
++
++	for (int i = 0; i &lt; config-&gt;shortcut_count; i++) {
++		if (config-&gt;shortcuts[i].type == SHORTCUT_BUILTIN) {
++			if (strcmp(config-&gt;shortcuts[i].value, "exit") == 0)
++				has_exit = true;
++			else if (strcmp(config-&gt;shortcuts[i].value, "screenshot") == 0)
++				has_screenshot = true;
++		}
++	}
++
++	if (!has_exit &amp;&amp; config-&gt;shortcut_count &lt; MAX_SHORTCUTS) {
++		int idx = config-&gt;shortcut_count;
++		memset(&amp;config-&gt;shortcuts[idx], 0, sizeof(config-&gt;shortcuts[0]));
++		config-&gt;shortcuts[idx].combo.ctrl = 1;
++		config-&gt;shortcuts[idx].combo.alt = 1;
++		config-&gt;shortcuts[idx].combo.key = KEY_Q;
++		config-&gt;shortcuts[idx].type = SHORTCUT_BUILTIN;
++		strcpy(config-&gt;shortcuts[idx].value, "exit");
++		config-&gt;shortcut_count++;
++	}
++
++	if (!has_screenshot &amp;&amp; config-&gt;shortcut_count &lt; MAX_SHORTCUTS) {
++		int idx = config-&gt;shortcut_count;
++		memset(&amp;config-&gt;shortcuts[idx], 0, sizeof(config-&gt;shortcuts[0]));
++		config-&gt;shortcuts[idx].combo.key = KEY_SYSRQ;
++		config-&gt;shortcuts[idx].type = SHORTCUT_BUILTIN;
++		strcpy(config-&gt;shortcuts[idx].value, "screenshot");
++		config-&gt;shortcut_count++;
++	}
++}
++
+ // Parse config file
+ int parse_config(struct config* config) {
+ 	const char* home = getenv("HOME");
+@@ -56,6 +278,7 @@ int parse_config(struct config* config) {
+ 	// Initialize with defaults
+ 	config-&gt;type = BG_COLOR;
+ 	config-&gt;color = 0xAAAAAAAA; // Default gray
++	config-&gt;shortcut_count = 0;
+ 
+ 	char line[1024];
+ 	char current_section[256] = "";
+@@ -104,9 +327,35 @@ int parse_config(struct config* config) {
+ 					config-&gt;mode = IMAGE_SCALED;
+ 				}
+ 			}
++		} else if (strcmp(current_section, "shortcuts") == 0) {
++			if (config-&gt;shortcut_count &lt; MAX_SHORTCUTS) {
++				struct key_combo kc = parse_key_combo(key);
++				if (kc.key != 0) {
++					struct shortcut sc = {0};
++					enum shortcut_parse_result rc = parse_shortcut_rhs(value, &amp;sc);
++					if (rc == SHORTCUT_PARSE_OK) {
++						sc.combo = kc;
++						config-&gt;shortcuts[config-&gt;shortcut_count] = sc;
++						config-&gt;shortcut_count++;
++					} else if (rc == SHORTCUT_PARSE_UNSUPPORTED_BUILTIN) {
++						fprintf(stderr, "[BGCE] Unsupported builtin command in shortcut '%s = %s' (must be 'exit' or 'screenshot')\n",
++						        key, value);
++					} else if (rc == SHORTCUT_PARSE_EMPTY_COMMAND) {
++						fprintf(stderr, "[BGCE] Empty command value in shortcut '%s = %s'\n", key, value);
++					} else {
++						fprintf(stderr, "[BGCE] Invalid shortcut '%s = %s'\n", key, value);
++					}
++				} else {
++					fprintf(stderr, "[BGCE] Ignoring shortcut with unknown key combo: %s\n", key);
++				}
++			}
+ 		}
+ 	}
+ 
++	// Add default exit/screenshot shortcuts unless the user explicitly
++	// specified their own binding for those actions.
++	set_default_shortcuts(config);
++
+ 	fclose(file);
+ 	return 0;
+ }
+diff --git a/input.c b/input.c
+index 03d7dce..46e888e 100644
+--- a/input.c
++++ b/input.c
+@@ -12,6 +12,7 @@
+ #include &lt;string.h&gt;
+ #include &lt;sys/ioctl.h&gt;
+ #include &lt;sys/mman.h&gt;
++#include &lt;sys/types.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+ #define test_bit(bit, array) ((array)[(bit) / 8] &amp; (1 &lt;&lt; ((bit) % 8)))
+@@ -37,6 +38,7 @@ struct {
+ } drag;
+ 
+ extern struct ServerState server;
++extern struct config config;
+ 
+ int resize_buffer(struct Client* c, int dx, int dy) {
+ 	// for resize we must reallocate the buffer
+@@ -164,18 +166,32 @@ int init_input(void) {
+ }
+ 
+ /*
+- * This is the key mappings handling part, for now this is hardcoded
+- * but in the future will be read from config.
+- * Shortcuts available:
+- *  CTRL + ALT + q: exit
+- *  ALT + CLICK + DRAG: move
++ * Check if current modifier+key state matches a configured shortcut.
++ * Returns pointer to the matching shortcut, or NULL.
++ */
++static struct shortcut *match_shortcut(int ctrl, int alt, int shift, uint16_t key) {
++	for (int i = 0; i &lt; config.shortcut_count; i++) {
++		struct shortcut* sc = &amp;config.shortcuts[i];
++		if (sc-&gt;combo.ctrl == ctrl &amp;&amp;
++		    sc-&gt;combo.alt == alt &amp;&amp;
++		    sc-&gt;combo.shift == shift &amp;&amp;
++		    sc-&gt;combo.key == key) {
++			return sc;
++		}
++	}
++	return NULL;
++}
++
++/*
++ * Keyboard shortcuts are configured via the config file ([shortcuts] section).
++ * Built-in behavior for mouse modifiers:
++ *  ALT + LEFT_CLICK + DRAG: move
+  *  ALT + RIGHT_CLICK + DRAG: resize
+  *
+  *  Returns if shortcut was handled
+  */
+ static int handle_input_event(struct input_event ev) {
+ 	if (ev.type == EV_KEY &amp;&amp; ev.value == 1) { // Key press
+-		// Ctrl+Alt+Q combo
+ 		if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
+ 			printf("[BGCE] Ctrl pressed.\n");
+ 			ctrl_down = 1;
+@@ -184,17 +200,34 @@ static int handle_input_event(struct input_event ev) {
+ 			printf("[BGCE] Alt pressed.\n");
+ 			alt_down = 1;
+ 		}
+-		if (ctrl_down &amp;&amp; alt_down &amp;&amp; ev.code == KEY_Q) {
+-			printf("[BGCE] Ctrl+Alt+Q pressed, exiting.\n");
+-			exit(1);
+-		}
+-		if (ev.code == KEY_SYSRQ) {
+-			printf("[BGCE] Print Screen key pressed, taking screenshot.\n");
+-			if (server.focused_client) {
+-				return 0;
++
++		// Check configured keyboard shortcuts (key press)
++		struct shortcut *sc = match_shortcut(ctrl_down, alt_down, 0, ev.code);
++		if (sc) {
++			if (sc-&gt;type == SHORTCUT_BUILTIN) {
++				if (strcmp(sc-&gt;value, "exit") == 0) {
++					printf("[BGCE] Exit shortcut triggered, exiting.\n");
++					exit(1);
++				} else if (strcmp(sc-&gt;value, "screenshot") == 0) {
++					printf("[BGCE] Screenshot shortcut triggered.\n");
++					if (server.focused_client) {
++						return 0;
++					}
++					take_screenshot("screenshot.png");
++					return 1;
++				}
++			} else if (sc-&gt;type == SHORTCUT_COMMAND) {
++				printf("[BGCE] Command shortcut triggered: %s\n", sc-&gt;value);
++				pid_t pid = fork();
++				if (pid == 0) {
++					/* child: run command via shell, do not block server */
++					execl("/bin/sh", "sh", "-c", sc-&gt;value, (char *)NULL);
++					_exit(127);
++				} else if (pid &lt; 0) {
++					perror("[BGCE] fork for shortcut command");
++				}
++				return 1;
+ 			}
+-			take_screenshot("screenshot.png");
+-			return 1;
+ 		}
+ 	}
+ 
+diff --git a/server.c b/server.c
+index 3fa1b87..7e1c29a 100644
+--- a/server.c
++++ b/server.c
+@@ -3,6 +3,7 @@
+ 
+ #include &lt;errno.h&gt;
+ #include &lt;pthread.h&gt;
++#include &lt;signal.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+@@ -11,25 +12,29 @@
+ #include &lt;unistd.h&gt;
+ 
+ struct ServerState server = {}; /* Global server state */
++struct config config = {};            /* Global config (background + shortcuts) */
+ 
+ int main(void) {
+ 	setvbuf(stdout, NULL, _IONBF, 0); // Disable buffering for stdout
+ 	setvbuf(stderr, NULL, _IONBF, 0); // Disable buffering for stderr
+ 
++	/* Auto-reap child processes so command shortcuts don't leave zombies */
++	signal(SIGCHLD, SIG_IGN);
++
+ 	memset(&amp;server, 0, sizeof(struct ServerState));
+ 	server.drm_fd = -1;
+ 	server.framebuffer = NULL;
+ 	server.crtc_id = 0;
+ 	server.client_count = 0;
+ 
+-	struct config config;
+ 	char* home = getenv("HOME");
+ 	if (home) {
+ 		char user_config[512];
+ 		snprintf(user_config, sizeof(user_config), "%s/.config/bgce.conf", home);
+ 		parse_config(&amp;config);
+ 	}
+-	printf("[BGCE] Loaded config type=%u, path=%s, mode=%u\n", config.type, config.path, config.mode);
++	printf("[BGCE] Loaded config type=%u, path=%s, mode=%u, shortcuts=%d\n",
++	       config.type, config.path, config.mode, config.shortcut_count);
+ 
+ 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+ 	if (fd &lt; 0) {
+diff --git a/server.h b/server.h
+index 7beb984..63c21ef 100644
+--- a/server.h
++++ b/server.h
+@@ -69,12 +69,46 @@ typedef enum {
+ 	IMAGE_SCALED
+ } ImageMode;
+ 
++/* ----------------------------
++ * Keyboard shortcuts
++ * ---------------------------- */
++#define MAX_SHORTCUTS 16
++
++struct key_combo {
++	int ctrl;
++	int alt;
++	int shift;
++	uint16_t key; // Linux key code (KEY_* from linux/input.h)
++};
++
++enum shortcut_type {
++	SHORTCUT_NONE = 0,
++	SHORTCUT_BUILTIN,
++	SHORTCUT_COMMAND,
++};
++
++enum shortcut_parse_result {
++	SHORTCUT_PARSE_OK = 0,
++	SHORTCUT_PARSE_BAD_FORMAT,
++	SHORTCUT_PARSE_UNSUPPORTED_BUILTIN,
++	SHORTCUT_PARSE_EMPTY_COMMAND,
++};
++
++struct shortcut {
++	struct key_combo combo;
++	enum shortcut_type type;
++	char value[256]; // for builtin: "exit" or "screenshot"; for command: the command line to run
++};
++
+ // Background configuration for now
+ struct config {
+ 	BackgroundType type;
+ 	uint32_t color; // RGBA format
+ 	ImageMode mode;
+ 	char path[MAX_PATH_LEN];
++
++	struct shortcut shortcuts[MAX_SHORTCUTS];
++	int shortcut_count;
+ };
+ 
+ // Parse config file
+</pre>

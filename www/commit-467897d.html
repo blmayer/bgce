@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 467897d</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 467897d
+parent <a href=commit-8b3ca15.html>8b3ca15</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-12-03T17:27:54-03:00
+
+    improved mouse event
+
+<a href=tree-467897d.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index b82e609..397f75c 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -25,25 +25,34 @@ Implement a minimal Linux graphical environment that runs without root, manages
+   - Efficient dirty-region drawing
+   - Minimal window manager support
+ 
+-## Current Milestone
+-
+-Phase 1: Single-client prototype with framebuffer output and working IPC communication.
+-
+-### Components to Implement First
+ 
+-1. `bgced` server skeleton:
+-   - Open `/dev/fb0`
+-   - Create UNIX socket for client connections
+-   - Manage shared memory for client buffers
+-   - Composite and blit to display buffer
+-
+-2. `libbgce.so`:
+-   - Connect to server
+-   - Allocate shared buffer
+-   - Implement API stubs (`getServerInfo`, `getBuffer`, `draw`)
++## Current Milestone
+ 
+-3. `bgce-client`:
+-   - Simple test: fill buffer with color, send draw request
++### BGTK (Brian's Graphical Toolkit)
++
++[x] **Step 1: Analyze Client API**
++    *   Check `bgce.h` to see what functions are available for client connection, buffer retrieval, and especially **event handling**.
++    *   Check `client.c` to see how an application currently interacts with `libbgce.so`.
++
++[ ] **Step 2: Define BGTK Interface (`bgtk.h`)**
++    * Define the core structure for a widget (`struct BGTK_Widget`).
++    * Define the event structure (`struct BGTK_Event`).
++    [ ] Improve widget structure: add options (like alignment), child widgets.
++    * Define API functions:
++        * `BGTK_Context *bgtk_init(void)`: Connects to BGCE server, gets buffer/dimensions.
++        * `void bgtk_main_loop(BGTK_Context *ctx)`: Blocking loop to handle events and redraws.
++        * `BGTK_Widget *bgtk_label_new(const char *text)`: Creates a label.
++        * `BGTK_Widget *bgtk_button_new(const char *text, void (*callback)(void))`
++        * `void bgtk_add_widget(BGTK_Context *ctx, BGTK_Widget *widget, int x, int y, int w, int h)`: Simple absolute positioning for now.
++
++[ ] **Step 3: Implement BGTK Core (`bgtk.c`)**
++    [X] Implement initialization, event queueing, and simple drawing (e.g., drawing rectangles for buttons, text rendering).
++    [ ] Only call draw when changes are made, like input.
++    [ ] Implement proper hit detection: using widget trees and coordinates, e.g. click on x,y -&gt; search the tree until last widget is found, then send the input to that widget.
++
++[x] **Step 4: Integrate and Test**
++    [X] Create a new client file (or update `client.c`) to demonstrate a basic BGTK application. -&gt; app.c
++    [ ] Ensure events (like mouse clicks) are routed to the appropriate widget callbacks. This needs server-side changes.
+ 
+ ---
+ 
+diff --git a/Makefile b/Makefile
+index 6ad84d4..c7024e2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,11 +1,11 @@
+ CC = gcc
+-CFLAGS = -Wall -O0 -std=c99 -fPIC -g -I/usr/include/libdrm
+-LDFLAGS = -lrt -ldrm
++CFLAGS = -Wall -O0 -std=c99 -fPIC -g -I/usr/include/libdrm -I/usr/include/freetype2 -I/usr/include/harfbuzz
++LDFLAGS = -lrt -ldrm -lfreetype
+ 
+ SERVER_OBJS = server.o loop.o libbgce.so input.o display.o
+ LIB_OBJS = libbgce.o
+ 
+-all: bgce libbgce.so client
++all: bgce libbgce.so client app
+ 
+ bgce: $(SERVER_OBJS)
+ 	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) -L. -lbgce $(LDFLAGS)
+@@ -16,11 +16,14 @@ libbgce.so: $(LIB_OBJS)
+ client: client.c bgce.h
+ 	$(CC) $(CFLAGS) -o $@ client.c -L. -lbgce $(LDFLAGS)
+ 
++app: app.c bgtk.h bgtk.o
++	$(CC) $(CFLAGS) -o $@ app.c bgtk.o -L. -lbgce $(LDFLAGS)
++
+ %.o: %.c
+ 	$(CC) $(CFLAGS) -c $&lt; -o $@
+ 
+ clean:
+-	rm -f *.o bgce libbgce.so client
++	rm -f *.o bgce libbgce.so client app
+ 
+ .PHONY: test
+ test-server: bgce
+diff --git a/bgce.h b/bgce.h
+index baf42de..eec1189 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -69,12 +69,6 @@ struct BufferReply {
+ 	uint32_t height;
+ };
+ 
+-enum InputType {
+-	INPUT_KEYBOARD,
+-	INPUT_MOUSE_MOVE,
+-	INPUT_MOUSE_BUTTON,
+-};
+-
+ struct InputEvent {
+ 	uint32_t code; /* key code or button code */
+ 	int32_t value; /* press=1, release=0, or delta */
+diff --git a/input.c b/input.c
+index 89e7f92..dbc64d6 100644
+--- a/input.c
++++ b/input.c
+@@ -386,22 +386,30 @@ void* input_loop(void* arg) {
+ 				if (!server.focused_client) {
+ 					continue;
+ 				}
++				struct Client c = *server.focused_client;
+ 
+ 				struct InputEvent e = {0};
+ 				e.device = server.input.devs[i];
+ 				e.code = ev.code;
+ 
+-				// TODO: send x, y for mouse move
+-				if (ev.type == EV_KEY) {
++				switch (ev.type) {
++				case EV_KEY:
+ 					e.value = ev.value;
+-				} else if (ev.type == EV_REL) {
+-					if (ev.code == REL_X)
+-						e.value = ev.value;
+-					else if (ev.code == REL_Y)
+-						e.value = ev.value;
+-				} else if (ev.type == EV_SYN) {
+-					continue;
+-				} else {
++					if (ev.code != BTN_LEFT &amp;&amp; ev.code != BTN_RIGHT) {
++						break;
++					}
++				case EV_REL: {
++					int in = mouse_x &gt;= c.x &amp;&amp; mouse_x &lt;= c.x + c.width &amp;&amp;
++					         mouse_y &gt;= c.y &amp;&amp; mouse_y &lt;= c.y + c.height;
++					if (!in) {
++						continue;
++					}
++
++					e.x = mouse_x - c.x;
++					e.y = mouse_y - c.y;
++					break;
++				}
++				default:
+ 					continue;
+ 				}
+ 
+@@ -409,7 +417,7 @@ void* input_loop(void* arg) {
+ 				struct BGCEMessage msg;
+ 				msg.type = MSG_INPUT_EVENT;
+ 				msg.data.input_event = e;
+-				bgce_send_msg(server.focused_client-&gt;fd, &amp;msg);
++				bgce_send_msg(c.fd, &amp;msg);
+ 			}
+ 		}
+ 	}
+diff --git a/libbgce.h b/libbgce.h
+deleted file mode 100644
+index ff8dd42..0000000
+--- a/libbgce.h
++++ /dev/null
+@@ -1,17 +0,0 @@
+-// libbgce.h
+-#ifndef LIBBGCE_H
+-#define LIBBGCE_H
+-
+-#include &lt;stdint.h&gt;
+-
+-struct bgce_info {
+-    uint32_t width, height, depth;
+-};
+-
+-int bgce_connect();
+-void bgce_disconnect(int conn);
+-struct bgce_info bgce_get_info(void);
+-uint32_t * bgce_get_buffer(uint32_t *out_width, uint32_t *out_height);
+-int bgce_draw(int32_t x, int32_t y, int32_t z);
+-
+-#endif
+</pre>

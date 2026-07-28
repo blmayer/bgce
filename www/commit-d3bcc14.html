@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce d3bcc14</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit d3bcc14
+parent <a href=commit-5b6b309.html>5b6b309</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2025-11-16T08:00:05-03:00
+
+    adjusted drawing
+
+<a href=tree-d3bcc14.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/bgce.h b/bgce.h
+index 7e93c8e..b671272 100644
+--- a/bgce.h
++++ b/bgce.h
+@@ -17,6 +17,7 @@
+ 
+ #define SOCKET_PATH "/tmp/bgce.sock"
+ #define BGCE_BYTES_PER_PIXEL 4
++#define MAX_INPUT_DEVICES 4
+ 
+ /* ----------------------------
+  * Protocol Message Types
+@@ -26,7 +27,8 @@ enum {
+ 	MSG_GET_BUFFER,
+ 	MSG_DRAW,
+ 	MSG_INPUT_EVENT,
+-	MSG_FOCUS_CHANGE
++	MSG_FOCUS_CHANGE,
++	MSG_SUBSCRIBE_INPUT
+ };
+ 
+ /* ----------------------------
+@@ -35,13 +37,21 @@ enum {
+ 
+ struct BGCEMessage {
+ 	uint32_t type;
+-	char data[128];
++	char data[512];
++};
++
++struct BGCEInputDevice {
++	uint16_t id;        // internal index of server
++	uint16_t type_mask; // bitmask: KEY, REL, ABS, etc
++	char name[64];
+ };
+ 
+ struct ServerInfo {
+ 	uint32_t width;
+ 	uint32_t height;
+ 	uint32_t color_depth;
++	uint16_t input_device_count;
++	struct BGCEInputDevice devices[MAX_INPUT_DEVICES];
+ };
+ 
+ struct ClientBufferRequest {
+@@ -73,9 +83,9 @@ struct BGCEInputEvent {
+  * API Functions
+  * ---------------------------- */
+ 
+-ssize_t bgce_send_msg(int conn, struct BGCEMessage *msg);
++ssize_t bgce_send_msg(int conn, struct BGCEMessage* msg);
+ 
+-ssize_t bgce_recv_msg(int conn, struct BGCEMessage *msg);
++ssize_t bgce_recv_msg(int conn, struct BGCEMessage* msg);
+ 
+ /**
+  * Connect to a BGCE server socket.
+diff --git a/display.c b/display.c
+index abc4798..7feb8d3 100644
+--- a/display.c
++++ b/display.c
+@@ -196,22 +196,6 @@ void draw(struct ServerState* srv, struct Client cli) {
+ 
+ 	/* ------------- Present via DRM ------------- */
+ 
+-	drmModeCrtc* crtc = drmModeGetCrtc(srv-&gt;display.drm_fd, srv-&gt;display.crtc_id);
+-	if (crtc) {
+-		int ret = drmModeSetCrtc(
+-		        srv-&gt;display.drm_fd,
+-		        srv-&gt;display.crtc_id,
+-		        srv-&gt;display.fb_id,
+-		        0, 0,
+-		        &amp;srv-&gt;display.connector_id, 1,
+-		        &amp;crtc-&gt;mode);
+-		drmModeFreeCrtc(crtc);
+-
+-		if (ret &lt; 0) {
+-			fprintf(stderr, "[BGCE] drmModeSetCrtc failed in draw(): %s\n",
+-			        strerror(errno));
+-		}
+-	}
+ }
+ 
+ /* Shutdown and cleanup */
+diff --git a/input.c b/input.c
+index 40a28ab..a0a07d0 100644
+--- a/input.c
++++ b/input.c
+@@ -13,7 +13,6 @@
+ #include &lt;sys/ioctl.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+-#define MAX_INPUT_DEVICES 8
+ #define test_bit(bit, array) ((array)[(bit) / 8] &amp; (1 &lt;&lt; ((bit) % 8)))
+ #define INPUT_DIR "/dev/input"
+ 
+@@ -71,6 +70,10 @@ int init_input(void) {
+ 
+ 		input_state.fds[input_state.count].fd = fd;
+ 		input_state.fds[input_state.count].events = POLLIN;
++
++		server.input.devs[input_state.count].id = input_state.count;
++		strcpy(server.input.devs[input_state.count].name, name);
++
+ 		input_state.count++;
+ 
+ 		printf("[BGCE] Input device accepted: %s (%s)%s%s\n",
+@@ -85,6 +88,7 @@ int init_input(void) {
+ 		fprintf(stderr, "[BGCE] No suitable input devices found\n");
+ 		return -1;
+ 	}
++	server.input.count = input_state.count;
+ 
+ 	return 0;
+ }
+@@ -132,10 +136,8 @@ void* input_loop(void* arg) {
+ 			perror("[BGCE] poll");
+ 			break;
+ 		}
+-		printf("[BGCE] poll() returned %d\n", ret);
+ 
+ 		if (!server.focused_client) {
+-			printf("[BGCE] No focused client for input event!\n");
+ 			continue;
+ 		}
+ 
+@@ -167,12 +169,16 @@ void* input_loop(void* arg) {
+ 					continue;
+ 				}
+ 
+-				/* Send to focused client */
+-				struct BGCEMessage msg;
+-				msg.type = MSG_INPUT_EVENT;
+-				memcpy(msg.data, &amp;ev, sizeof(ev));
++				for (int sub = 0; sub &lt; MAX_INPUT_DEVICES; sub++) {
++					if (server.focused_client-&gt;inputs[sub] == i) {
++						/* Send to focused client */
++						struct BGCEMessage msg;
++						msg.type = MSG_INPUT_EVENT;
++						memcpy(msg.data, &amp;ev, sizeof(ev));
+ 
+-				bgce_send_msg(server.focused_client-&gt;fd, &amp;msg);
++						bgce_send_msg(server.focused_client-&gt;fd, &amp;msg);
++					}
++				}
+ 			}
+ 
+ 			if (n &lt; 0 &amp;&amp; errno != EAGAIN)
+diff --git a/libbgce.c b/libbgce.c
+index fdde134..14e4aaf 100644
+--- a/libbgce.c
++++ b/libbgce.c
+@@ -93,7 +93,7 @@ void* bgce_get_buffer(int conn, struct ClientBufferRequest req) {
+ 	struct ClientBufferReply reply;
+ 	memcpy(&amp;reply, msg.data, sizeof(reply));
+ 
+-	size_t size = reply.width * reply.height * 3;
++	size_t size = reply.width * reply.height * 4;
+ 	int shm_fd = shm_open(reply.shm_name, O_RDWR, 0600);
+ 	if (shm_fd &lt; 0) {
+ 		perror("shm_open (client)");
+diff --git a/loop.c b/loop.c
+index 1376c5b..70b18ac 100644
+--- a/loop.c
++++ b/loop.c
+@@ -37,7 +37,13 @@ void* client_thread_main(void* arg) {
+ 			struct ServerInfo info = {
+ 			        .width = server.display.mode.hdisplay,
+ 			        .height = server.display.mode.vdisplay,
+-			        .color_depth = server.color_depth};
++			        .color_depth = server.color_depth,
++			        .input_device_count = server.input.count,
++			};
++			for (int d = 0; d &lt; server.input.count; d++) {
++				info.devices[d] = server.input.devs[d];
++			}
++
+ 			memcpy(msg.data, &amp;info, sizeof(info));
+ 			bgce_send_msg(client_fd, &amp;msg);
+ 			break;
+@@ -46,6 +52,10 @@ void* client_thread_main(void* arg) {
+ 		case MSG_GET_BUFFER: {
+ 			struct ClientBufferRequest req;
+ 			memcpy(&amp;req, msg.data, sizeof(req));
++			printf(
++			        "[BGCE] Client requested buffer of size %dx%d\n",
++			        req.width,
++			        req.height);
+ 
+ 			snprintf(client.shm_name, sizeof(client.shm_name),
+ 			         "/bgce_buf_%d_%ld", getpid(), time(NULL));
+@@ -56,7 +66,7 @@ void* client_thread_main(void* arg) {
+ 				break;
+ 			}
+ 
+-			size_t buf_size = req.width * req.height * 3;
++			size_t buf_size = req.width * req.height * 4;
+ 			if (ftruncate(shm_fd, buf_size) &lt; 0) {
+ 				perror("ftruncate");
+ 				close(shm_fd);
+@@ -67,6 +77,11 @@ void* client_thread_main(void* arg) {
+ 			client.width = req.width;
+ 			client.height = req.height;
+ 			close(shm_fd);
++			printf("Server buffer: %p size=%zu (%dx%d) name=%s\n",
++			       client.buffer,
++			       client.width * client.height * 4UL,
++			       client.width, client.height,
++			       client.shm_name);
+ 
+ 			struct ClientBufferReply reply = {0};
+ 			strncpy(reply.shm_name, client.shm_name, sizeof(reply.shm_name));
+diff --git a/server.h b/server.h
+index 8724b07..dcef36a 100644
+--- a/server.h
++++ b/server.h
+@@ -2,11 +2,13 @@
+ #define BGCE_SERVER_H
+ 
+ #define _XOPEN_SOURCE 700
++#include "bgce.h"
++
+ #include &lt;drm/drm_mode.h&gt;
+-#include &lt;xf86drmMode.h&gt;
+ #include &lt;pthread.h&gt;
+ #include &lt;stdint.h&gt;
+ #include &lt;sys/types.h&gt;
++#include &lt;xf86drmMode.h&gt;
+ 
+ /* ----------------------------
+  * Client Representation
+@@ -22,21 +24,28 @@ struct Client {
+ 	uint32_t x;
+ 	uint32_t y;
+ 	struct Client* next;
++	int inputs[MAX_INPUT_DEVICES];
+ };
+ 
+ /* ----------------------------
+  * Server State
+  * ---------------------------- */
+ 
++struct InputState {
++	int fds[MAX_INPUT_DEVICES];
++	struct BGCEInputDevice devs[MAX_INPUT_DEVICES];
++	size_t count;
++};
++
+ struct DisplayState {
+-	int drm_fd;                    /* DRM device file descriptor */
+-	uint32_t crtc_id;              /* CRTC ID in use */
+-	uint32_t connector_id;         /* Connector ID in use */
+-	uint32_t fb_id;                /* Framebuffer ID */
+-	uint32_t handle;               /* GEM buffer handle */
+-	uint32_t pitch;                /* Bytes per scanline */
+-	uint64_t size;                 /* Total buffer size (bytes) */
+-	uint8_t* framebuffer;          /* Mapped framebuffer pointer */
++	int drm_fd;            /* DRM device file descriptor */
++	uint32_t crtc_id;      /* CRTC ID in use */
++	uint32_t connector_id; /* Connector ID in use */
++	uint32_t fb_id;        /* Framebuffer ID */
++	uint32_t handle;       /* GEM buffer handle */
++	uint32_t pitch;        /* Bytes per scanline */
++	uint64_t size;         /* Total buffer size (bytes) */
++	uint8_t* framebuffer;  /* Mapped framebuffer pointer */
+ 	drmModeRes* resources;
+ 	drmModeConnector* connector;
+ 	drmModeEncoder* encoder;
+@@ -48,6 +57,7 @@ struct ServerState {
+ 	int color_depth;
+ 
+ 	struct DisplayState display;
++	struct InputState input;
+ 
+ 	struct Client* clients;
+ 	int client_count;
+diff --git a/test_client.c b/test_client.c
+index bcf6574..1ed0bb9 100644
+--- a/test_client.c
++++ b/test_client.c
+@@ -22,6 +22,14 @@ int main(void) {
+ 	printf("[BGCE] Server info: %dx%d, %d-bit color\n",
+ 	       info.width, info.height, info.color_depth);
+ 
++	printf("Available devices:\n");
++	for (int i = 0; i &lt; info.input_device_count; i++) {
++		printf("  [%d] %s (mask=%x)\n",
++		       info.devices[i].id,
++		       info.devices[i].name,
++		       info.devices[i].type_mask);
++	}
++
+ 	int w = info.width;
+ 	int h = info.height;
+ 
+@@ -31,14 +39,18 @@ int main(void) {
+ 		fprintf(stderr, "[BGCE] Failed to get buffer\n");
+ 		return 3;
+ 	}
++	printf("Client got buffer at: %p\n", buf);
+ 
+ 	printf("[BGCE] Drawing gradient...\n");
+ 	for (int y = 0; y &lt; h; y++) {
+ 		for (int x = 0; x &lt; w; x++) {
+-			uint8_t* p = buf + (y * w + x) * 3;
+-			p[0] = (x * 255) / w;  // R
+-			p[1] = (y * 255) / h; // G
+-			p[2] = 128;                       // B
++			uint32_t* p = (uint32_t*)buf + (y * w + x);
++
++			uint8_t r = (x * 255) / w;
++			uint8_t g = (y * 255) / h;
++			uint8_t b = 128;
++
++			*p = 0xFF000000 | (r &lt;&lt; 16) | (g &lt;&lt; 8) | b; // ARGB
+ 		}
+ 	}
+ 
+@@ -49,7 +61,7 @@ int main(void) {
+ 
+ 	printf("[BGCE] Frame drawn. Check /tmp/bgce_frame.ppm\n");
+ 
+-	//while (1) {
++	// while (1) {
+ 	//	struct BGCEMessage msg;
+ 	//	ssize_t rc = bgce_recv_msg(conn, &amp;msg);
+ 	//	if (rc &lt;= 0) {
+</pre>

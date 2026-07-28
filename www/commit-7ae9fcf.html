@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bgce 7ae9fcf</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>bgce</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 7ae9fcf
+parent <a href=commit-ee91a7c.html>ee91a7c</a> 
+author Brian Mayer &lt;bleemayer@gmail.com&gt;
+date   2026-07-16T11:51:45-03:00
+
+    Procedural wallpaper: drop full virtual-desktop buffer.
+
+    Paint solid color or a small source image into damage rects only.
+    Removes the WORLD_SCALE² ARGB background client (~4× screen RAM).
+
+<a href=tree-7ae9fcf.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/config.c b/config.c
+index 1133dc6..4d666cf 100644
+--- a/config.c
++++ b/config.c
+@@ -750,79 +750,82 @@ static inline uint32_t rgba_to_u32(const unsigned char *p)
+ 	       ((uint32_t)p[1] &lt;&lt; 8) | (uint32_t)p[2];
+ }
+ 
+-// Apply background to a buffer (typically the full virtual desktop).
+-int apply_background(struct config* config, uint32_t* buffer,
+-                     uint32_t width, uint32_t height,
+-                     uint32_t tile_w, uint32_t tile_h) {
+-	if (!config || !buffer || width == 0 || height == 0)
++/* Procedural wallpaper source (no full virtual-desktop raster). */
++struct Wallpaper wallpaper;
++
++void wallpaper_free(void)
++{
++	free(wallpaper.src);
++	wallpaper.src = NULL;
++	wallpaper.src_w = 0;
++	wallpaper.src_h = 0;
++	wallpaper.type = BG_COLOR;
++	wallpaper.mode = IMAGE_SCALED;
++	wallpaper.color = 0xFF333333;
++}
++
++int wallpaper_load(const struct config *config)
++{
++	int img_width, img_height, img_channels;
++	unsigned char *img_data;
++	uint32_t *argb;
++	size_t n, i;
++
++	wallpaper_free();
++	if (!config)
+ 		return -1;
+ 
+-	if (tile_w == 0)
+-		tile_w = width;
+-	if (tile_h == 0)
+-		tile_h = height;
++	wallpaper.color = config-&gt;color;
++	wallpaper.mode = config-&gt;mode;
++	wallpaper.type = BG_COLOR;
+ 
+-	if (config-&gt;type == BG_COLOR) {
+-		for (uint32_t i = 0; i &lt; width * height; i++)
+-			buffer[i] = config-&gt;color;
++	if (config-&gt;type != BG_IMAGE) {
++		wallpaper.type = BG_COLOR;
++		printf("[BGCE] wallpaper: solid color #%08X (no full-desktop buffer)\n",
++		       wallpaper.color);
+ 		return 0;
+ 	}
+ 
+-	if (config-&gt;type != BG_IMAGE)
+-		return -1;
++	if (!config-&gt;path[0]) {
++		fprintf(stderr, "[BGCE] wallpaper image path empty; using color\n");
++		printf("[BGCE] wallpaper: solid color #%08X\n", wallpaper.color);
++		return 0;
++	}
+ 
+-	int img_width, img_height, img_channels;
+-	unsigned char *img_data =
+-	        stbi_load(config-&gt;path, &amp;img_width, &amp;img_height, &amp;img_channels, 4);
+-	if (!img_data) {
++	img_data = stbi_load(config-&gt;path, &amp;img_width, &amp;img_height, &amp;img_channels, 4);
++	if (!img_data || img_width &lt;= 0 || img_height &lt;= 0) {
+ 		fprintf(stderr, "[BGCE] Failed to load background image: %s\n",
+-		        config-&gt;path[0] ? config-&gt;path : "(empty path)");
+-		fprintf(stderr, "[BGCE] Falling back to default color #333333\n");
+-		for (uint32_t i = 0; i &lt; width * height; i++)
+-			buffer[i] = 0xFF333333;
++		        config-&gt;path);
++		fprintf(stderr, "[BGCE] Falling back to solid color #%08X\n",
++		        wallpaper.color);
++		if (img_data)
++			stbi_image_free(img_data);
+ 		return 0;
+ 	}
+ 
+-	printf("[BGCE] Background image %s (%dx%d) mode=%s → canvas %ux%u\n",
+-	       config-&gt;path, img_width, img_height,
+-	       config-&gt;mode == IMAGE_TILED ? "tiled" : "scaled",
+-	       width, height);
+-
+-	if (config-&gt;mode == IMAGE_TILED) {
+-		/* Repeat source texels over the whole canvas. */
+-		for (uint32_t y = 0; y &lt; height; y++) {
+-			uint32_t img_y = y % (uint32_t)img_height;
+-			for (uint32_t x = 0; x &lt; width; x++) {
+-				uint32_t img_x = x % (uint32_t)img_width;
+-				uint32_t img_idx = (img_y * (uint32_t)img_width + img_x) * 4;
+-				buffer[y * width + x] = rgba_to_u32(img_data + img_idx);
+-			}
+-		}
+-	} else {
+-		/*
+-		 * Scaled: stretch the image over the full canvas (virtual desktop).
+-		 * tile_w/tile_h are unused for this mode (kept for API stability).
+-		 */
+-		(void)tile_w;
+-		(void)tile_h;
+-		float x_ratio = (float)img_width / (float)width;
+-		float y_ratio = (float)img_height / (float)height;
+-
+-		for (uint32_t y = 0; y &lt; height; y++) {
+-			uint32_t img_y = (uint32_t)(y * y_ratio);
+-			if (img_y &gt;= (uint32_t)img_height)
+-				img_y = (uint32_t)img_height - 1;
+-			for (uint32_t x = 0; x &lt; width; x++) {
+-				uint32_t img_x = (uint32_t)(x * x_ratio);
+-				if (img_x &gt;= (uint32_t)img_width)
+-					img_x = (uint32_t)img_width - 1;
+-				uint32_t img_idx =
+-				        (img_y * (uint32_t)img_width + img_x) * 4;
+-				buffer[y * width + x] = rgba_to_u32(img_data + img_idx);
+-			}
+-		}
++	n = (size_t)img_width * (size_t)img_height;
++	argb = malloc(n * sizeof(uint32_t));
++	if (!argb) {
++		perror("[BGCE] wallpaper source");
++		stbi_image_free(img_data);
++		fprintf(stderr, "[BGCE] Falling back to solid color #%08X\n",
++		        wallpaper.color);
++		return 0;
+ 	}
+ 
++	for (i = 0; i &lt; n; i++)
++		argb[i] = rgba_to_u32(img_data + i * 4);
+ 	stbi_image_free(img_data);
++
++	wallpaper.src = argb;
++	wallpaper.src_w = (uint32_t)img_width;
++	wallpaper.src_h = (uint32_t)img_height;
++	wallpaper.type = BG_IMAGE;
++	wallpaper.mode = config-&gt;mode;
++
++	printf("[BGCE] wallpaper: image %s (%dx%d) mode=%s "
++	       "(source only; paint samples into damage rects)\n",
++	       config-&gt;path, img_width, img_height,
++	       config-&gt;mode == IMAGE_TILED ? "tiled" : "scaled");
+ 	return 0;
+ }
+diff --git a/display.c b/display.c
+index f080f59..d9c43a5 100644
+--- a/display.c
++++ b/display.c
+@@ -827,6 +827,151 @@ static inline void fill_u32(uint32_t *p, int n, uint32_t v)
+ 		p[i] = v;
+ }
+ 
++/* Forward decl — used by wallpaper_fill before its definition. */
++static int clip_to_display(const struct ServerState *srv,
++                           int *x0, int *y0, int *x1, int *y1);
++
++/* Positive modulo for world coords that can go slightly negative. */
++static int wallpaper_mod(int a, int m)
++{
++	int r;
++
++	if (m &lt;= 0)
++		return 0;
++	r = a % m;
++	if (r &lt; 0)
++		r += m;
++	return r;
++}
++
++/*
++ * Procedural wallpaper into a screen damage rect.  Samples solid color or
++ * a small source image (tiled / scaled over the virtual desktop).  No
++ * full-world buffer — only the damage rect is written.
++ */
++void wallpaper_fill_screen_rect(struct ServerState *srv,
++                                int sx0, int sy0, int sx1, int sy1)
++{
++	uint32_t *dst;
++	uint32_t stride;
++	int z, pan_x, pan_y;
++	uint32_t color;
++	int y, x;
++	int vw, vh;
++
++	if (!srv || !srv-&gt;framebuffer)
++		return;
++	if (!clip_to_display(srv, &amp;sx0, &amp;sy0, &amp;sx1, &amp;sy1))
++		return;
++
++	dst = (uint32_t *)srv-&gt;framebuffer;
++	stride = display_stride_px(srv);
++	z = zoom_pct_of(srv);
++	pan_x = srv-&gt;pan_x;
++	pan_y = srv-&gt;pan_y;
++	color = wallpaper.color;
++	vw = srv-&gt;virtual_w &gt; 0 ? (int)srv-&gt;virtual_w : 1;
++	vh = srv-&gt;virtual_h &gt; 0 ? (int)srv-&gt;virtual_h : 1;
++
++	/* Fast path: solid color (default and image-load fallback). */
++	if (wallpaper.type != BG_IMAGE || !wallpaper.src ||
++	    wallpaper.src_w == 0 || wallpaper.src_h == 0) {
++		for (y = sy0; y &lt; sy1; y++)
++			fill_u32(dst + y * (int)stride + sx0, sx1 - sx0, color);
++		return;
++	}
++
++	{
++		const uint32_t *src = wallpaper.src;
++		int sw = (int)wallpaper.src_w;
++		int sh = (int)wallpaper.src_h;
++
++		if (wallpaper.mode == IMAGE_TILED) {
++			/*
++			 * Tile in world space: (wx,wy) → src[wy % sh][wx % sw].
++			 * At zoom 100%: wx = sx + pan (same as old full canvas).
++			 */
++			if (z == BGCE_ZOOM_PCT_1X) {
++				for (y = sy0; y &lt; sy1; y++) {
++					int wy = y + pan_y;
++					int ty = wallpaper_mod(wy, sh);
++					const uint32_t *srow = src + ty * sw;
++					uint32_t *drow = dst + y * (int)stride;
++
++					for (x = sx0; x &lt; sx1; x++) {
++						int wx = x + pan_x;
++						drow[x] = srow[wallpaper_mod(wx, sw)];
++					}
++				}
++			} else {
++				for (y = sy0; y &lt; sy1; y++) {
++					int wy = (y + pan_y) * 100 / z;
++					int ty = wallpaper_mod(wy, sh);
++					const uint32_t *srow = src + ty * sw;
++					uint32_t *drow = dst + y * (int)stride;
++
++					for (x = sx0; x &lt; sx1; x++) {
++						int wx = (x + pan_x) * 100 / z;
++						drow[x] = srow[wallpaper_mod(wx, sw)];
++					}
++				}
++			}
++			return;
++		}
++
++		/*
++		 * Scaled: stretch source over the full virtual desktop.
++		 *   ix = wx * sw / virtual_w
++		 *   iy = wy * sh / virtual_h
++		 */
++		if (z == BGCE_ZOOM_PCT_1X) {
++			for (y = sy0; y &lt; sy1; y++) {
++				int wy = y + pan_y;
++				int iy = wy * sh / vh;
++				uint32_t *drow = dst + y * (int)stride;
++				const uint32_t *srow;
++
++				if (iy &lt; 0)
++					iy = 0;
++				if (iy &gt;= sh)
++					iy = sh - 1;
++				srow = src + iy * sw;
++				for (x = sx0; x &lt; sx1; x++) {
++					int wx = x + pan_x;
++					int ix = wx * sw / vw;
++					if (ix &lt; 0)
++						ix = 0;
++					if (ix &gt;= sw)
++						ix = sw - 1;
++					drow[x] = srow[ix];
++				}
++			}
++		} else {
++			for (y = sy0; y &lt; sy1; y++) {
++				int wy = (y + pan_y) * 100 / z;
++				int iy = wy * sh / vh;
++				uint32_t *drow = dst + y * (int)stride;
++				const uint32_t *srow;
++
++				if (iy &lt; 0)
++					iy = 0;
++				if (iy &gt;= sh)
++					iy = sh - 1;
++				srow = src + iy * sw;
++				for (x = sx0; x &lt; sx1; x++) {
++					int wx = (x + pan_x) * 100 / z;
++					int ix = wx * sw / vw;
++					if (ix &lt; 0)
++						ix = 0;
++					if (ix &gt;= sw)
++						ix = sw - 1;
++					drow[x] = srow[ix];
++				}
++			}
++		}
++	}
++}
++
+ /*
+  * 1:1 blit when zoom_pct == 100 and buffer size == world size.
+  *   pan is screen-pixel pan: world = screen + pan
+@@ -1060,6 +1205,9 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
+ 	if (rx0 &gt;= rx1 || ry0 &gt;= ry1)
+ 		return;
+ 
++	/* Bottom layer: procedural wallpaper (not a client buffer). */
++	wallpaper_fill_screen_rect(srv, rx0, ry0, rx1, ry1);
++
+ 	int n = 0;
+ 	for (struct Client* c = first; c; c = c-&gt;next)
+ 		n++;
+@@ -1083,8 +1231,7 @@ static void composite_chain_to_rect(struct ServerState* srv, struct Client* firs
+ 		stack[i++] = c;
+ 
+ 	/* The linked-list is ordered top-&gt;bottom.
+-	 * For correct composition we must draw bottom-&gt;top so that higher windows
+-	 * overwrite lower ones (background is typically last in the chain).
++	 * Draw bottom-&gt;top so higher windows overwrite lower ones.
+ 	 */
+ 	for (i = n - 1; i &gt;= 0; i--) {
+ 		blit_client_overlap(srv, stack[i], rx0, ry0, rx1, ry1);
+@@ -1517,9 +1664,9 @@ void draw(struct ServerState *srv, struct Client *cli)
+ }
+ 
+ /*
+- * Paint every client except `skip` into a screen rect, bottom → top.
+- * Used for move expose so wallpaper (and true underlay) always runs even
+- * if list topology is odd — never leave the mover’s old pixels in the trail.
++ * Paint wallpaper + every client except `skip` into a screen rect, bottom → top.
++ * Used for move expose so wallpaper always runs even if the client list is empty
++ * — never leave the mover’s old pixels in the trail.
+  */
+ static void composite_all_except(struct ServerState *srv,
+                                  const struct Client *skip,
+@@ -1533,6 +1680,8 @@ static void composite_all_except(struct ServerState *srv,
+ 	if (!clip_to_display(srv, &amp;x0, &amp;y0, &amp;x1, &amp;y1))
+ 		return;
+ 
++	wallpaper_fill_screen_rect(srv, x0, y0, x1, y1);
++
+ 	for (c = srv-&gt;clients; c; c = c-&gt;next) {
+ 		if (c == skip || !c-&gt;buffer)
+ 			continue;
+@@ -1553,7 +1702,7 @@ static void composite_all_except(struct ServerState *srv,
+ 		stack[i++] = c;
+ 	}
+ 	if (bgce_comp_debug()) {
+-		printf("[BGCE] underlay-stack: %d layer(s) into "
++		printf("[BGCE] underlay-stack: wallpaper + %d layer(s) into "
+ 		       "screen=(%d,%d)-(%d,%d) %dx%d skip_id=%u\n",
+ 		       n, x0, y0,
+ 		       x1 &gt; x0 ? x1 - 1 : x0,
+diff --git a/input.c b/input.c
+index b2ad3ef..22036f5 100644
+--- a/input.c
++++ b/input.c
+@@ -130,7 +130,7 @@ int resize_buffer(struct Client* c, int dx, int dy) {
+ 	return 1;
+ }
+ 
+-/* Pick topmost non-background client under screen-space (x, y). */
++/* Pick topmost client under screen-space (x, y). Wallpaper is not a client. */
+ struct Client* pick_client(int x, int y) {
+ 	int wx, wy;
+ 	screen_to_world(&amp;server, x, y, &amp;wx, &amp;wy);
+@@ -147,7 +147,7 @@ struct Client* pick_client(int x, int y) {
+ 		}
+ 		c = c-&gt;next;
+ 	}
+-	return (picked &amp;&amp; picked-&gt;z &gt; 0) ? picked : NULL; /* skip background */
++	return picked;
+ }
+ 
+ /*
+diff --git a/input_headless.c b/input_headless.c
+index 11f6e82..e1c8784 100644
+--- a/input_headless.c
++++ b/input_headless.c
+@@ -62,5 +62,5 @@ struct Client *pick_client(int x, int y)
+ 		}
+ 		c = c-&gt;next;
+ 	}
+-	return (picked &amp;&amp; picked-&gt;z &gt; 0) ? picked : NULL;
++	return picked;
+ }
+diff --git a/location_cache.c b/location_cache.c
+index 6b2a3e8..56237a2 100644
+--- a/location_cache.c
++++ b/location_cache.c
+@@ -318,7 +318,7 @@ void location_cache_remember_client(const struct Client *client)
+ 
+ 	if (!client || !client-&gt;app_id[0])
+ 		return;
+-	/* Skip placeholder background client */
++	/* Skip non-app placeholders (legacy z==0 background had no app_id). */
+ 	if (client-&gt;z == 0 &amp;&amp; client-&gt;fd &lt; 0)
+ 		return;
+ 	z = server.zoom_pct &gt; 0 ? server.zoom_pct : BGCE_ZOOM_PCT_1X;
+diff --git a/loop.c b/loop.c
+index a197ae4..9badff7 100644
+--- a/loop.c
++++ b/loop.c
+@@ -35,17 +35,9 @@ void* client_thread(void* arg) {
+ 		client-&gt;id = next_client_id++;
+ 	location_cache_identify_client(client, client_fd);
+ 
+-	/* Background client is always first; keep the list non-empty. */
+-	if (!server.clients) {
+-		fprintf(stderr, "[BGCE] no client list (missing background); dropping connection\n");
+-		close(client_fd);
+-		free(client);
+-		return NULL;
+-	}
+-
+-	// Add client to the linked list
++	/* Add client to the linked list (wallpaper is not a client). */
+ 	client-&gt;next = server.clients;
+-	client-&gt;z = server.clients-&gt;z + 1;
++	client-&gt;z = server.clients ? server.clients-&gt;z + 1 : 1;
+ 	server.clients = client;
+ 
+ 	/* last connected client gets focus (notify old focus only; don't notify the new client yet) */
+@@ -286,17 +278,15 @@ void* client_thread(void* arg) {
+ 		client-&gt;shm_name[0] = '\0';
+ 	}
+ 
+-	// Remove client from the linked list (never drop the background client)
++	/* Remove client from the linked list. */
+ 	struct Client* prev = NULL;
+ 	struct Client* curr = server.clients;
+ 	while (curr) {
+ 		if (curr == client) {
+-			if (prev) {
++			if (prev)
+ 				prev-&gt;next = curr-&gt;next;
+-			} else {
+-				/* Head is a real client; next should be background or another. */
++			else
+ 				server.clients = curr-&gt;next;
+-			}
+ 			break;
+ 		}
+ 		prev = curr;
+diff --git a/mock.c b/mock.c
+index 5b36ea9..93c0534 100644
+--- a/mock.c
++++ b/mock.c
+@@ -17,7 +17,6 @@ struct config config;
+ /* From input_headless / input */
+ struct Client *pick_client(int x, int y);
+ 
+-static struct Client *bg_client;
+ static int mock_active;
+ static uint32_t mock_next_id = 1;
+ 
+@@ -62,34 +61,19 @@ int bgce_mock_init(uint32_t width, uint32_t height)
+ 	server.pan_y = 0;
+ 	server.client_count = 0;
+ 	server.focused_client = NULL;
++	server.clients = NULL;
+ 
+-	bg_client = calloc(1, sizeof(*bg_client));
+-	if (!bg_client) {
+-		release_display();
+-		return -1;
+-	}
+-	bg_client-&gt;z = 0;
+-	bg_client-&gt;fd = -1;
+-	bg_client-&gt;width = server.virtual_w;
+-	bg_client-&gt;height = server.virtual_h;
+-	bg_client-&gt;world_w = server.virtual_w;
+-	bg_client-&gt;world_h = server.virtual_h;
+-	bg_client-&gt;buffer = malloc((size_t)server.virtual_w * server.virtual_h * 4);
+-	if (!bg_client-&gt;buffer) {
+-		free(bg_client);
+-		bg_client = NULL;
++	/* Procedural wallpaper — solid color source only (no world-sized buffer). */
++	if (wallpaper_load(&amp;config) != 0) {
+ 		release_display();
+ 		return -1;
+ 	}
+-	apply_background(&amp;config, bg_client-&gt;buffer,
+-	                 server.virtual_w, server.virtual_h,
+-	                 server.virtual_w, server.virtual_h);
+-	server.clients = bg_client;
+ 
+ 	init_input();
+ 	location_cache_load();
+ 	/* Sync compositor: paint inline so headless tests need no flush. */
+ 	if (bgce_comp_init(1) != 0) {
++		wallpaper_free();
+ 		release_display();
+ 		return -1;
+ 	}
+@@ -117,17 +101,12 @@ void bgce_mock_fini(void)
+ 		struct Client *n = c-&gt;next;
+ 		if (c-&gt;buffer)
+ 			free(c-&gt;buffer);
+-		if (c != bg_client)
+-			free(c);
++		free(c);
+ 		c = n;
+ 	}
+-	if (bg_client) {
+-		/* buffer already freed in loop if bg was in list */
+-		free(bg_client);
+-		bg_client = NULL;
+-	}
+ 	server.clients = NULL;
+ 	server.focused_client = NULL;
++	wallpaper_free();
+ 	release_display();
+ 	mock_active = 0;
+ }
+@@ -199,7 +178,7 @@ void bgce_mock_remove_client(struct Client *c)
+ 	struct Client *prev = NULL;
+ 	struct Client *curr;
+ 
+-	if (!c || c == bg_client)
++	if (!c)
+ 		return;
+ 
+ 	curr = server.clients;
+@@ -236,7 +215,7 @@ void bgce_mock_focus(struct Client *c)
+ 	struct Client *prev;
+ 	struct Client *curr;
+ 
+-	if (!c || c == bg_client)
++	if (!c)
+ 		return;
+ 
+ 	/* Raise to head of list (top). */
+diff --git a/mock.h b/mock.h
+index cddaa38..86196cb 100644
+--- a/mock.h
++++ b/mock.h
+@@ -15,7 +15,7 @@
+ 
+ #include &lt;stdint.h&gt;
+ 
+-/** Start mock server: malloc FB, virtual desktop, solid background. */
++/** Start mock server: malloc FB, virtual desktop, solid procedural wallpaper. */
+ int bgce_mock_init(uint32_t width, uint32_t height);
+ 
+ /** Tear down mock (frees clients and FB). */
+diff --git a/server.c b/server.c
+index 4a40aa8..61c5542 100644
+--- a/server.c
++++ b/server.c
+@@ -323,33 +323,15 @@ int main(void) {
+ 	       server.virtual_w, server.virtual_h,
+ 	       (double)(BGCE_WORLD_SCALE * BGCE_WORLD_SCALE), server.zoom_pct);
+ 
+-	/* Background covers the entire virtual desktop */
+-	struct Client background_client;
+-	memset(&amp;background_client, 0, sizeof(background_client));
+-	background_client.x = 0;
+-	background_client.y = 0;
+-	background_client.z = 0; /* special: never focusable */
+-	background_client.width = server.virtual_w;
+-	background_client.height = server.virtual_h;
+-	/* 1:1 world ↔ buffer for the desktop surface */
+-	background_client.world_w = server.virtual_w;
+-	background_client.world_h = server.virtual_h;
+-	background_client.buffer = malloc((size_t)server.virtual_w * server.virtual_h * 4);
+-	if (!background_client.buffer) {
+-		perror("[BGCE] malloc background");
++	/* Wallpaper is procedural (color or small source image) — no world-sized buffer. */
++	server.clients = NULL;
++	if (wallpaper_load(&amp;config) != 0) {
++		fprintf(stderr, "[BGCE] wallpaper_load failed\n");
+ 		release_display();
+ 		return 1;
+ 	}
+-	background_client.next = NULL;
+-	background_client.fd = -1;
+-	server.clients = &amp;background_client;
+ 
+-	/* Wallpaper covers the full virtual desktop (scaled mode stretches). */
+-	apply_background(&amp;config, background_client.buffer,
+-	                 server.virtual_w, server.virtual_h,
+-	                 server.virtual_w, server.virtual_h);
+-
+-	puts("[BGCE] Drawing background");
++	puts("[BGCE] Drawing wallpaper");
+ 	/* Async compositor owns FB writes after this. */
+ 	if (bgce_comp_init(0) != 0)
+ 		fprintf(stderr, "[BGCE] compositor init failed; using sync fallback\n");
+diff --git a/server.h b/server.h
+index 388a31d..4b3060c 100644
+--- a/server.h
++++ b/server.h
+@@ -177,14 +177,33 @@ struct config {
+ int load_config(struct config* config);
+ /** Log the full effective configuration (background, shortcuts, cursors). */
+ void print_config(const struct config* config);
++
++/*
++ * Procedural wallpaper: solid color, or a small source image (tiled / scaled
++ * over the virtual desktop).  No full-world pixel buffer — paint samples into
++ * screen damage rects only (see wallpaper_fill_screen_rect).
++ */
++struct Wallpaper {
++	BackgroundType type; /* BG_COLOR or BG_IMAGE */
++	ImageMode mode;
++	uint32_t color;      /* used for BG_COLOR or image load failure */
++	uint32_t *src;       /* ARGB row-major; NULL if color-only */
++	uint32_t src_w;
++	uint32_t src_h;
++};
++
++extern struct Wallpaper wallpaper;
++
++/** Load color / decode image from config. Frees any previous source. */
++int wallpaper_load(const struct config *config);
++/** Free decoded image pixels (safe if never loaded). */
++void wallpaper_free(void);
+ /**
+- * Paint background into a width×height buffer (usually the full virtual desktop).
+- * IMAGE_SCALED stretches the image over the whole buffer; IMAGE_TILED repeats
+- * source texels. tile_w/tile_h are reserved (pass display size; unused for scaled).
++ * Paint wallpaper into a half-open screen rect [sx0,sx1)×[sy0,sy1).
++ * Uses live zoom/pan and virtual desktop size. Clips to the display.
+  */
+-int apply_background(struct config* config, uint32_t* buffer,
+-                     uint32_t width, uint32_t height,
+-                     uint32_t tile_w, uint32_t tile_h);
++void wallpaper_fill_screen_rect(struct ServerState *srv,
++                                int sx0, int sy0, int sx1, int sy1);
+ 
+ /* ----------------------------
+  * Cursor
+</pre>
