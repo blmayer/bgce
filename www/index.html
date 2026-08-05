@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>BGCE</title>
+<title>bgce</title>
 <meta charset="UTF-8">
 <meta name="color-scheme" content="light dark">
 <link rel=icon href=data:,>
@@ -8,7 +8,7 @@
 <style>pre{width:52ch;margin:2ch auto}a{color:#ff00ff}</style>
 <pre>
 	┌──────────────────────────────────┐
-	│ BGCE.                            │
+	│ bgce.                            │
 	│     |\                           │
 	│      ^                           │
 	│                   ┌───────┐      │
@@ -23,59 +23,59 @@
 <a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
 <!-- site nav -->
 
-<i><b>BGCE: Brian's Graphical Computer Environment</b></i>
+<i><b>bgce: brian's graphical computer environment</b></i>
 
-BGCE is a minimal graphical environment for Linux
-written in C. It acts as a bare-bones window system
-similar to Xorg or Wayland, but much simpler and
+bgce is a minimal graphical environment for linux
+written in c. it acts as a bare-bones window system
+similar to xorg or wayland, but much simpler and
 designed to run <b>without root privileges</b>.
 
-<b>Zoomable virtual desktop</b> — the canvas is larger
-than the screen. Zoom in to focus, zoom out to see
+<b>zoomable virtual desktop</b> — the canvas is larger
+than the screen. zoom in to focus, zoom out to see
 the whole workspace, pan to move around.
 
 
-<b>Overview</b>
+<b>overview</b>
 
-The system is split into two components:
+the system is split into two components:
 
-- <b>Server:</b> Manages video buffer, input events, and
+- <b>server:</b> manages video buffer, input events, and
   window stacking.
-- <b>Client:</b> Applications that render to their own
+- <b>client:</b> applications that render to their own
   buffers and request drawing through the server.
 
-To keep track of the develoment check the commit log
+to keep track of the develoment check the commit log
 on the <a href=feed.xml>feed</a>.
 
-Here's a <a href=screenshot.png>screenshot</a>.
+here's a <a href=screenshot.png>screenshot</a>.
 
 
-<b>Zoom &amp; virtual desktop</b>
+<b>zoom &amp; virtual desktop</b>
 
-The desktop is a virtual canvas larger than the
+the desktop is a virtual canvas larger than the
 physical display, with a zoomable viewport:
 
-- <b>Canvas:</b> 2× physical size on each axis
+- <b>canvas:</b> 2× physical size on each axis
   (4× screen area)
-- <b>Zoom range:</b> 50%–400% (100% = 1:1 pixels)
-- <b>Alt + scroll</b> — zoom in/out toward the cursor
-- <b>Alt + left-drag</b> on empty space — pan
-- <b>Alt + left-drag</b> on a window — move
-- <b>Alt + right-drag</b> on a window — resize
+- <b>zoom range:</b> 50%–400% (100% = 1:1 pixels)
+- <b>alt + scroll</b> — zoom in/out toward the cursor
+- <b>alt + left-drag</b> on empty space — pan
+- <b>alt + left-drag</b> on a window — move
+- <b>alt + right-drag</b> on a window — resize
 
-New apps size themselves for the current zoom so an
+new apps size themselves for the current zoom so an
 800×600 window still looks about that large on screen
-whether you are zoomed in or out. Wallpaper can cover
+whether you are zoomed in or out. wallpaper can cover
 the full virtual desktop (scaled mode stretches across
 the whole canvas).
 
-Pan and window moves only repaint revealed edges —
+pan and window moves only repaint revealed edges —
 fast on a pure software compositor.
 
 
-<b>Download</b>
+<b>download</b>
 
-Source snapshot (no git history):
+source snapshot (no git history):
 
 	<a href=bgce.tar.gz>bgce.tar.gz</a>
 
@@ -83,63 +83,63 @@ Source snapshot (no git history):
 	tar xzf bgce.tar.gz
 	cd bgce
 
-Or clone the repository:
+or clone the repository:
 
 	git clone https://terminal.pink/bgce
 	cd bgce
 
  
-<i>Goals</i>
+<i>goals</i>
 
-- Minimal, understandable graphics stack in C
-- No external dependencies like OpenGL, X11 etc
-- Educational reference for framebuffer-based
-  compositing, zoom/pan, and IPC
+- minimal, understandable graphics stack in c
+- no external dependencies like opengl, x11 etc
+- educational reference for framebuffer-based
+  compositing, zoom/pan, and ipc
 
 
-<b>Build Instructions</b>
+<b>build instructions</b>
 
 	make all client
 	./bgce   # run server
-	./client # run test client (in another TTY)
+	./client # run test client (in another tty)
 
   
-<b>Configuration</b>
+<b>configuration</b>
 
-BGCE supports configuration through a config file.
-By default, it looks for `~/.config/bgce.conf`.
+bgce supports configuration through a config file.
+by default, it looks for `~/.config/bgce.conf`.
 
-<i>Config File Format</i>
+<i>config file format</i>
 
 [background]
-# Background type: "color" or "image"
+# background type: "color" or "image"
 type = color
 
-# For color background:
-color = #RRGGBB   # Hex color code
+# for color background:
+color = #rrggbb   # hex color code
 # or
-color = #RRGGBBAA # Hex color with alpha
+color = #rrggbbaa # hex color with alpha
 
-# For image background:
+# for image background:
 #path = /path/to/image.png
 #mode = tiled     # or "scaled"
 
 [shortcuts]
-# Define keyboard shortcuts. Format:
+# define keyboard shortcuts. format:
 # <combo> = <type>:<value>
 #
 # type is one of:
 #   builtin  - value must be "exit" or "screenshot"
 #   command  - program + args (execvp, no shell; "quote" args)
 #
-# Combo examples: ctrl+alt+q, sysrq, f12, ctrl+shift+s, super+r
+# combo examples: ctrl+alt+q, sysrq, f12, ctrl+shift+s, super+r
 
-# Defaults (active when no [shortcuts] section is present or it is empty):
+# defaults (active when no [shortcuts] section is present or it is empty):
 # ctrl+alt+q = builtin:exit
 # sysrq = builtin:screenshot
 
 
-<i>Example Config File</i>
+<i>example config file</i>
 
 [background]
 type = color
@@ -152,38 +152,38 @@ type = image
 path = /usr/share/backgrounds/default.png
 mode = scaled
 
-With custom shortcuts:
+with custom shortcuts:
 
 [shortcuts]
 ctrl+alt+q = builtin:exit
 sysrq = builtin:screenshot
 
-# Launch programs: fork + execvp (no /bin/sh)
+# launch programs: fork + execvp (no /bin/sh)
 ctrl+alt+t = command:alacritty
 super+r = command:rofi -show drun
 f12 = command:import -window root /tmp/screenshot.png
 
 
-<i>Notes</i>
+<i>notes</i>
 
-- Scaled images look horrible.
+- scaled images look horrible.
 
 
-<b>Developing client applications</b>
+<b>developing client applications</b>
 
-BGCE clients should write directly to the buffer
+bgce clients should write directly to the buffer
 and call draw(), so the server will draw it to the
-screen. When users resize the window an event is
+screen. when users resize the window an event is
 sent to the client, applications then should adjust
 its content and call draw().
 
-You are free to choose any libraries to help with
-drawing graphical elements. To be honest I don't
+you are free to choose any libraries to help with
+drawing graphical elements. to be honest i don't
 know if the most common ones can directly handle
-buffers. So I am creating a toolkit: <a href=/bgtk/index.html>BGTK</a>, check it
+buffers. so i am creating a toolkit: <a href=/bgtk/index.html>bgtk</a>, check it
 out if you want.
 
-<b>License</b>
+<b>license</b>
 
-BSD 2-clause license.
+bsd 2-clause license.
 </pre>
